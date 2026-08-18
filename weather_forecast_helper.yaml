@@ -1,0 +1,40 @@
+# Home Assistant helper for the Magic Dial's Weather screen.
+#
+# The dial subscribes to two entities to render its Weather Mode:
+#   1) weather.home  ->  current condition (text) + temperature (attribute)
+#   2) sensor.va_weekly_forecast  ->  a compact 7-day forecast string it can
+#      unpack on-device without needing HA's response-variable service.
+#
+# This template creates the 7-day sensor. Add it to Home Assistant's
+# configuration.yaml (or a packages/ file), then restart HA / reload
+# template entities. Update `weather.home` to whatever weather entity you
+# actually use (three places below), or update the substitution
+# `weather_entity` in magic-dial.yaml if the entity id is different.
+#
+# State format per day segment: "condition,high,low,DayName" (Mon/Tue/...).
+# Segments are joined with "|" and capped at 7 days.
+template:
+  - trigger:
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        minutes: "/30"
+    action:
+      - service: weather.get_forecasts
+        target:
+          entity_id: weather.home
+        data:
+          type: daily
+        response_variable: fc
+    sensor:
+      - name: "VA weekly forecast"
+        unique_id: va_weekly_forecast
+        state: >
+          {% set ns = namespace(parts=[]) %}
+          {% for d in fc['weather.home'].forecast[:7] %}
+            {% set hi = (d.temperature | round(0)) if d.temperature is not none else 0 %}
+            {% set lo = (d.templow | round(0)) if (d.templow is defined and d.templow is not none) else hi %}
+            {% set nm = as_timestamp(d.datetime) | timestamp_custom('%a', true) %}
+            {% set ns.parts = ns.parts + [d.condition ~ ',' ~ hi ~ ',' ~ lo ~ ',' ~ nm] %}
+          {% endfor %}
+          {{ ns.parts | join('|') }}

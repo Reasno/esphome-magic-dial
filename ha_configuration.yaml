@@ -1,0 +1,345 @@
+# Loads default set of integrations. Do not remove.
+default_config:
+
+# Load frontend themes from the themes folder
+frontend:
+  themes: !include_dir_merge_named themes
+
+homeassistant:
+  packages: !include_dir_named packages
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+timer:
+  ulanzi_display_busy:
+    name: Ulanzi 显示占用
+    duration: "00:00:30"
+
+wake_on_lan:
+
+# Dot. Canvas API for Home Assistant
+# 基于官方 Canvas API 文档实现，支持发送自定义卡片、仪表盘和任意布局内容
+# 完整文档: https://dot.mindreset.tech/docs/service/open/canvas_api
+# ✅ FIXED: Object of type LoggingUndefined is not JSON serializable
+rest_command:
+  ulanzi_set_brightness_low:
+    url: "http://192.168.31.32/setConfig"
+    method: "post"
+    content_type: "application/json"
+    payload: >-
+      {
+        "brightness": {"level": "low", "low": 50, "mid": 80, "high": 100},
+        "volume": 4,
+        "carouselSpeed": 0,
+        "scrollSpeed": 7,
+        "timezone": "UTC+8",
+        "dateFormat": "MM/DD",
+        "showWeek": true,
+        "weekStart": 1,
+        "lowBatteryAutoSleep": false
+      }
+    timeout: 10
+  ulanzi_set_brightness_high:
+    url: "http://192.168.31.32/setConfig"
+    method: "post"
+    content_type: "application/json"
+    payload: >-
+      {
+        "brightness": {"level": "high", "low": 50, "mid": 80, "high": 100},
+        "volume": 4,
+        "carouselSpeed": 0,
+        "scrollSpeed": 7,
+        "timezone": "UTC+8",
+        "dateFormat": "MM/DD",
+        "showWeek": true,
+        "weekStart": 1,
+        "lowBatteryAutoSleep": false
+      }
+    timeout: 10
+  dot_text_api:
+    url: "https://dot.mindreset.tech/api/authV2/open/device/B43A455B91AC/text"
+    method: "post"
+    content_type: "application/json"
+    headers:
+      Authorization: "Bearer dot_app_BPIXaZKMTKxshwepZfOIYTcqCpgYPhHeHemfWbnTrfYxHttxrZVJioSEuTRLInrD"
+    payload: >
+      {
+        "refreshNow": true,
+        "title": "{{ title | default('') }}",
+        "message": "{{ message | default('') }}",
+        "signature": "{{ signature | default('') }}",
+        "link": "{{ nfc_link | default('') }}"
+      }
+    timeout: 15
+    verify_ssl: true
+    insecure_cipher: false
+  dot_canvas_todo:
+    url: "https://dot.mindreset.tech/api/authV2/open/device/B43A455B91AC/canvas"
+    method: "post"
+    content_type: "application/json"
+    headers:
+      Authorization: "Bearer dot_app_BPIXaZKMTKxshwepZfOIYTcqCpgYPhHeHemfWbnTrfYxHttxrZVJioSEuTRLInrD"
+    payload: >-
+      {
+        "refreshNow": true,
+        "taskKey": "ewIWk5Yvqx3W",
+        "taskAlias": "今日任务",
+        "data": {},
+        "windowData": {
+          "default": [{
+            "type": "div",
+            "props": {
+              "tw": "flex flex-col w-full h-full bg-white text-black overflow-hidden",
+              "children": [
+                {"type":"div","props":{"tw":"flex flex-row flex-1 items-center w-full px-[8px] border-b border-black gap-[7px]","children":[{"type":"div","props":{"tw":"flex items-center justify-center w-[22px] h-[22px] border-2 border-black rounded-[3px] shrink-0 text-18-chillduansans font-bold","children":{{ english_marker | tojson }} }},{"type":"div","props":{"tw":"flex-1 min-w-0 text-18-chillduansans font-bold","children":{{ english_text | tojson }} }}]}},
+                {"type":"div","props":{"tw":"flex flex-row flex-1 items-center w-full px-[8px] border-b border-black gap-[7px]","children":[{"type":"div","props":{"tw":"flex items-center justify-center w-[22px] h-[22px] border-2 border-black rounded-[3px] shrink-0 text-18-chillduansans font-bold","children":{{ drum_marker | tojson }} }},{"type":"div","props":{"tw":"flex-1 min-w-0 text-18-chillduansans font-bold","children":{{ drum_text | tojson }} }}]}},
+                {"type":"div","props":{"tw":"flex flex-row flex-1 items-center w-full px-[8px] gap-[7px]","children":[{"type":"div","props":{"tw":"flex items-center justify-center w-[22px] h-[22px] border-2 border-black rounded-[3px] shrink-0 text-18-chillduansans font-bold","children":{{ homework_marker | tojson }} }},{"type":"div","props":{"tw":"flex-1 min-w-0 text-18-chillduansans font-bold","children":{{ homework_text | tojson }} }}]}}
+              ]
+            }
+          }]
+        },
+        "layoutFull": {"tw":"p-0 bg-white","style":{"padding":0}},
+        "border": 0
+      }
+    timeout: 15
+    verify_ssl: true
+    insecure_cipher: false
+
+command_line:
+  - binary_sensor:
+      name: curl_google
+      command: >-
+        sh -c 'curl -s --max-time 5 https://google.com > /dev/null 2>&1 && echo success || echo fail'
+      device_class: connectivity
+      payload_on: "success"
+      payload_off: "fail"
+      scan_interval: 3600
+      command_timeout: 10
+  - sensor:
+      name: 小米路由器CPU温度
+      command: >-
+        ssh -i /config/.ssh/id_rsa -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o StrictHostKeyChecking=no -o ConnectTimeout=5 -q root@192.168.31.1 "cat /sys/class/thermal/thermal_zone0/temp" 2>/dev/null
+      scan_interval: 60
+      unit_of_measurement: "°C"
+      state_class: measurement
+      value_template: >
+        {% if value and value | is_number %}
+          {{ value | float | round(1) }}
+        {% else %}
+          {{ states('sensor.小米路由器cpu温度') | try('float') | default(none) }}
+        {% endif %}
+      command_timeout: 10
+  - binary_sensor:
+      name: imac_online
+      command: >-
+        ssh -i /config/.ssh/id_rsa -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 guxi@192.168.31.113 'exit 0' && echo on || echo off
+      payload_on: "on"
+      payload_off: "off"
+      device_class: connectivity
+      scan_interval: 30
+      command_timeout: 10
+
+input_boolean:
+  kong_tiao_jie_dian_shou_wei:
+    name: 空调节电守卫
+    icon: mdi:shield-check
+  ci_wo_heng_wen_shou_wei:
+    name: 次卧恒温守卫
+    icon: mdi:shield-check
+
+input_text:
+  ps4_today_games:
+    name: 今日玩过的 PS4 游戏
+    max: 255
+
+input_datetime:
+  last_drum_date:
+    name: Last Drum Date
+    has_date: true
+    has_time: false
+  gu_qin_yuan_homework_tv_bonus_last_date:
+    name: 谷沁园作业完成看电视奖励最后执行日期
+    has_date: true
+    has_time: false
+input_number:
+  weight_0:
+    name: 用户0体重
+    min: 0
+    max: 200
+    step: 0.1
+    unit_of_measurement: kg
+    mode: box
+  weight_1:
+    name: 谷溪体重
+    min: 0
+    max: 200
+    step: 0.1
+    unit_of_measurement: kg
+    mode: box
+  weight_3:
+    name: 谷沁萱体重
+    min: 0
+    max: 200
+    step: 0.1
+    unit_of_measurement: kg
+    mode: box
+  weight_4:
+    name: 谷沁园体重
+    min: 0
+    max: 200
+    step: 0.1
+    unit_of_measurement: kg
+    mode: box
+  weight_5:
+    name: 刘心怡体重
+    min: 0
+    max: 200
+    step: 0.1
+    unit_of_measurement: kg
+    mode: box
+  weight_6:
+    name: 用户6体重
+    min: 0
+    max: 200
+    step: 0.1
+    unit_of_measurement: kg
+    mode: box
+
+sensor:
+  - platform: history_stats
+    name: 谷沁园写作业时长
+    entity_id: light.xiaomi_cn_963754995_lamp35_s_2_light
+    state: "on"
+    type: time
+    start: "{{ now().replace(hour=0, minute=0, second=0, microsecond=0) }}"
+    end: "{{ now() }}"
+  - platform: history_stats
+    name: 谷沁园打鼓时长
+    entity_id: binary_sensor.da_gu_zhong
+    state: "on"
+    type: time
+    start: "{{ now().replace(hour=0, minute=0, second=0, microsecond=0) }}"
+    end: "{{ now() }}"
+  - platform: history_stats
+    name: "PlayStation 4 今日时长"
+    entity_id: media_player.ps4_183_playstation_4
+    state: "playing"
+    type: time
+    start: "{{ today_at('00:00') }}"
+    end: "{{ now() }}"
+  - platform: history_stats
+    name: "PlayStation 5 今日时长"
+    entity_id: sensor.sony_tv_source
+    state: "PlayStation 5"
+    type: time
+    start: "{{ today_at('00:00') }}"
+    end: "{{ now() }}"
+
+template:
+  - switch:
+      - name: 小米AI音箱 播放控制
+        unique_id: xiaomi_ai_speaker_play_switch
+        icon: mdi:play-pause
+        state: >
+          {{ is_state('sensor.xiaomi_cn_114004415_s12_playing_state_p_4_1', '播放中') }}
+        turn_on:
+          service: button.press
+          target:
+            entity_id: button.xiaomi_cn_114004415_s12_play_a_4_2
+        turn_off:
+          service: button.press
+          target:
+            entity_id: button.xiaomi_cn_114004415_s12_pause_a_4_1
+      - name: "Xiaomi智能家庭屏Mini 播放控制"
+        unique_id: xiaomi_smart_display_mini_play_control
+        state: >
+          {{ is_state('sensor.xiaomi_cn_936551320_x4b_playing_state_p_3_1', '播放中') }}
+        turn_on:
+          service: button.press
+          target:
+            entity_id: button.xiaomi_cn_936551320_x4b_play_a_3_2
+        turn_off:
+          service: button.press
+          target:
+            entity_id: button.xiaomi_cn_936551320_x4b_pause_a_3_3
+        icon: >
+          {% if is_state('sensor.xiaomi_cn_936551320_x4b_playing_state_p_3_1', '播放中') %}
+            mdi:play-circle
+          {% else %}
+            mdi:pause-circle
+          {% endif %}
+      - name: iMac 睡眠开关
+        unique_id: imac_sleep_switch
+        icon: >
+          {% if is_state('binary_sensor.imac_online', 'on') %}
+            mdi:monitor
+          {% else %}
+            mdi:monitor-off
+          {% endif %}
+        state: >
+          {{ is_state('binary_sensor.imac_online', 'on') }}
+        turn_on:
+          service: wake_on_lan.send_magic_packet
+          data:
+            mac: "04:9D:05:25:05:44"
+        turn_off:
+          service: shell_command.imac_sleep
+  - sensor:
+      - name: "Sony TV Source"
+        unique_id: sony_tv_source
+        state: "{{ state_attr('media_player.sony_k_55xr50', 'source') }}"
+  - button:
+      - name: iMac 关机
+        unique_id: imac_shutdown
+        icon: mdi:power
+        press:
+          service: shell_command.imac_shutdown
+      - name: iMac 睡眠
+        unique_id: imac_sleep
+        icon: mdi:sleep
+        press:
+          service: shell_command.imac_sleep
+
+shell_command:
+  ulanzi_set_display_mode: >-
+    python3 /config/scripts/ulanzi_set_display_mode.py {{ target_mode }}
+  ulanzi_force_tool_app: >-
+    python3 /config/scripts/ulanzi_force_tool_app.py {{ tool_id }} {{ hold_seconds }}
+  ulanzi_tr_progress: >-
+    python3 /config/scripts/ulanzi_tr_frame.py progress {{ speed }} {{ percent }}
+  ulanzi_tr_done: >-
+    python3 /config/scripts/ulanzi_tr_frame.py done
+  ulanzi_tr_done_dim: >-
+    python3 /config/scripts/ulanzi_tr_frame.py done_dim
+  ulanzi_tr_clear: >-
+    python3 /config/scripts/ulanzi_tr_frame.py clear
+  imac_shutdown: >-
+    ssh -i /config/.ssh/id_rsa -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 guxi@192.168.31.113 'sudo -n shutdown -h now'
+  imac_sleep: >-
+    ssh -i /config/.ssh/id_rsa -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 guxi@192.168.31.113 'pmset sleepnow'
+
+# Exclude high-frequency Ulanzi state updates from history/logbook noise
+recorder:
+  exclude:
+    entities:
+      - input_text.ulanzi_display_owner
+      - timer.ulanzi_display_busy
+    entity_globs:
+      - sensor.ulanzi_*
+      - mqtt.ulanzi_*
+
+logbook:
+  exclude:
+    entities:
+      - input_text.ulanzi_display_owner
+      - timer.ulanzi_display_busy
+      - automation.tong_bu_kan_dian_shi_sheng_yu_shi_jian_dao_ulanzi
+      - automation.ulanzi_xian_shi_suo_chao_shi_zhong_zhi_owner
+      - script.ulanzi_show_tv_status
+      - automation.ulanzi_kong_xian_shi_xian_shi_shi_zhong
+      - script.ulanzi_show_clock_status
+    entity_globs:
+      - sensor.ulanzi_*
+

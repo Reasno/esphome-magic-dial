@@ -1,0 +1,48 @@
+# Local ESPHome state and build output
+.esphome/
+.venv/
+
+# Secrets and credentials
+secrets.yaml
+secrets*.yaml
+*.secret
+*.key
+*.pem
+.env
+.env.*
+
+# Logs and runtime state
+*.log
+*.log.*
+*.json
+
+# Backups and temporary files
+*.bak
+*.bak.*
+*.tmp
+*.swp
+*~
+.DS_Store
+
+# Photos and image assets
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.heic
+
+# Other binary assets kept local
+fonts/
+icons/
+sounds/
+*.wav
+*.mp3
+*.ttf
+*.otf
+
+# ESPHome firmware/build artifacts
+*.bin
+*.elf
+*.map
+*.uf2

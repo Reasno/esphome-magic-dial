@@ -1,0 +1,4390 @@
+substitutions:
+  device_name: magic-dial
+  friendly_name: "Magic Dial"
+  timezone: "Asia/Shanghai"
+
+  # Magic Dial P6 / Midnight Orbit color tokens.
+  color_bg_canvas: "0x03070A"
+  color_bg_aod: "0x010304"
+  color_bg_surface: "0x09131B"
+  color_line_track: "0x14222C"
+  color_line_tick: "0x263945"
+  color_text_primary: "0xF2F6F8"
+  color_text_secondary: "0xA5B4BD"
+  color_text_tertiary: "0x617681"
+  color_offline: "0xE66472"
+  color_media: "0x49A8FF"
+  color_light: "0xFFC05A"
+  color_local: "0x45D6C5"
+
+  # Home Assistant entities. Change only these substitutions if entity IDs differ.
+  tv_entity: media_player.sony_k_55xr50
+  tv_remote_entity: remote.sony_k_55xr50
+  homepod_entity: media_player.ke_ting_ke_ting
+  ceiling_light_entity: light.opple_cn_246509731_bydceiling_s_2_light
+  strip_light_entity: light.yeelink_cn_48303523_strip1_s_2_light
+  dining_room_climate_entity: climate.24dfa79bdf8f
+  living_room_climate_entity: climate.24dfa7d09617
+  floor_heating_entity: climate.suittc_cn_929054575_m302
+
+  # Point this at a calendar that aggregates every holiday you want to display.
+  # The current event's `message` attribute is shown verbatim; an inactive calendar
+  # leaves the holiday line blank. This is intentionally not limited to Chinese holidays.
+  holiday_calendar_entity: calendar.zhong_guo
+
+  # 2.0: Weather Mode. `forecast_entity` reads a compact string sensor built by an HA
+  # template helper (see weather.ha-helper.yaml in this directory) that packs 7 days
+  # into "condition,high,low,DayName|..." for a single subscription.
+  weather_entity: weather.home
+  forecast_entity: sensor.va_weekly_forecast
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.7.4
+  # Hand-rolled PNG encoder for the Ulanzi knob bar. See publish_knob_bar.
+  includes:
+    - ulanzi_bar.h
+  on_boot:
+    priority: -100
+    then:
+      - delay: 1s
+      - light.turn_on:
+          id: backlight_light
+          brightness: !lambda 'return id(g_aod_backlight_pct) / 100.0f;'
+      - lambda: |-
+          id(g_last_activity) = millis();
+          id(g_backlight_pct) = 100;
+          id(g_ui_mode) = 0;
+          id(g_sleeping) = true;
+      - script.execute: render_aod
+      - script.execute: render_lockscreen
+      - lvgl.page.show:
+          id: page_aod
+          animation: fade_in
+          time: 250ms
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB          # 16 MB flash (JC3636K718C)
+  partitions: partitions.csv  # MAX app partitions (~7.94 MB/slot). Requires USB flashing!
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret magic_dial_api_key
+
+ota:
+  - platform: esphome
+    password: !secret magic_dial_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: 192.168.31.33
+    gateway: 192.168.31.1
+    subnet: 255.255.255.0
+    dns1: 192.168.31.1
+  ap:
+    ssid: "Magic Dial Setup"
+
+captive_portal:
+
+# BLE scanning runs alongside Wi-Fi on the ESP32-S3. Active scanning lets the
+# Home Assistant Bluetooth proxy request scan responses from nearby devices.
+esp32_ble_tracker:
+
+bluetooth_proxy:
+  active: true
+
+# MQTT is used for exactly one thing: driving the Ulanzi pixel clock's knob bar.
+# The dial publishes a ready-made AWTRIX payload straight to
+# `ulanzi_aa68/custom/test` on the shared EMQX broker - no Home Assistant round
+# trip, so there is no per-frame `shell_command` (~140 ms) in the path and the bar
+# tracks the knob smoothly. Everything else keeps using the native API, so all of
+# ESPHome's own MQTT plumbing is turned off:
+#   discovery / discover_ip: false - HA already owns these entities via the native
+#                       API; leaving them on would create a duplicate device.
+#   topic_prefix: null - suppresses the per-entity state/command topics. Requires
+#                       log_topic / birth_message / will_message to be empty too.
+#   reboot_timeout: 0s - never reboot just because EMQX is unreachable. The dial
+#                       must stay usable without the broker.
+mqtt:
+  id: mqtt_client
+  broker: 192.168.31.111
+  port: 1883
+  discovery: false
+  discover_ip: false
+  topic_prefix: null
+  log_topic: null
+  birth_message:
+  will_message:
+  reboot_timeout: 0s
+
+# The physical knob is not a quadrature encoder. Each direction has its own
+# active-low pulse input: left on GPIO2 and right on GPIO1.
+binary_sensor:
+  - platform: homeassistant
+    id: tv_muted
+    entity_id: ${tv_entity}
+    attribute: is_volume_muted
+    internal: true
+
+  - platform: homeassistant
+    id: homepod_muted
+    entity_id: ${homepod_entity}
+    attribute: is_volume_muted
+    internal: true
+
+  - platform: gpio
+    name: "Knob Left"
+    id: knob_left
+    pin:
+      number: GPIO2
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 5ms
+    on_press:
+      - lambda: |-
+          const uint32_t now = millis();
+          // The first knob pulse in AOD is consumed: wake only, never mutate state.
+          if (id(g_sleeping)) {
+            id(g_last_activity) = now;
+            id(wake_display).execute();
+            return;
+          }
+          const uint32_t elapsed = id(g_knob_last_pulse_ms) == 0 ? UINT32_MAX : now - id(g_knob_last_pulse_ms);
+          if (id(g_knob_last_direction) == 1 && elapsed < 20) return;
+          // Continuous acceleration curve: step % = (250 / elapsed) ^ 1.86, 1..20 %.
+          const float e = (float) (elapsed > 250 ? 250 : (elapsed < 20 ? 20 : elapsed));
+          id(g_knob_speed_pct) = (int) fminf(20.0f, fmaxf(1.0f, roundf(powf(250.0f / e, 1.86f))));
+          id(g_knob_last_pulse_ms) = now;
+          id(g_knob_last_direction) = -1;
+          id(g_last_activity) = now;
+      # 2.0 knob router: lock screen rotates the mode selector; each mode owns
+      # its own knob handler. Home routes to handle_knob for legacy behaviour.
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 0;' }
+          then:
+            - script.execute: { id: sel_rotate, direction: -1 }
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 1;' }
+          then:
+            - lambda: |-
+                auto active = [&](int target) -> bool {
+                  if (target == 0) { const auto s=id(tv_state).state; return s=="playing"||s=="on"||s=="paused"; }
+                  if (target == 1) { const auto s=id(homepod_state).state; return s=="playing"||s=="on"||s=="paused"; }
+                  if (target == 2) return id(ceiling_light_state).state=="on";
+                  if (target == 3) return id(strip_light_state).state=="on";
+                  if (target == 4) { const auto s=id(climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+                  if (target == 5) { const auto s=id(dining_room_climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+                  if (target == 6) { const auto s=id(floor_heating_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+                  return false;
+                };
+                if (active(id(g_target))) id(handle_knob).execute(-1);
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 3;' }
+          then:
+            - script.execute: { id: timer_knob, direction: -1 }
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 4;' }
+          then:
+            - script.execute: { id: wx_knob, direction: -1 }
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 5;' }
+          then:
+            - script.execute: { id: setting_knob, direction: -1 }
+
+  - platform: gpio
+    name: "Knob Right"
+    id: knob_right
+    pin:
+      number: GPIO1
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 5ms
+    on_press:
+      - lambda: |-
+          const uint32_t now = millis();
+          if (id(g_sleeping)) {
+            id(g_last_activity) = now;
+            id(wake_display).execute();
+            return;
+          }
+          const uint32_t elapsed = id(g_knob_last_pulse_ms) == 0 ? UINT32_MAX : now - id(g_knob_last_pulse_ms);
+          if (id(g_knob_last_direction) == -1 && elapsed < 20) return;
+          const float e = (float) (elapsed > 250 ? 250 : (elapsed < 20 ? 20 : elapsed));
+          id(g_knob_speed_pct) = (int) fminf(20.0f, fmaxf(1.0f, roundf(powf(250.0f / e, 1.86f))));
+          id(g_knob_last_pulse_ms) = now;
+          id(g_knob_last_direction) = 1;
+          id(g_last_activity) = now;
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 0;' }
+          then:
+            - script.execute: { id: sel_rotate, direction: 1 }
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 1;' }
+          then:
+            - lambda: |-
+                auto active = [&](int target) -> bool {
+                  if (target == 0) { const auto s=id(tv_state).state; return s=="playing"||s=="on"||s=="paused"; }
+                  if (target == 1) { const auto s=id(homepod_state).state; return s=="playing"||s=="on"||s=="paused"; }
+                  if (target == 2) return id(ceiling_light_state).state=="on";
+                  if (target == 3) return id(strip_light_state).state=="on";
+                  if (target == 4) { const auto s=id(climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+                  if (target == 5) { const auto s=id(dining_room_climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+                  if (target == 6) { const auto s=id(floor_heating_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+                  return false;
+                };
+                if (active(id(g_target))) id(handle_knob).execute(1);
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 3;' }
+          then:
+            - script.execute: { id: timer_knob, direction: 1 }
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 4;' }
+          then:
+            - script.execute: { id: wx_knob, direction: 1 }
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 5;' }
+          then:
+            - script.execute: { id: setting_knob, direction: 1 }
+
+# PCM5100A enable: HIGH means unmuted.
+switch:
+  - platform: gpio
+    name: "DAC Unmute"
+    id: dac_unmute
+    pin:
+      number: GPIO46
+      ignore_strapping_warning: true
+    restore_mode: ALWAYS_ON
+
+# Separate I2S buses are used for PCM5100A output and the PDM microphone.
+i2s_audio:
+  - id: i2s_out
+    i2s_bclk_pin:
+      number: GPIO3
+      ignore_strapping_warning: true
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+
+  - id: i2s_in
+    i2s_lrclk_pin: GPIO5
+
+speaker:
+  - platform: i2s_audio
+    id: magic_dial_speaker
+    i2s_audio_id: i2s_out
+    i2s_dout_pin: GPIO42
+    dac_type: external
+    channel: stereo
+  # 2.0: a resampler is stacked on top of the raw i2s speaker so the
+  # media_player component can push arbitrary-sample-rate WAV files (the
+  # embedded alarm sound is 22 kHz). Everything else keeps using the raw
+  # magic_dial_speaker id, so nothing existing needs to change.
+  - platform: resampler
+    id: magic_dial_media_speaker
+    output_speaker: magic_dial_speaker
+
+# 2.0: Timer alarm needs on-device audio playback. `alarm_sound` is downloaded
+# from the reference project at compile time so no extra files must land on the
+# device. media_player uses the announcement pipeline so short bursts do not
+# fight with anything else that might play back-to-back.
+media_player:
+  - platform: speaker
+    id: magic_dial_media
+    name: "Magic Dial Alarm"
+    internal: true
+    announcement_pipeline:
+      speaker: magic_dial_media_speaker
+    files:
+      - id: alarm_sound
+        file: sounds/alarm.wav
+
+microphone:
+  - platform: i2s_audio
+    id: magic_dial_microphone
+    i2s_audio_id: i2s_in
+    i2s_din_pin: GPIO4
+    adc_type: external
+    pdm: true
+    sample_rate: 16000
+    bits_per_sample: 16bit
+
+# ST77916 QSPI display bus.
+spi:
+  id: display_qspi
+  type: quad
+  clk_pin: GPIO11
+  data_pins: [GPIO13, GPIO14, GPIO15, GPIO16]
+
+# CST816 touch controller bus.
+i2c:
+  id: touchscreen_bus
+  sda: GPIO9
+  scl: GPIO10
+
+output:
+  - platform: ledc
+    pin: GPIO21
+    id: backlight_output
+
+light:
+  - platform: monochromatic
+    name: "Backlight"
+    id: backlight_light
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+    # Every brightness change ramps instead of stepping, so wake / sleep / manual
+    # brightness edits all fade smoothly.
+    default_transition_length: 400ms
+
+  # 13-pixel WS2812 ring. RMT DMA keeps LED timing stable while LVGL/QSPI is busy.
+  - platform: esp32_rmt_led_strip
+    id: ring_light
+    name: "${friendly_name} Ring"
+    pin:
+      number: GPIO0
+      ignore_strapping_warning: true
+    num_leds: 13
+    rgb_order: GRB
+    chipset: WS2812
+    rmt_symbols: 128
+    use_dma: true
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_OFF
+    effects:
+      - addressable_lambda:
+          name: "Ring State"
+          update_interval: 40ms
+          lambda: |-
+            const int n = it.size();
+            if (id(g_sleeping)) {
+              it.all() = Color(0, 0, 0);
+              return;
+            }
+            float level = id(g_ring_brightness);
+            if (id(g_target) == 0 || id(g_target) == 1) {
+              // Slow 3-second breath, from 30% to 60% of the target color.
+              const float phase = (millis() % 3000) / 3000.0f * 6.2831853f;
+              level = 0.45f - 0.15f * cosf(phase);
+            }
+            const uint8_t r = (uint8_t) roundf(id(g_ring_r) * level);
+            const uint8_t g = (uint8_t) roundf(id(g_ring_g) * level);
+            const uint8_t b = (uint8_t) roundf(id(g_ring_b) * level);
+            it.all() = Color(r, g, b);
+
+      - addressable_lambda:
+          name: "Ring Feedback"
+          update_interval: 20ms
+          lambda: |-
+            const int n = it.size();
+            const int kind = id(g_ring_feedback);
+            if (kind == 1) {
+              // One directional comet lap in 300 ms; direction follows the knob.
+              const float elapsed = (float) (millis() - id(g_ring_feedback_started_ms));
+              float head = fmodf(elapsed / 300.0f * n, (float) n);
+              if (id(g_ring_direction) < 0) head = fmodf(n - head, (float) n);
+              for (int i = 0; i < n; i++) {
+                float d = id(g_ring_direction) > 0 ? head - i : i - head;
+                while (d < 0) d += n;
+                while (d >= n) d -= n;
+                float tail = d < 4.0f ? 1.0f - d / 4.0f : 0.0f;
+                tail *= tail;
+                it[i] = Color(
+                  (uint8_t) roundf(id(g_ring_r) * tail),
+                  (uint8_t) roundf(id(g_ring_g) * tail),
+                  (uint8_t) roundf(id(g_ring_b) * tail));
+              }
+            } else if (kind == 2) {
+              it.all() = Color(255, 255, 255);  // device switch
+            } else if (kind == 3) {
+              it.all() = Color(id(g_ring_r), id(g_ring_g), id(g_ring_b));  // mode switch
+            } else if (kind == 4) {
+              it.all() = Color(255, 0, 0);      // tap acknowledgement
+            } else {
+              it.all() = Color(0, 0, 0);
+            }
+
+# Keep the manufacturer's complete ST77916 initialization sequence. It is
+# specific to the JC3636K718C_I_YR1 and is not interchangeable with JC3636W518.
+display:
+  - platform: mipi_spi
+    model: CUSTOM
+    bus_mode: quad
+    data_rate: 80MHz
+    id: main_display
+    spi_id: display_qspi
+    color_order: rgb
+    invert_colors: true
+    dimensions:
+      height: 360
+      width: 360
+    cs_pin: GPIO12
+    reset_pin: GPIO17
+    init_sequence:
+      - [0xF0, 0x28]
+      - [0xF2, 0x28]
+      - [0x73, 0xF0]
+      - [0x7C, 0xD1]
+      - [0x83, 0xE0]
+      - [0x84, 0x61]
+      - [0xF2, 0x82]
+      - [0xF0, 0x00]
+      - [0xF0, 0x01]
+      - [0xF1, 0x01]
+      - [0xB0, 0x56]
+      - [0xB1, 0x4D]
+      - [0xB2, 0x24]
+      - [0xB4, 0x87]
+      - [0xB5, 0x44]
+      - [0xB6, 0x8B]
+      - [0xB7, 0x40]
+      - [0xB8, 0x86]
+      - [0xBA, 0x00]
+      - [0xBB, 0x08]
+      - [0xBC, 0x08]
+      - [0xBD, 0x00]
+      - [0xC0, 0x80]
+      - [0xC1, 0x10]
+      - [0xC2, 0x37]
+      - [0xC3, 0x80]
+      - [0xC4, 0x10]
+      - [0xC5, 0x37]
+      - [0xC6, 0xA9]
+      - [0xC7, 0x41]
+      - [0xC8, 0x01]
+      - [0xC9, 0xA9]
+      - [0xCA, 0x41]
+      - [0xCB, 0x01]
+      - [0xD0, 0x91]
+      - [0xD1, 0x68]
+      - [0xD2, 0x68]
+      - [0xF5, 0x00, 0xA5]
+      - [0xDD, 0x4F]
+      - [0xDE, 0x4F]
+      - [0xF1, 0x10]
+      - [0xF0, 0x00]
+      - [0xF0, 0x02]
+      - [0xE0, 0xF0, 0x0A, 0x10, 0x09, 0x09, 0x36, 0x35, 0x33, 0x4A, 0x29, 0x15, 0x15, 0x2E, 0x34]
+      - [0xE1, 0xF0, 0x0A, 0x0F, 0x08, 0x08, 0x05, 0x34, 0x33, 0x4A, 0x39, 0x15, 0x15, 0x2D, 0x33]
+      - [0xF0, 0x10]
+      - [0xF3, 0x10]
+      - [0xE0, 0x07]
+      - [0xE1, 0x00]
+      - [0xE2, 0x00]
+      - [0xE3, 0x00]
+      - [0xE4, 0xE0]
+      - [0xE5, 0x06]
+      - [0xE6, 0x21]
+      - [0xE7, 0x01]
+      - [0xE8, 0x05]
+      - [0xE9, 0x02]
+      - [0xEA, 0xDA]
+      - [0xEB, 0x00]
+      - [0xEC, 0x00]
+      - [0xED, 0x0F]
+      - [0xEE, 0x00]
+      - [0xEF, 0x00]
+      - [0xF8, 0x00]
+      - [0xF9, 0x00]
+      - [0xFA, 0x00]
+      - [0xFB, 0x00]
+      - [0xFC, 0x00]
+      - [0xFD, 0x00]
+      - [0xFE, 0x00]
+      - [0xFF, 0x00]
+      - [0x60, 0x40]
+      - [0x61, 0x04]
+      - [0x62, 0x00]
+      - [0x63, 0x42]
+      - [0x64, 0xD9]
+      - [0x65, 0x00]
+      - [0x66, 0x00]
+      - [0x67, 0x00]
+      - [0x68, 0x00]
+      - [0x69, 0x00]
+      - [0x6A, 0x00]
+      - [0x6B, 0x00]
+      - [0x70, 0x40]
+      - [0x71, 0x03]
+      - [0x72, 0x00]
+      - [0x73, 0x42]
+      - [0x74, 0xD8]
+      - [0x75, 0x00]
+      - [0x76, 0x00]
+      - [0x77, 0x00]
+      - [0x78, 0x00]
+      - [0x79, 0x00]
+      - [0x7A, 0x00]
+      - [0x7B, 0x00]
+      - [0x80, 0x48]
+      - [0x81, 0x00]
+      - [0x82, 0x06]
+      - [0x83, 0x02]
+      - [0x84, 0xD6]
+      - [0x85, 0x04]
+      - [0x86, 0x00]
+      - [0x87, 0x00]
+      - [0x88, 0x48]
+      - [0x89, 0x00]
+      - [0x8A, 0x08]
+      - [0x8B, 0x02]
+      - [0x8C, 0xD8]
+      - [0x8D, 0x04]
+      - [0x8E, 0x00]
+      - [0x8F, 0x00]
+      - [0x90, 0x48]
+      - [0x91, 0x00]
+      - [0x92, 0x0A]
+      - [0x93, 0x02]
+      - [0x94, 0xDA]
+      - [0x95, 0x04]
+      - [0x96, 0x00]
+      - [0x97, 0x00]
+      - [0x98, 0x48]
+      - [0x99, 0x00]
+      - [0x9A, 0x0C]
+      - [0x9B, 0x02]
+      - [0x9C, 0xDC]
+      - [0x9D, 0x04]
+      - [0x9E, 0x00]
+      - [0x9F, 0x00]
+      - [0xA0, 0x48]
+      - [0xA1, 0x00]
+      - [0xA2, 0x05]
+      - [0xA3, 0x02]
+      - [0xA4, 0xD5]
+      - [0xA5, 0x04]
+      - [0xA6, 0x00]
+      - [0xA7, 0x00]
+      - [0xA8, 0x48]
+      - [0xA9, 0x00]
+      - [0xAA, 0x07]
+      - [0xAB, 0x02]
+      - [0xAC, 0xD7]
+      - [0xAD, 0x04]
+      - [0xAE, 0x00]
+      - [0xAF, 0x00]
+      - [0xB0, 0x48]
+      - [0xB1, 0x00]
+      - [0xB2, 0x09]
+      - [0xB3, 0x02]
+      - [0xB4, 0xD9]
+      - [0xB5, 0x04]
+      - [0xB6, 0x00]
+      - [0xB7, 0x00]
+      - [0xB8, 0x48]
+      - [0xB9, 0x00]
+      - [0xBA, 0x0B]
+      - [0xBB, 0x02]
+      - [0xBC, 0xDB]
+      - [0xBD, 0x04]
+      - [0xBE, 0x00]
+      - [0xBF, 0x00]
+      - [0xC0, 0x10]
+      - [0xC1, 0x47]
+      - [0xC2, 0x56]
+      - [0xC3, 0x65]
+      - [0xC4, 0x74]
+      - [0xC5, 0x88]
+      - [0xC6, 0x99]
+      - [0xC7, 0x01]
+      - [0xC8, 0xBB]
+      - [0xC9, 0xAA]
+      - [0xD0, 0x10]
+      - [0xD1, 0x47]
+      - [0xD2, 0x56]
+      - [0xD3, 0x65]
+      - [0xD4, 0x74]
+      - [0xD5, 0x88]
+      - [0xD6, 0x99]
+      - [0xD7, 0x01]
+      - [0xD8, 0xBB]
+      - [0xD9, 0xAA]
+      - [0xF3, 0x01]
+      - [0xF0, 0x00]
+      - [0x21, 0x00]
+      - [0x11, 0x00]
+      - delay 120ms
+      - [0x29, 0x00]
+
+touchscreen:
+  - platform: cst816
+    id: main_touchscreen
+    i2c_id: touchscreen_bus
+    interrupt_pin: GPIO7
+    reset_pin: GPIO8
+    display: main_display
+    # ESPHome 2026.7.x 的 CST816 驱动没有 on_gesture，也不会直接暴露
+    # SWIPE_LEFT 等枚举。手势需通过坐标增量自行识别。
+    # touch_timeout 会在最后一次触摸中断后继续轮询，确保抬手时触发
+    # on_release；若不设置，部分 CST816 固件不会为抬手产生 IRQ，导致
+    # dispatch_gesture 永远不执行。
+    touch_timeout: 100ms
+    on_touch:
+      - lambda: |-
+          id(g_touch_x0) = (int) touch.x;
+          id(g_touch_y0) = (int) touch.y;
+          id(g_touch_dx) = 0;
+          id(g_touch_dy) = 0;
+          id(g_touch_t0) = millis();
+          id(g_wake_consume) = id(g_sleeping);
+          id(g_last_activity) = millis();
+      - if:
+          condition:
+            lambda: 'return id(g_sleeping);'
+          then:
+            - script.execute: wake_display
+    on_update:
+      - lambda: |-
+          if (!touches.empty()) {
+            id(g_touch_dx) = (int) touches[0].x - id(g_touch_x0);
+            id(g_touch_dy) = (int) touches[0].y - id(g_touch_y0);
+          }
+          id(g_last_activity) = millis();
+    on_release:
+      - lambda: |-
+          // The panel is rotated 180 deg in hardware, but the touch controller
+          // still reports raw unrotated coordinates, so both axes must be
+          // negated for swipe direction to match what the user sees.
+          const int dx = -id(g_touch_dx);
+          const int dy = -id(g_touch_dy);
+          const uint32_t held = millis() - id(g_touch_t0);
+          int gesture = -1;
+          if (abs(dx) > 50 && abs(dx) > abs(dy)) gesture = dx < 0 ? 2 : 3;
+          else if (abs(dy) > 50 && abs(dy) > abs(dx)) gesture = dy < 0 ? 4 : 5;
+          else if (abs(dx) < 16 && abs(dy) < 16) gesture = held >= 600 ? 1 : 0;
+          if (id(g_wake_consume)) {
+            gesture = -1;
+            id(g_wake_consume) = false;
+          }
+          id(g_gesture) = gesture;
+          id(g_last_activity) = millis();
+      - script.execute: dispatch_gesture
+
+# Home Assistant time drives the sleep clock and Chinese date/weekday text.
+time:
+  - platform: homeassistant
+    id: ha_time
+    timezone: ${timezone}
+    on_time:
+      # 2.0: the lock screen shows a MM.DD date, not a HH:MM clock, so the
+      # per-minute repaint of the AOD is gone. The date refreshes once per day
+      # at 00:00, plus every wake / boot (via render_lockscreen).
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - if:
+              condition: { lambda: 'return id(g_sleeping);' }
+              then:
+                - script.execute: render_lockscreen
+
+# State subscriptions used by the P2 local priority resolver.
+text_sensor:
+  - platform: homeassistant
+    id: tv_state
+    entity_id: ${tv_entity}
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: homepod_state
+    entity_id: ${homepod_entity}
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+      # 2.0 music mode: HomePod state flipping to/from "playing" while the dial
+      # is on the lockscreen swaps the Pacifico date for a music icon (and
+      # starts / stops the family-photo rotation).
+      - if:
+          condition: { lambda: 'return id(g_sleeping) && id(g_ui_mode) == 0;' }
+          then:
+            - script.execute: render_lockscreen
+
+  - platform: homeassistant
+    id: ceiling_light_state
+    entity_id: ${ceiling_light_entity}
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: strip_light_state
+    entity_id: ${strip_light_entity}
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: strip_light_hs_color
+    entity_id: ${strip_light_entity}
+    attribute: hs_color
+    internal: true
+    on_value:
+      - lambda: |-
+          // HA serialises the hs_color attribute as a Python tuple, e.g. "(240.0, 100.0)",
+          // but older builds also emitted "[240.0, 100.0]". Skip whatever bracket style
+          // arrives and parse the first number, otherwise hue stays NaN forever and the
+          // knob always restarts from 0.
+          const char *p = x.c_str();
+          while (*p != '\0' && !(*p == '-' || *p == '.' || (*p >= '0' && *p <= '9'))) p++;
+          float hue = 0.0f;
+          if (*p != '\0' && sscanf(p, "%f", &hue) == 1) id(strip_light_hue).publish_state(hue);
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: climate_state
+    entity_id: ${living_room_climate_entity}
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: dining_room_climate_state
+    entity_id: ${dining_room_climate_entity}
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: floor_heating_state
+    entity_id: ${floor_heating_entity}
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: holiday_calendar_state
+    entity_id: ${holiday_calendar_entity}
+    internal: true
+    on_value:
+      - script.execute: render_aod
+
+  - platform: homeassistant
+    id: holiday_calendar_name
+    entity_id: ${holiday_calendar_entity}
+    attribute: message
+    internal: true
+    on_value:
+      - script.execute: render_aod
+
+  # ==================== 2.0: Weather Mode subscriptions ====================
+  # `wx_now_state` = the weather entity's current condition string (sunny,
+  # cloudy, rainy, ...). Used for the centre icon + label when day 0 is shown.
+  - platform: homeassistant
+    id: wx_now_state
+    entity_id: ${weather_entity}
+    internal: true
+    on_value:
+      - lambda: 'id(g_wx_state_cur) = x;'
+      - script.execute: wx_render
+  # `wx_week` = compact 7-day forecast string from the HA helper (see
+  # weather.ha-helper.yaml). Format per segment: "condition,high,low,DayName",
+  # segments joined with "|". Up to 7 segments; extra ones are dropped.
+  - platform: homeassistant
+    id: wx_week
+    entity_id: ${forecast_entity}
+    internal: true
+    on_value:
+      - lambda: |-
+          std::string s = x;
+          for (int i = 0; i < 7; i++) { id(g_wx_cond)[i] = ""; id(g_wx_icon)[i] = ""; }
+          int n = 0; size_t pos = 0;
+          while (n < 7) {
+            size_t bar = s.find('|', pos);
+            std::string seg = (bar == std::string::npos) ? s.substr(pos) : s.substr(pos, bar - pos);
+            size_t c1 = seg.find(',');
+            if (c1 != std::string::npos) {
+              size_t c2 = seg.find(',', c1 + 1);
+              size_t c3 = (c2 != std::string::npos) ? seg.find(',', c2 + 1) : std::string::npos;
+              if (c2 != std::string::npos && c3 != std::string::npos) {
+                std::string cond = seg.substr(0, c1);
+                id(g_wx_cond)[n] = cond;
+                // Compact MDI glyphs. Full set is documented in weather.yaml.
+                std::string g;
+                if (cond == "sunny") g = "󰖙";
+                else if (cond == "clear-night") g = "󰖔";
+                else if (cond == "partlycloudy") g = "󰖕";
+                else if (cond == "fog") g = "󰖑";
+                else if (cond == "windy" || cond == "windy-variant") g = "󰖝";
+                else if (cond == "lightning" || cond == "lightning-rainy") g = "󰖓";
+                else if (cond == "pouring") g = "󰖖";
+                else if (cond == "rainy") g = "󰖗";
+                else if (cond == "snowy" || cond == "snowy-rainy" || cond == "hail") g = "󰖘";
+                else g = "󰖐";
+                id(g_wx_icon)[n] = g;
+                id(g_wx_hi)[n] = atoi(seg.substr(c1 + 1, c2 - c1 - 1).c_str());
+                id(g_wx_lo)[n] = atoi(seg.substr(c2 + 1, c3 - c2 - 1).c_str());
+                id(g_wx_name)[n] = seg.substr(c3 + 1);
+                n++;
+              }
+            }
+            if (bar == std::string::npos) break;
+            pos = bar + 1;
+          }
+          id(g_wx_n) = n;
+          if (id(g_wx_day) >= n) id(g_wx_day) = 0;
+      - script.execute: wx_render
+
+sensor:
+  - platform: homeassistant
+    id: tv_volume
+    entity_id: ${tv_entity}
+    attribute: volume_level
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: homepod_volume
+    entity_id: ${homepod_entity}
+    attribute: volume_level
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: tv_position
+    entity_id: ${tv_entity}
+    attribute: media_position
+    internal: true
+
+  - platform: homeassistant
+    id: tv_duration
+    entity_id: ${tv_entity}
+    attribute: media_duration
+    internal: true
+
+  - platform: homeassistant
+    id: homepod_position
+    entity_id: ${homepod_entity}
+    attribute: media_position
+    internal: true
+
+  - platform: homeassistant
+    id: homepod_duration
+    entity_id: ${homepod_entity}
+    attribute: media_duration
+    internal: true
+
+  - platform: homeassistant
+    id: ceiling_light_color_temp
+    entity_id: ${ceiling_light_entity}
+    attribute: color_temp_kelvin
+    internal: true
+
+  - platform: homeassistant
+    id: ceiling_light_brightness
+    entity_id: ${ceiling_light_entity}
+    attribute: brightness
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: strip_light_brightness
+    entity_id: ${strip_light_entity}
+    attribute: brightness
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: template
+    id: strip_light_hue
+    internal: true
+    update_interval: never
+
+  - platform: homeassistant
+    id: climate_target_temperature
+    entity_id: ${living_room_climate_entity}
+    attribute: temperature
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: dining_room_climate_temp
+    entity_id: ${dining_room_climate_entity}
+    attribute: current_temperature
+    internal: true
+
+  - platform: homeassistant
+    id: dining_room_climate_target_temp
+    entity_id: ${dining_room_climate_entity}
+    attribute: temperature
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  - platform: homeassistant
+    id: floor_heating_target_temp
+    entity_id: ${floor_heating_entity}
+    attribute: temperature
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  # ==================== 2.0: Weather current-temperature ====================
+  # Pulled from the same weather entity used by wx_now_state, but as a numeric
+  # attribute. Falls through to wx_render on change so the hero temperature is
+  # always current for day 0.
+  - platform: homeassistant
+    id: wx_now_temp
+    entity_id: ${weather_entity}
+    attribute: temperature
+    internal: true
+    on_value:
+      - lambda: 'id(g_wx_now) = (int) roundf(x);'
+      - script.execute: wx_render
+
+  # Battery: ADC on GPIO6 (BAT_ADC, ~10k/10k divider -> x2), ported verbatim from
+  # the upstream Guition VA project. GPIO6 is ADC1_CH5 and is otherwise unused on
+  # this board, so it does not collide with the display / touch / audio pins.
+  - platform: adc
+    pin: GPIO6
+    id: batt_volt
+    name: "Battery voltage"
+    attenuation: 12db
+    update_interval: 1s
+    samples: 64                  # hardware oversampling: 64 readings averaged per measurement
+                                 # -> cuts ripple from the ETA6003 converter (no cap on BAT_ADC)
+    filters:
+      - multiply: 2.0
+      # Reject values physically impossible for Li-ion (that is switching ripple, not voltage).
+      # Upstream capped this at 4.30 V, but on this unit the docked rail measures a stable
+      # 4.40-4.43 V, so 4.30 rejected every single sample and the level never left "--".
+      # The ceiling is 4.60 V here; anything above the 4.10 V curve top clamps to 100 %.
+      # Out-of-range samples are rate-limited into the log (once per ~10 s) so a missing
+      # battery or a wrong divider ratio stays diagnosable instead of silently becoming NAN.
+      - lambda: |-
+          if (x >= 3.20f && x <= 4.60f) return x;
+          static uint8_t dropped = 0;
+          if (++dropped >= 10) { dropped = 0; ESP_LOGI("batt", "BAT_ADC out of range: %.3f V (already x2)", x); }
+          return NAN;
+      # On the cleaned signal: moving average, output every ~10 s
+      - sliding_window_moving_average:
+          window_size: 20
+          send_every: 10
+          send_first_at: 5
+    on_value:
+      - lambda: |-
+          // x = VCC_OUT (median, after x2) = system rail ~= battery voltage UNDER load.
+          float v = x;
+          // Voltage->% curve CALIBRATED on a real discharge (under load):
+          // start ~4.10 (~90%), nearly linear drop, brownout ~3.20 V. Range 3.20-4.15.
+          static const float vt[] = {3.20f,3.25f,3.39f,3.57f,3.74f,3.84f,4.10f};
+          static const float st[] = {0.f,  4.f,  20.f, 40.f, 60.f, 80.f, 100.f};
+          const int n = 7;
+          float pct;
+          if (v <= vt[0]) pct = 0.f;
+          else if (v >= vt[n-1]) pct = 100.f;
+          else { pct = 0.f; for (int i = 0; i < n-1; i++) { if (v >= vt[i] && v < vt[i+1]) { pct = st[i] + (v - vt[i]) / (vt[i+1] - vt[i]) * (st[i+1] - st[i]); break; } } }
+          int p = (int) roundf(pct);
+          if (p < 0) p = 0;
+          if (p > 100) p = 100;
+          id(g_batt) = p;
+          // --- Charging detection (no STAT pin on GPIO -> voltage heuristic) ---
+          // The puck constantly draws current (backlight + ESP + audio); only USB
+          // keeps the rail high.
+          float prev = id(g_v_med);
+          id(g_v_med) = v;
+          bool rising = (prev > 0.1f) && (v - prev > 0.010f);  // voltage rising = charging
+          bool high   = (v >= 4.13f);                          // on battery under load max ~4.10
+          bool low    = (v < 4.05f);                           // clearly on battery
+          if (high || rising) id(g_charging) = true;
+          else if (low)       id(g_charging) = false;
+          // 4.05-4.13 zone without a rise: keep the previous state (hysteresis, no flicker)
+      # 2.0: 本机 (target 7) no longer exists in Home; the battery readout now
+      # lives on the Setting page (row 3). Repaint that page when the reading
+      # changes so the number stays fresh.
+      - if:
+          condition:
+            lambda: 'return !id(g_sleeping) && id(g_ui_mode) == 5 && id(g_set_row) == 3;'
+          then:
+            - script.execute: set_render
+
+globals:
+  # AOD clock string, shared by the visible label and its four glow copies.
+  - id: g_aod_clock
+    type: std::string
+    restore_value: no
+    initial_value: '"--:--"'
+  - id: g_sleeping
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_wake_consume
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_last_activity
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_manual_until
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_backlight_pct
+    type: int
+    restore_value: no
+    initial_value: '100'
+  # Lock-screen (AOD) backlight, 5-50 %. Unlike g_backlight_pct this one is
+  # persisted: it is a user preference, not a transient runtime value.
+  - id: g_aod_backlight_pct
+    type: int
+    restore_value: yes
+    initial_value: '18'
+  - id: g_target
+    type: int
+    restore_value: no
+    initial_value: '7'
+  - id: g_control_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_local_volume
+    type: float
+    restore_value: no
+    initial_value: '50.0'
+  # Shared between render_main's main lambda and the arc/arc_dot lambdas that run
+  # after it, so the glowing arc endpoint can reuse the already-computed state.
+  - id: g_arc_pct
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_arc_color
+    type: int
+    restore_value: no
+    initial_value: '0x45D6C5'
+  - id: g_target_online
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Arc smoothing layer. `lvgl.arc.update` sets the value instantly, so a knob
+  # pulse used to teleport the indicator (and the glowing endpoint) by a whole
+  # step - the single biggest source of the "notchy" feel. render_main now only
+  # writes g_arc_target_pct; the 30 ms `arc_ease` interval walks
+  # g_arc_display_pct toward it and that is what actually gets drawn.
+  # g_arc_anim_target / _mode exist so switching device or control mode SNAPS
+  # instead of sweeping across the dial - only knob turns and HA updates ease.
+  - id: g_arc_target_pct
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: g_arc_display_pct
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: g_arc_anim_target
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: g_arc_anim_mode
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: g_touch_x0
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_touch_y0
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_touch_dx
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_touch_dy
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_touch_t0
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_knob_last_pulse_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_knob_speed_pct
+    type: int
+    restore_value: no
+    initial_value: '1'
+  - id: g_knob_last_direction
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_knob_last_rotate_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_optimistic_valid
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_optimistic_target
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: g_optimistic_mode
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: g_optimistic_value
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  # TV transport has its own optimistic state so play/pause feedback is immediate
+  # and HA callbacks cannot flip the icon back during the 2000 ms ignore window.
+  - id: g_tv_transport_optimistic
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_tv_transport_playing
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_tv_transport_changed_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_gesture
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  # Current steady-state ring color and level. Feedback effects temporarily override these.
+  - id: g_ring_r
+    type: int
+    restore_value: no
+    initial_value: '255'
+  - id: g_ring_g
+    type: int
+    restore_value: no
+    initial_value: '255'
+  - id: g_ring_b
+    type: int
+    restore_value: no
+    initial_value: '255'
+  - id: g_ring_brightness
+    type: float
+    restore_value: no
+    initial_value: '0.1'
+  - id: g_ring_feedback
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_ring_direction
+    type: int
+    restore_value: no
+    initial_value: '1'
+  - id: g_ring_feedback_started_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Battery state, ported from the upstream Guition VA project. There is no STAT
+  # pin wired to a GPIO on the JC3636K718C dock, so charging is inferred from the
+  # rail voltage instead.
+  - id: g_batt         # battery level in % (-1 = no reading yet -> show "--")
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: g_charging     # true = charging / on USB (voltage heuristic)
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_v_med        # last median VCC_OUT voltage (a rise means charging)
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: g_chg_anim     # frame of the battery "filling" animation while charging (0..4)
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # Ulanzi knob bar (see the `publish_knob_bar` script). The frame is published
+  # straight to the Ulanzi's MQTT custom app, so the only rate limit that matters
+  # is the Ulanzi's own refresh: a 200 ms leading-edge throttle keeps the bar live
+  # while turning, and a trailing frame lands the final value after it stops.
+  - id: g_knob_pub_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_knob_pub_pct
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: g_knob_pub_ok  # set by publish_knob_bar's lambda; gates the mqtt.publish
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # ~1.3 kB of ready-to-send AWTRIX payload, built by ulanzi_bar.h.
+  - id: g_knob_pub_payload
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  # ==================== 2.0 additions ====================
+  # UI mode:  0 = 锁屏 lock (AOD)   1 = Home   2 = Remote   3 = Timer   4 = Weather   5 = Setting
+  - id: g_ui_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # Lock-screen arc mode selector (bottom overlay).
+  #   g_sel_active  = the selector is currently visible (rotating knob on lockscreen shows it)
+  #   g_sel_idx     = which mode is currently highlighted (1..5, mapping to g_ui_mode target)
+  #   g_sel_last_ms = timestamp of last selector interaction; 2 s idle collapses it
+  - id: g_sel_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_sel_idx
+    type: int
+    restore_value: no
+    initial_value: '1'
+  - id: g_sel_last_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Music mode on lockscreen (HomePod state == playing while g_ui_mode == 0).
+  - id: g_music_mode
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Timer state (mirrors the reference repo core.yaml). Values in seconds.
+  - id: g_timer_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_timer_paused
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_timer_total
+    type: int
+    restore_value: no
+    initial_value: '300'
+  - id: g_set_min
+    type: int
+    restore_value: yes
+    initial_value: '5'
+  - id: g_timer_secs
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_timer_local
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_alarm_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_alarm_cnt
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # Weather Mode state (from reference base/screens/weather.yaml, remapped).
+  - id: g_wx_fahrenheit
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: g_wx_now
+    type: int
+    restore_value: no
+    initial_value: '-127'
+  - id: g_wx_state_cur
+    type: std::string
+    restore_value: no
+  - id: g_wx_cond
+    type: std::string[7]
+    restore_value: no
+  - id: g_wx_icon
+    type: std::string[7]
+    restore_value: no
+  - id: g_wx_name
+    type: std::string[7]
+    restore_value: no
+  - id: g_wx_hi
+    type: int[7]
+    restore_value: no
+  - id: g_wx_lo
+    type: int[7]
+    restore_value: no
+  - id: g_wx_n
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_wx_day
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_wx_sel
+    type: std::string
+    restore_value: no
+  - id: g_wx_tc
+    type: int
+    restore_value: no
+    initial_value: '-127'
+  - id: g_wx_lastcond
+    type: std::string
+    restore_value: no
+  - id: g_wx_ikey
+    type: std::string
+    restore_value: no
+  - id: g_wx_gpos
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  # Setting Mode: index of the currently selected control row (0..3).
+  #   0 = 本机音量   1 = 屏幕亮度   2 = 锁屏亮度   3 = 电量
+  - id: g_set_row
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # Lock-screen music mode animation state. `g_aod_music_active` gates the
+  # 500 ms photo-rotation interval; `g_aod_photo_angle` counts up in 0.1 deg
+  # units (LVGL native), sampled at 15 deg per step for a slow 12 s revolution.
+  - id: g_aod_music_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_aod_photo_angle
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+script:
+  - id: ring_update_state
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(g_sleeping)) {
+            id(ring_light)->turn_off().perform();
+            return;
+          }
+          if (id(g_ring_feedback) != 0) return;
+
+          if (id(g_target) == 0) {
+            id(g_ring_r) = 0x1E; id(g_ring_g) = 0x90; id(g_ring_b) = 0xFF;
+            id(g_ring_brightness) = 0.45f;
+          } else if (id(g_target) == 1) {
+            id(g_ring_r) = 0x9B; id(g_ring_g) = 0x59; id(g_ring_b) = 0xB6;
+            id(g_ring_brightness) = 0.45f;
+          } else if (id(g_target) == 2) {
+            const bool optimistic = id(g_optimistic_valid) && id(g_optimistic_target) == 2 &&
+              millis() - id(g_knob_last_rotate_ms) <= 2000;
+            float kelvin = optimistic && id(g_optimistic_mode) == 1 ? id(g_optimistic_value) :
+              (isnan(id(ceiling_light_color_temp).state) ? 4000.0f : id(ceiling_light_color_temp).state);
+            if (kelvin < 2000.0f) kelvin = 2000.0f;
+            if (kelvin > 6500.0f) kelvin = 6500.0f;
+            const float t = (kelvin - 2000.0f) / 4500.0f;
+            // Interpolate from warm white to cool white.
+            id(g_ring_r) = (int) roundf(255.0f + (221.0f - 255.0f) * t);
+            id(g_ring_g) = (int) roundf(210.0f + (235.0f - 210.0f) * t);
+            id(g_ring_b) = (int) roundf(161.0f + (255.0f - 161.0f) * t);
+            const float raw = optimistic && id(g_optimistic_mode) == 0 ? id(g_optimistic_value) * 2.55f :
+              (isnan(id(ceiling_light_brightness).state) ? 0.0f : id(ceiling_light_brightness).state);
+            id(g_ring_brightness) = raw / 255.0f;
+          } else if (id(g_target) == 3) {
+            const bool optimistic = id(g_optimistic_valid) && id(g_optimistic_target) == 3 &&
+              millis() - id(g_knob_last_rotate_ms) <= 2000;
+            float hue = optimistic && id(g_optimistic_mode) == 1 ? id(g_optimistic_value) :
+              (isnan(id(strip_light_hue).state) ? 0.0f : id(strip_light_hue).state);
+            hue = fmodf(hue, 360.0f); if (hue < 0.0f) hue += 360.0f;
+            const float c = 1.0f;
+            const float x = c * (1.0f - fabsf(fmodf(hue / 60.0f, 2.0f) - 1.0f));
+            float r = 0, g = 0, b = 0;
+            if (hue < 60) { r = c; g = x; }
+            else if (hue < 120) { r = x; g = c; }
+            else if (hue < 180) { g = c; b = x; }
+            else if (hue < 240) { g = x; b = c; }
+            else if (hue < 300) { r = x; b = c; }
+            else { r = c; b = x; }
+            id(g_ring_r) = (int) roundf(r * 255.0f);
+            id(g_ring_g) = (int) roundf(g * 255.0f);
+            id(g_ring_b) = (int) roundf(b * 255.0f);
+            const float raw = optimistic && id(g_optimistic_mode) == 0 ? id(g_optimistic_value) * 2.55f :
+              (isnan(id(strip_light_brightness).state) ? 0.0f : id(strip_light_brightness).state);
+            id(g_ring_brightness) = raw / 255.0f;
+          } else if (id(g_target) == 4 || id(g_target) == 5 || id(g_target) == 6) {
+            const std::string mode = id(g_target) == 4 ? id(climate_state).state :
+              (id(g_target) == 5 ? id(dining_room_climate_state).state : id(floor_heating_state).state);
+            if (mode == "heat") {
+              id(g_ring_r) = 0xFF; id(g_ring_g) = 0x6B; id(g_ring_b) = 0x35;
+            } else if (mode == "cool") {
+              id(g_ring_r) = 0x4F; id(g_ring_g) = 0xC3; id(g_ring_b) = 0xF7;
+            } else {
+              id(g_ring_r) = 255; id(g_ring_g) = 255; id(g_ring_b) = 255;
+            }
+            id(g_ring_brightness) = id(g_target) == 4 ? 0.50f : (id(g_target) == 5 ? 0.45f : 0.40f);
+          } else if (id(g_control_mode) == 3) {
+            // 本机 mode 3 (电量): green while charging, then level-coded green / amber / red.
+            if (id(g_charging) || id(g_batt) > 50) { id(g_ring_r) = 0x35; id(g_ring_g) = 0xC7; id(g_ring_b) = 0x59; }
+            else if (id(g_batt) < 0) { id(g_ring_r) = 0x61; id(g_ring_g) = 0x76; id(g_ring_b) = 0x81; }
+            else if (id(g_batt) > 20) { id(g_ring_r) = 0xFF; id(g_ring_g) = 0xC0; id(g_ring_b) = 0x5A; }
+            else { id(g_ring_r) = 0xE6; id(g_ring_g) = 0x64; id(g_ring_b) = 0x72; }
+            id(g_ring_brightness) = 0.25f;
+          } else {
+            id(g_ring_r) = 255; id(g_ring_g) = 255; id(g_ring_b) = 255;
+            id(g_ring_brightness) = 0.10f;
+          }
+
+          auto call = id(ring_light)->turn_on();
+          call.set_brightness(1.0f);
+          call.set_effect("Ring State");
+          call.perform();
+
+  - id: ring_rotate_feedback
+    mode: restart
+    parameters:
+      direction: int
+    then:
+      - lambda: |-
+          id(g_ring_feedback) = 1;
+          id(g_ring_direction) = direction >= 0 ? 1 : -1;
+          id(g_ring_feedback_started_ms) = millis();
+          auto call = id(ring_light)->turn_on();
+          call.set_brightness(1.0f);
+          call.set_effect("Ring Feedback");
+          call.perform();
+      - delay: 300ms
+      - lambda: 'id(g_ring_feedback) = 0;'
+      - script.execute: ring_update_state
+
+  - id: ring_device_feedback
+    mode: restart
+    then:
+      - lambda: |-
+          id(g_ring_feedback) = 2;
+          id(g_ring_feedback_started_ms) = millis();
+          auto call = id(ring_light)->turn_on();
+          call.set_brightness(1.0f);
+          call.set_effect("Ring Feedback");
+          call.perform();
+      - delay: 200ms
+      - lambda: 'id(g_ring_feedback) = 0;'
+      - script.execute: ring_update_state
+
+  - id: ring_mode_feedback
+    mode: restart
+    then:
+      - lambda: |-
+          id(g_ring_feedback) = 3;
+          id(g_ring_feedback_started_ms) = millis();
+          auto call = id(ring_light)->turn_on();
+          call.set_brightness(1.0f);
+          call.set_effect("Ring Feedback");
+          call.perform();
+      - delay: 200ms
+      - lambda: 'id(g_ring_feedback) = 0;'
+      - script.execute: ring_update_state
+
+  - id: ring_tap_feedback
+    mode: restart
+    then:
+      - lambda: |-
+          id(g_ring_feedback) = 4;
+          id(g_ring_feedback_started_ms) = millis();
+          auto call = id(ring_light)->turn_on();
+          call.set_brightness(1.0f);
+          call.set_effect("Ring Feedback");
+          call.perform();
+      - delay: 400ms
+      - lambda: 'id(g_ring_feedback) = 0;'
+      - script.execute: ring_update_state
+
+  - id: knob_visual_settle
+    mode: restart
+    then:
+      - delay: 500ms
+      - lambda: |-
+          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex(0xF2F6F8), LV_PART_MAIN);
+          lv_obj_set_style_arc_opa(id(arc_value), LV_OPA_70, LV_PART_INDICATOR);
+
+  - id: optimistic_settle
+    mode: restart
+    then:
+      - delay: 2010ms
+      - if:
+          condition:
+            lambda: 'return millis() - id(g_knob_last_rotate_ms) > 2000;'
+          then:
+            - lambda: 'id(g_optimistic_valid) = false;'
+            - if:
+                condition:
+                  lambda: 'return !id(g_sleeping);'
+                then:
+                  - script.execute: render_main
+
+  - id: tv_transport_settle
+    mode: restart
+    then:
+      - delay: 2010ms
+      - lambda: |-
+          if (millis() - id(g_tv_transport_changed_ms) > 2000) {
+            id(g_tv_transport_optimistic) = false;
+          }
+      - if:
+          condition:
+            lambda: 'return !id(g_sleeping);'
+          then:
+            - script.execute: render_main
+
+  - id: sync_from_ha
+    mode: restart
+    then:
+      - delay: 50ms
+      - lambda: |-
+          if (id(g_optimistic_valid) && millis() - id(g_knob_last_rotate_ms) > 2000)
+            id(g_optimistic_valid) = false;
+      - if:
+          condition:
+            lambda: 'return !id(g_sleeping) && millis() - id(g_knob_last_rotate_ms) > 2000 && !id(g_optimistic_valid);'
+          then:
+            - if:
+                condition:
+                  lambda: 'return millis() >= id(g_manual_until);'
+                then:
+                  - script.execute: resolve_priority
+                else:
+                  - script.execute: render_main
+
+  - id: resolve_priority
+    then:
+      - lambda: |-
+          const std::string tv = id(tv_state).state;
+          const std::string homepod = id(homepod_state).state;
+          if (tv == "playing" || tv == "on" || tv == "paused") id(g_target) = 0;
+          else if (homepod == "playing" || homepod == "on" || homepod == "paused") id(g_target) = 1;
+          else if (id(ceiling_light_state).state == "on") id(g_target) = 2;
+          else if (id(strip_light_state).state == "on") id(g_target) = 3;
+          else if (!id(climate_state).state.empty() &&
+                   id(climate_state).state != "off" &&
+                   id(climate_state).state != "unknown" &&
+                   id(climate_state).state != "unavailable") id(g_target) = 4;
+          else if (!id(dining_room_climate_state).state.empty() &&
+                   id(dining_room_climate_state).state != "off" &&
+                   id(dining_room_climate_state).state != "unknown" &&
+                   id(dining_room_climate_state).state != "unavailable") id(g_target) = 5;
+          else if (!id(floor_heating_state).state.empty() &&
+                   id(floor_heating_state).state != "off" &&
+                   id(floor_heating_state).state != "unknown" &&
+                   id(floor_heating_state).state != "unavailable") id(g_target) = 6;
+          // 2.0: the 本机 兜底 (g_target == 7) has moved to Setting Mode, so
+          // Home Mode never falls off the chain. When nothing is controllable
+          // the page still shows the top device (TV) but knob / tap will no-op
+          // because the render_main "online" gate stays false.
+          else id(g_target) = 0;
+          id(g_control_mode) = 0;
+      - script.execute: render_main
+
+  - id: render_main
+    then:
+      - lvgl.label.update:
+          id: lbl_device_name
+          text: !lambda |-
+            switch (id(g_target)) {
+              case 0: return std::string("客厅电视");
+              case 1: return std::string("HomePod");
+              case 2: return std::string("客厅吸顶灯");
+              case 3: return std::string("灯带");
+              case 4: return std::string("客厅空调");
+              case 5: return std::string("餐厅空调");
+              case 6: return std::string("地暖");
+              default: return std::string("Magic Dial");
+            }
+      - lvgl.label.update:
+          id: lbl_mode
+          text: !lambda |-
+            if (id(g_target) == 0 || id(g_target) == 1)
+              return id(g_control_mode) == 0 ? std::string("进度") : std::string("音量");
+            if (id(g_target) == 2)
+              return id(g_control_mode) == 0 ? std::string("亮度") : std::string("色温");
+            if (id(g_target) == 3)
+              return id(g_control_mode) == 0 ? std::string("亮度") : std::string("色相");
+            if (id(g_target) == 4 || id(g_target) == 5 || id(g_target) == 6)
+              return id(g_control_mode) == 0 ? std::string("目标温度") : std::string("模式");
+            // 本机 has four modes; mode 3 (电量) doubles as the charge state readout.
+            if (id(g_control_mode) == 3)
+              return id(g_charging) ? std::string("充电中") : std::string("电量");
+            if (id(g_control_mode) == 2) return std::string("锁屏亮度");
+            return id(g_control_mode) == 0 ? std::string("本机音量") : std::string("屏幕亮度");
+      - lvgl.label.update:
+          id: dev_icon
+          text: !lambda |-
+            switch (id(g_target)) {
+              case 0: return std::string("󰔂");  // mdi-television
+              case 1: return std::string("󰓃");  // mdi-speaker
+              case 2: return std::string("󰝩");  // mdi-ceiling-light
+              case 3: return std::string("󰟖");  // mdi-led-strip
+              case 4: case 5: return std::string("󰀛");  // mdi-air-conditioner
+              case 6: return std::string("󰐸");  // mdi-radiator
+              default:
+                // 本机 mode 3 (电量) swaps the knob glyph for a level-aware battery icon.
+                // While charging it cycles the mdi-battery-charging-* frames, which is the
+                // "filling" animation the upstream batt_render script draws, and it sits
+                // right next to the device name as the ⚡ marker.
+                if (id(g_control_mode) == 3) {
+                  if (id(g_batt) < 0) return std::string("󰂎");  // mdi-battery-outline
+                  if (id(g_charging)) {
+                    static const char *frames[5] = {
+                      "󰂆",  // mdi-battery-charging-20
+                      "󰂈",  // mdi-battery-charging-40
+                      "󰂉",  // mdi-battery-charging-60
+                      "󰂊",  // mdi-battery-charging-80
+                      "󰂅",  // mdi-battery-charging-100
+                    };
+                    return std::string(frames[id(g_chg_anim) % 5]);
+                  }
+                  const int p = id(g_batt);
+                  if (p > 87) return std::string("󰁹");  // mdi-battery
+                  if (p > 62) return std::string("󰂁");  // mdi-battery-80
+                  if (p > 37) return std::string("󰁿");  // mdi-battery-60
+                  if (p > 12) return std::string("󰁽");  // mdi-battery-40
+                  return std::string("󰁻");              // mdi-battery-20
+                }
+                return std::string("󱮖");  // mdi-knob
+            }
+      - lvgl.label.update:
+          id: lbl_value
+          text: !lambda |-
+            // 本机 mode 2 (锁屏亮度): plain integer percent, optimistic while dialing.
+            if (id(g_target) == 7 && id(g_control_mode) == 2) {
+              const bool aod_optimistic = id(g_optimistic_valid) &&
+                id(g_optimistic_target) == 7 && id(g_optimistic_mode) == 2 &&
+                millis() - id(g_knob_last_rotate_ms) <= 2000;
+              char aod_text[8];
+              snprintf(aod_text, sizeof(aod_text), "%d",
+                (int) roundf(aod_optimistic ? id(g_optimistic_value) : (float) id(g_aod_backlight_pct)));
+              return std::string(aod_text);
+            }
+            // 本机 mode 3 (电量): read-only percentage, "--" until the first ADC reading lands.
+            if (id(g_target) == 7 && id(g_control_mode) == 3) {
+              if (id(g_batt) < 0) return std::string("--");
+              char batt_text[8];
+              snprintf(batt_text, sizeof(batt_text), "%d", id(g_batt));
+              return std::string(batt_text);
+            }
+            auto active = [&](int target) -> bool {
+              if (target == 0) { const auto s = id(tv_state).state; return s == "playing" || s == "on" || s == "paused"; }
+              if (target == 1) { const auto s = id(homepod_state).state; return s == "playing" || s == "on" || s == "paused"; }
+              if (target == 2) return id(ceiling_light_state).state == "on";
+              if (target == 3) return id(strip_light_state).state == "on";
+              if (target == 4) { const auto s = id(climate_state).state; return !s.empty() && s != "off" && s != "unknown" && s != "unavailable"; }
+              if (target == 5) { const auto s = id(dining_room_climate_state).state; return !s.empty() && s != "off" && s != "unknown" && s != "unavailable"; }
+              if (target == 6) { const auto s = id(floor_heating_state).state; return !s.empty() && s != "off" && s != "unknown" && s != "unavailable"; }
+              return true;
+            };
+            if (!active(id(g_target))) return std::string("—");
+            const bool optimistic = id(g_optimistic_valid) &&
+              id(g_optimistic_target) == id(g_target) && id(g_optimistic_mode) == id(g_control_mode) &&
+              millis() - id(g_knob_last_rotate_ms) <= 2000;
+            char text[24];
+            // Media targets swapped their slots: mode 0 is now 进度, mode 1 is 音量.
+            // `view` keeps the rest of this renderer in the original 0=numeric /
+            // 1=alternate shape so only the media mapping had to move.
+            const int view = id(g_target) <= 1 ? (id(g_control_mode) == 0 ? 1 : 0) : id(g_control_mode);
+            if (view == 1) {
+              if (id(g_target) == 0) {
+                const bool optimistic_transport = id(g_tv_transport_optimistic) &&
+                  millis() - id(g_tv_transport_changed_ms) <= 2000;
+                const bool playing = optimistic_transport ? id(g_tv_transport_playing) : id(tv_state).state == "playing";
+                return playing ? std::string("▶") : std::string("Ⅱ");
+              }
+              if (id(g_target) == 1) {
+                float seconds = optimistic ? id(g_optimistic_value) : id(homepod_position).state;
+                if (isnan(seconds) || seconds < 0) seconds = 0;
+                int whole = (int) roundf(seconds);
+                if (whole >= 3600) snprintf(text, sizeof(text), "%d:%02d", whole / 3600, (whole / 60) % 60);
+                else snprintf(text, sizeof(text), "%d:%02d", whole / 60, whole % 60);
+                return std::string(text);
+              }
+              if (id(g_target) == 2)
+                return std::string("暖↔冷");
+              if (id(g_target) == 3) {
+                float h = optimistic ? id(g_optimistic_value) : (isnan(id(strip_light_hue).state) ? 0.0f : id(strip_light_hue).state);
+                snprintf(text, sizeof(text), "%.0f", h);
+                return std::string(text);
+              }
+              if (id(g_target) == 4 || id(g_target) == 5 || id(g_target) == 6) {
+                if (optimistic) {
+                  const int mode_index = (int) roundf(id(g_optimistic_value));
+                  if (id(g_target) == 6) {
+                    static const char *floor_names[] = {"关闭", "自动", "制热"};
+                    return std::string(floor_names[mode_index < 0 ? 0 : (mode_index > 2 ? 2 : mode_index)]);
+                  }
+                  static const char *mode_names[] = {"关闭", "自动", "制冷", "制热", "除湿", "送风"};
+                  return std::string(mode_names[mode_index < 0 ? 0 : (mode_index > 5 ? 5 : mode_index)]);
+                }
+                const auto s = id(g_target) == 4 ? id(climate_state).state :
+                  (id(g_target) == 5 ? id(dining_room_climate_state).state : id(floor_heating_state).state);
+                if (s == "cool") return std::string("制冷");
+                if (s == "heat") return std::string("制热");
+                if (s == "auto") return std::string("自动");
+                if (s == "fan_only") return std::string("送风");
+                if (s == "dry") return std::string("除湿");
+                return std::string("关闭");
+              }
+              return std::string((optimistic ? id(g_optimistic_value) : id(g_backlight_pct)) < 45 ? "低" :
+                ((optimistic ? id(g_optimistic_value) : id(g_backlight_pct)) < 85 ? "中" : "高"));
+            }
+            float value = 0;
+            if (id(g_target) == 0) value = optimistic ? id(g_optimistic_value) : (isnan(id(tv_volume).state) ? 0 : id(tv_volume).state * 100.0f);
+            else if (id(g_target) == 1) value = optimistic ? id(g_optimistic_value) : (isnan(id(homepod_volume).state) ? 0 : id(homepod_volume).state * 100.0f);
+            else if (id(g_target) == 2) value = optimistic ? id(g_optimistic_value) : (isnan(id(ceiling_light_brightness).state) ? 0 : id(ceiling_light_brightness).state / 2.55f);
+            else if (id(g_target) == 3) value = optimistic ? id(g_optimistic_value) : (isnan(id(strip_light_brightness).state) ? 0 : id(strip_light_brightness).state / 2.55f);
+            else if (id(g_target) == 4 || id(g_target) == 5 || id(g_target) == 6) {
+              value = optimistic ? id(g_optimistic_value) : (id(g_target) == 4 ? id(climate_target_temperature).state :
+                (id(g_target) == 5 ? id(dining_room_climate_target_temp).state : id(floor_heating_target_temp).state));
+              if (isnan(value)) value = 22.0f;
+              if (fabsf(value - roundf(value)) < 0.05f) snprintf(text, sizeof(text), "%.0f", value);
+              else snprintf(text, sizeof(text), "%.1f", value);
+              return std::string(text);
+            } else value = optimistic ? id(g_optimistic_value) : id(g_local_volume);
+            snprintf(text, sizeof(text), "%.0f", value);
+            return std::string(text);
+      - lvgl.label.update:
+          id: lbl_unit
+          text: !lambda |-
+            // 本机 mode 3 (电量): percent sign only once a real reading exists.
+            if (id(g_target) == 7 && id(g_control_mode) == 3)
+              return id(g_batt) >= 0 ? std::string("%") : std::string("");
+            // 本机 mode 2 (锁屏亮度) is always a percentage.
+            if (id(g_target) == 7 && id(g_control_mode) == 2) return std::string("%");
+            // Media: 音量 (mode 1) is a percentage; 进度 (mode 0) renders its own glyph/timestamp.
+            if (id(g_target) <= 1) return id(g_control_mode) == 1 ? std::string("%") : std::string("");
+            if (id(g_control_mode) == 0) return (id(g_target) >= 4 && id(g_target) <= 6) ? std::string("°C") : std::string("%");
+            if (id(g_target) == 3) return std::string("°");
+            return std::string("");
+      - lambda: |-
+          auto active = [&](int target) -> bool {
+            if (target == 0) { const auto s=id(tv_state).state; return s=="playing"||s=="on"||s=="paused"; }
+            if (target == 1) { const auto s=id(homepod_state).state; return s=="playing"||s=="on"||s=="paused"; }
+            if (target == 2) return id(ceiling_light_state).state == "on";
+            if (target == 3) return id(strip_light_state).state == "on";
+            if (target == 4) { const auto s=id(climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+            if (target == 5) { const auto s=id(dining_room_climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+            if (target == 6) { const auto s=id(floor_heating_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+            return true;
+          };
+          const bool online = active(id(g_target));
+          // `online` lumps "switched off" together with "cannot be reached", but the two
+          // deserve different copy: a lamp that is simply off is not a fault. Only
+          // unavailable / unknown (or a missing state) counts as a real outage.
+          auto raw_state = [&](int target) -> std::string {
+            switch (target) {
+              case 0: return id(tv_state).state;
+              case 1: return id(homepod_state).state;
+              case 2: return id(ceiling_light_state).state;
+              case 3: return id(strip_light_state).state;
+              case 4: return id(climate_state).state;
+              case 5: return id(dining_room_climate_state).state;
+              case 6: return id(floor_heating_state).state;
+              default: return std::string("on");  // the local speaker is always reachable
+            }
+          };
+          const std::string target_state = raw_state(id(g_target));
+          const bool truly_offline = target_state.empty() || target_state == "unavailable" ||
+            target_state == "unknown";
+          id(g_target_online) = online;
+          // The red dot means "cannot be reached", so a device that is merely switched
+          // off no longer lights it. The arc still needs a live value, so it only shows
+          // while the target is actually on.
+          if (truly_offline) lv_obj_clear_flag(id(offline_dot), LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(id(offline_dot), LV_OBJ_FLAG_HIDDEN);
+          if (online) lv_obj_clear_flag(id(arc_value), LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(id(arc_value), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_set_style_text_color(id(lbl_device_name), lv_color_hex(online ? 0xBFD0D8 : 0x81919A), LV_PART_MAIN);
+          if (!online) lv_label_set_text(id(lbl_mode), truly_offline ? "设备离线" : "已关闭");
+          // The flex row keeps the value and unit aligned, so only the font
+          // changes per target; no manual y offsets are needed any more.
+          lv_obj_set_style_text_font(id(lbl_value), id(font_mono_76), LV_PART_MAIN);
+          // Media targets read 0=进度 / 1=音量, so the alternate-view test is inverted for them.
+          const int font_view = id(g_target) <= 1 ? (id(g_control_mode) == 0 ? 1 : 0) : id(g_control_mode);
+          if (online && font_view == 1) {
+            if (id(g_target) == 1) {
+              lv_obj_set_style_text_font(id(lbl_value), id(font_mono_68), LV_PART_MAIN);
+            } else if (id(g_target) == 0 || id(g_target) == 2 || id(g_target) == 7) {
+              // TV playback glyph, color-temperature graphic and local brightness are hero text.
+              lv_obj_set_style_text_font(id(lbl_value), id(font_sc_52), LV_PART_MAIN);
+            } else if (id(g_target) >= 4 && id(g_target) <= 6) {
+              lv_obj_set_style_text_font(id(lbl_value), id(font_sc_44), LV_PART_MAIN);
+            }
+          }
+
+          uint32_t accent = 0x45D6C5;
+          if (id(g_target) <= 1) accent = id(g_target) == 0 ? 0x49A8FF : 0x6A9BFF;
+          else if (id(g_target) == 2 || id(g_target) == 3) accent = id(g_control_mode) == 0 ? 0xFFC05A : 0xFFB36A;
+          else if (id(g_target) == 4 || id(g_target) == 5 || id(g_target) == 6) {
+            const bool optimistic_color = id(g_optimistic_valid) && id(g_optimistic_target) == id(g_target) &&
+              id(g_optimistic_mode) == 0 && millis() - id(g_knob_last_rotate_ms) <= 2000;
+            float temp = optimistic_color ? id(g_optimistic_value) : (id(g_target) == 4 ? id(climate_target_temperature).state :
+              (id(g_target) == 5 ? id(dining_room_climate_target_temp).state : id(floor_heating_target_temp).state));
+            if (isnan(temp)) temp = 22.0f;
+            float t = fminf(1.0f, fmaxf(0.0f, (temp - 16.0f) / 15.0f));
+            uint8_t r, g, b;
+            if (t < 0.5f) { float q=t*2; r=roundf(0x66 + (0x79 - 0x66)*q); g=roundf(0xC8 + (0xD4 - 0xC8)*q); b=roundf(0xFF + (0xC0 - 0xFF)*q); }
+            else { float q=(t-0.5f)*2; r=roundf(0x79 + (0xFF - 0x79)*q); g=roundf(0xD4 + (0x82 - 0xD4)*q); b=roundf(0xC0 + (0x6E - 0xC0)*q); }
+            accent = (r<<16)|(g<<8)|b;
+          } else if (id(g_target) == 7 && id(g_control_mode) == 3) {
+            // 电量: green while charging, otherwise level-coded green / amber / red.
+            if (id(g_charging)) accent = 0x35C759;
+            else if (id(g_batt) < 0) accent = 0x617681;
+            else if (id(g_batt) > 50) accent = 0x35C759;
+            else if (id(g_batt) > 20) accent = 0xFFC05A;
+            else accent = 0xE66472;
+          }
+          lv_obj_set_style_arc_color(id(arc_value), lv_color_hex(accent), LV_PART_INDICATOR);
+          id(g_arc_color) = (int) accent;
+          lv_obj_set_style_text_color(id(dev_icon), lv_color_hex(online ? 0xBFD0D8 : 0x81919A), LV_PART_MAIN);
+          // Line widget ids are LvLineType*, so ->obj is needed for raw LVGL calls.
+          // Wheel: the selected mode wears the domain color, neighbours stay ghosted.
+          uint32_t wheel_accent = 0x9EB2BC;
+          if (id(g_target) <= 1) wheel_accent = 0x49A8FF;
+          else if (id(g_target) == 2 || id(g_target) == 3) wheel_accent = 0xFFD166;
+          else if (id(g_target) >= 4 && id(g_target) <= 6) wheel_accent = 0xFF8C61;
+          else if (id(g_control_mode) == 3 && id(g_charging)) wheel_accent = 0x35C759;
+
+          auto mode_name = [&](int target, int mode) -> const char * {
+            if (target == 0 || target == 1) return mode == 0 ? "进度" : "音量";
+            if (target == 2) return mode == 0 ? "亮度" : "色温";
+            if (target == 3) return mode == 0 ? "亮度" : "色相";
+            if (target >= 4 && target <= 6) return mode == 0 ? "目标温度" : "模式";
+            // 本机 is the only target with four modes; the last one is read-only.
+            return mode == 0 ? "本机音量" : (mode == 1 ? "屏幕亮度" : (mode == 2 ? "锁屏亮度" : "电量"));
+          };
+          // Classic three-slot wheel: the selected mode is the big centre label, and
+          // the previous / next options bleed in above and below. With only two modes
+          // the list wraps, so both neighbours show the same "other" name; 本机 has
+          // four, so its neighbours are genuinely different.
+          const int mode_count = id(g_target) == 7 ? 4 : 2;
+          const int prev_mode = (id(g_control_mode) + mode_count - 1) % mode_count;
+          const int next_mode = (id(g_control_mode) + 1) % mode_count;
+          lv_label_set_text(id(lbl_wheel_prev), mode_name(id(g_target), prev_mode));
+          lv_label_set_text(id(lbl_wheel_next), mode_name(id(g_target), next_mode));
+          lv_obj_set_style_text_font(id(lbl_mode), id(font_sc_20), LV_PART_MAIN);
+          // Red is reserved for a genuine outage; a device that is merely switched off
+          // gets the same neutral grey as the ghosted neighbours.
+          const uint32_t centre_color = online ? wheel_accent : (truly_offline ? 0xE66472 : 0x36505D);
+          lv_obj_set_style_text_color(id(lbl_mode), lv_color_hex(centre_color), LV_PART_MAIN);
+          lv_obj_set_style_text_opa(id(lbl_mode), LV_OPA_COVER, LV_PART_MAIN);
+          lv_obj_clear_flag(id(lbl_mode), LV_OBJ_FLAG_HIDDEN);
+          // Always re-seat the stack at its rest position: if a device swipe cancels an
+          // in-flight mode slide, the box would otherwise stay parked one notch off.
+          lv_obj_set_y(id(wheel_box), 214);
+          lv_obj_t *neighbours[] = {id(lbl_wheel_prev), id(lbl_wheel_next)};
+          for (auto *neighbour : neighbours) {
+            lv_obj_set_style_text_font(neighbour, id(font_sc_16), LV_PART_MAIN);
+            lv_obj_set_style_text_color(neighbour, lv_color_hex(0x36505D), LV_PART_MAIN);
+            lv_obj_set_style_text_opa(neighbour, LV_OPA_40, LV_PART_MAIN);
+            // Offline the centre label carries a notice, so the wheel context is dropped.
+            if (online) lv_obj_clear_flag(neighbour, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(neighbour, LV_OBJ_FLAG_HIDDEN);
+          }
+
+          // Park the unit just right of the digits, baseline-aligned with them.
+          // lbl_value is CENTER-aligned, which means its x/translate styles act as an
+          // OFFSET from the centre rather than an absolute position. Any animation that
+          // ever touched x leaves that offset behind and the digits stay off-centre, so
+          // both are zeroed on every render before measuring.
+          lv_obj_set_x(id(lbl_value), 0);
+          lv_obj_set_style_translate_x(id(lbl_value), 0, LV_PART_MAIN);
+          lv_obj_set_style_translate_y(id(lbl_value), 0, LV_PART_MAIN);
+          lv_obj_set_style_translate_x(id(lbl_unit), 0, LV_PART_MAIN);
+          lv_obj_set_style_translate_y(id(lbl_unit), 0, LV_PART_MAIN);
+          // Measure only after the final font for this target/mode has been applied,
+          // otherwise value_w is one frame stale and the unit lands in the wrong place.
+          lv_obj_update_layout(id(lbl_value));
+          const int value_w = lv_obj_get_width(id(lbl_value));
+          int unit_x = 180 + value_w / 2 + 4;
+          if (unit_x > 344) unit_x = 344;  // never let the unit run off the round screen
+          lv_obj_set_pos(id(lbl_unit), unit_x, 168);
+
+          // Center the icon+name pair on x=180. Both are content-sized, so the
+          // group width is only known after the label text has been applied.
+          // translate_x is zeroed first: the swipe fly-in animates translate, and a
+          // cancelled animation would otherwise leave the pair permanently shifted.
+          lv_obj_set_style_translate_x(id(dev_icon), 0, LV_PART_MAIN);
+          lv_obj_set_style_translate_x(id(lbl_device_name), 0, LV_PART_MAIN);
+          lv_obj_update_layout(id(lbl_device_name));
+          const int icon_w = lv_obj_get_width(id(dev_icon));
+          const int name_w = lv_obj_get_width(id(lbl_device_name));
+          const int group_left = 180 - (icon_w + 8 + name_w) / 2;
+          lv_obj_set_x(id(dev_icon), group_left);
+          lv_obj_set_x(id(lbl_device_name), group_left + icon_w + 8);
+
+          // All 7 targets are swipe-reachable now (2.0 dropped 本机 into Setting),
+          // so every one gets a dot. Inactive targets are drawn dimmer.
+          int available[7], count=0, selected=0;
+          for (int t=0; t<7; t++) { if (t==id(g_target)) selected=count; available[count++]=t; }
+          const int visible = count > 7 ? 7 : count;
+          int window_start = count > 7 ? selected - 3 : 0;
+          if (window_start < 0) window_start = 0;
+          if (window_start > count - visible) window_start = count - visible;
+          const int selected_dot = selected - window_start;
+          lv_obj_t *dots[7] = {id(dot_0),id(dot_1),id(dot_2),id(dot_3),id(dot_4),id(dot_5),id(dot_6)};
+          for (int i=0;i<7;i++) {
+            if (count < 2 || i >= visible) { lv_obj_add_flag(dots[i], LV_OBJ_FLAG_HIDDEN); continue; }
+            lv_obj_clear_flag(dots[i], LV_OBJ_FLAG_HIDDEN);
+            const bool overflow_edge = count > 7 && ((i == 0 && window_start > 0) || (i == 6 && window_start + visible < count));
+            const int diameter = overflow_edge ? 4 : 6;
+            lv_obj_set_size(dots[i], diameter, diameter);
+            lv_obj_set_style_radius(dots[i], LV_RADIUS_CIRCLE, LV_PART_MAIN);
+            lv_obj_align(dots[i], LV_ALIGN_TOP_MID, (i * 16) - ((visible - 1) * 16 / 2), 311);
+            lv_obj_set_style_bg_color(dots[i], lv_color_hex(i == selected_dot ? 0xF2F6F8 :
+              (active(available[window_start + i]) ? 0x37464D : 0x232D31)), LV_PART_MAIN);
+          }
+      - lvgl.arc.update:
+          id: arc_value
+          value: !lambda |-
+            const bool optimistic = id(g_optimistic_valid) &&
+              id(g_optimistic_target) == id(g_target) && id(g_optimistic_mode) == id(g_control_mode) &&
+              millis() - id(g_knob_last_rotate_ms) <= 2000;
+            float value = 0;
+            if (id(g_target) == 0)
+              value = id(g_control_mode) == 1
+                ? (optimistic ? id(g_optimistic_value) : (isnan(id(tv_volume).state) ? 0 : id(tv_volume).state * 100.0f))
+                : ((isnan(id(tv_position).state) || isnan(id(tv_duration).state) || id(tv_duration).state <= 0) ? 0 : id(tv_position).state / id(tv_duration).state * 100.0f);
+            else if (id(g_target) == 1)
+              value = id(g_control_mode) == 1
+                ? (optimistic ? id(g_optimistic_value) : (isnan(id(homepod_volume).state) ? 0 : id(homepod_volume).state * 100.0f))
+                : (optimistic ? ((isnan(id(homepod_duration).state) || id(homepod_duration).state <= 0) ? 0 : id(g_optimistic_value) / id(homepod_duration).state * 100.0f) : ((isnan(id(homepod_position).state) || isnan(id(homepod_duration).state) || id(homepod_duration).state <= 0) ? 0 : id(homepod_position).state / id(homepod_duration).state * 100.0f));
+            else if (id(g_target) == 2)
+              value = id(g_control_mode) == 0
+                ? (optimistic ? id(g_optimistic_value) : (isnan(id(ceiling_light_brightness).state) ? 0 : id(ceiling_light_brightness).state / 255.0f * 100.0f))
+                : ((optimistic ? id(g_optimistic_value) : (isnan(id(ceiling_light_color_temp).state) ? 4000.0f : id(ceiling_light_color_temp).state)) - 2000.0f) / 45.0f;
+            else if (id(g_target) == 3)
+              value = id(g_control_mode) == 0
+                ? (optimistic ? id(g_optimistic_value) : (isnan(id(strip_light_brightness).state) ? 0 : id(strip_light_brightness).state / 255.0f * 100.0f))
+                : (optimistic ? id(g_optimistic_value) / 360.0f * 100.0f : (isnan(id(strip_light_hue).state) ? 0 : id(strip_light_hue).state / 360.0f * 100.0f));
+            else if (id(g_target) == 4 && id(g_control_mode) == 0) {
+              const float temp = optimistic ? id(g_optimistic_value) : (isnan(id(climate_target_temperature).state) ? 22.0f : id(climate_target_temperature).state);
+              value = (temp - 16.0f) / 15.0f * 100.0f;
+            } else if (id(g_target) == 5 && id(g_control_mode) == 0) {
+              const float temp = optimistic ? id(g_optimistic_value) : (isnan(id(dining_room_climate_target_temp).state) ? 22.0f : id(dining_room_climate_target_temp).state);
+              value = (temp - 16.0f) / 15.0f * 100.0f;
+            } else if (id(g_target) == 6 && id(g_control_mode) == 0) {
+              const float temp = optimistic ? id(g_optimistic_value) : (isnan(id(floor_heating_target_temp).state) ? 22.0f : id(floor_heating_target_temp).state);
+              value = (temp - 16.0f) / 15.0f * 100.0f;
+            } else if (id(g_target) == 7) {
+              // mode 3 (电量) is read-only: 0-100 % maps straight onto the arc.
+              if (id(g_control_mode) == 3) value = id(g_batt) < 0 ? 0.0f : (float) id(g_batt);
+              // mode 2 (锁屏亮度) spans 5-50 %, stretched across the whole sweep.
+              else if (id(g_control_mode) == 2) {
+                const float raw = optimistic ? id(g_optimistic_value) : (float) id(g_aod_backlight_pct);
+                value = (raw - 5.0f) / 45.0f * 100.0f;
+              }
+              else value = optimistic ? id(g_optimistic_value) : (id(g_control_mode) == 0 ? id(g_local_volume) : id(g_backlight_pct));
+            }
+            if (value < 0) value = 0;
+            if (value > 100) value = 100;
+            // Hand the value to the smoothing layer instead of drawing it. A
+            // device or control-mode change snaps (a 0 -> 90 % sweep across the
+            // dial would read as a glitch), everything else - knob pulses and
+            // HA-driven updates alike - is eased by the `arc_ease` interval.
+            id(g_arc_target_pct) = value;
+            if (id(g_arc_anim_target) != id(g_target) || id(g_arc_anim_mode) != id(g_control_mode)) {
+              id(g_arc_anim_target) = id(g_target);
+              id(g_arc_anim_mode) = id(g_control_mode);
+              id(g_arc_display_pct) = value;
+            }
+            id(g_arc_pct) = (int) roundf(id(g_arc_display_pct));
+            return id(g_arc_pct);
+      - lambda: |-
+          // Glowing endpoint that rides the arc. Geometry: the arc widget is 316x316
+          // centred on (180,180) with an 8px band, so the band's centre-line radius is
+          // 316/2 - 8/2 = 154. LVGL angles start at 3 o'clock and grow clockwise, and
+          // this arc runs start_angle 135 -> end_angle 45, i.e. 270 degrees.
+          if (!id(g_target_online)) {
+            lv_obj_add_flag(id(arc_dot), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            const float pct = id(g_arc_pct) / 100.0f;
+            const float angle_rad = (135.0f + pct * 270.0f) * 3.14159265f / 180.0f;
+            const int dot_x = (int) roundf(180.0f + 154.0f * cosf(angle_rad)) - 4;
+            const int dot_y = (int) roundf(180.0f + 154.0f * sinf(angle_rad)) - 4;
+            lv_obj_set_pos(id(arc_dot), dot_x, dot_y);
+            lv_obj_set_style_bg_color(id(arc_dot), lv_color_hex((uint32_t) id(g_arc_color)), LV_PART_MAIN);
+            lv_obj_clear_flag(id(arc_dot), LV_OBJ_FLAG_HIDDEN);
+          }
+      - script.execute: ring_update_state
+
+  - id: render_aod
+    then:
+      # 2.0: the lock screen shows a MM.DD date (e.g. "08.17") on the Pacifico
+      # label, with the four glow copies keeping it legible over the family photo.
+      # Music mode swaps the label for a big music-note icon while the HomePod is
+      # playing (handled by render_lockscreen_music which toggles the two layers).
+      - lambda: |-
+          auto now = id(ha_time).now();
+          if (!now.is_valid()) {
+            id(g_aod_clock) = "--.--";
+          } else {
+            char text[8];
+            snprintf(text, sizeof(text), "%02d.%02d", now.month, now.day_of_month);
+            id(g_aod_clock) = text;
+          }
+      - lvgl.label.update:
+          id: lbl_aod_time_g1
+          text: !lambda 'return id(g_aod_clock);'
+      - lvgl.label.update:
+          id: lbl_aod_time_g2
+          text: !lambda 'return id(g_aod_clock);'
+      - lvgl.label.update:
+          id: lbl_aod_time_g3
+          text: !lambda 'return id(g_aod_clock);'
+      - lvgl.label.update:
+          id: lbl_aod_time_g4
+          text: !lambda 'return id(g_aod_clock);'
+      - lvgl.label.update:
+          id: lbl_aod_time
+          text: !lambda 'return id(g_aod_clock);'
+      # 2.0 lock screen suppresses the old Chinese date/weekday and holiday
+      # captions - the design calls for the family photo, the Pacifico date,
+      # and the mode selector arc (when active). Nothing else. `hidden` on the
+      # widgets themselves would be overridden by other flows, so hide them here.
+      - lvgl.widget.hide: lbl_aod_date
+      - lvgl.widget.hide: lbl_aod_holiday
+
+  # 2.0 addition: refresh the lock screen. Rebuilds the date via render_aod and
+  # then applies music-mode visibility so the correct layer (Pacifico date vs.
+  # music icon) is on top. Called on boot, on wake, at midnight, and whenever
+  # the HomePod state flips while the dial is on the lockscreen.
+  - id: render_lockscreen
+    then:
+      - script.execute: render_aod
+      - lambda: |-
+          const std::string state = id(homepod_state).state;
+          const bool playing = state == "playing";
+          const bool should = playing && id(g_ui_mode) == 0;
+          id(g_music_mode) = should;
+      - if:
+          condition: { lambda: 'return id(g_music_mode);' }
+          then:
+            - lvgl.widget.hide: lbl_aod_time
+            - lvgl.widget.hide: lbl_aod_time_g1
+            - lvgl.widget.hide: lbl_aod_time_g2
+            - lvgl.widget.hide: lbl_aod_time_g3
+            - lvgl.widget.hide: lbl_aod_time_g4
+            - lvgl.widget.show: lbl_aod_music
+            - lambda: |-
+                // Spin the family photo. Continuous rotation is a lot to ask the
+                // MIPI SPI panel for 360x360, so we sample 24 stops (15 deg per
+                // step) with a slow interval - see aod_music_spin below.
+                id(g_aod_music_active) = true;
+          else:
+            - lvgl.widget.show: lbl_aod_time
+            - lvgl.widget.show: lbl_aod_time_g1
+            - lvgl.widget.show: lbl_aod_time_g2
+            - lvgl.widget.show: lbl_aod_time_g3
+            - lvgl.widget.show: lbl_aod_time_g4
+            - lvgl.widget.hide: lbl_aod_music
+            - lambda: |-
+                id(g_aod_music_active) = false;
+                // Reset photo to upright when leaving music mode.
+                lv_img_set_angle(id(img_aod_bg), 0);
+                id(g_aod_photo_angle) = 0;
+
+  # Mode selector overlay (arc at the bottom of the lockscreen). show / hide /
+  # rotate / confirm are the four verbs used by the input router.
+  - id: sel_show
+    then:
+      - lambda: |-
+          id(g_sel_active) = true;
+          id(g_sel_last_ms) = millis();
+      - lvgl.widget.show: sel_bar
+      - script.execute: sel_render
+
+  - id: sel_hide
+    then:
+      - lambda: 'id(g_sel_active) = false;'
+      - lvgl.widget.hide: sel_bar
+
+  - id: sel_render
+    then:
+      - lvgl.label.update:
+          id: sel_name
+          text: !lambda |-
+            switch (id(g_sel_idx)) {
+              case 1: return std::string("Home");
+              case 2: return std::string("Remote");
+              case 3: return std::string("Timer");
+              case 4: return std::string("Weather");
+              case 5: return std::string("Setting");
+              default: return std::string("");
+            }
+      - lambda: |-
+          lv_obj_t *dots[5] = {id(sel_i1), id(sel_i2), id(sel_i3), id(sel_i4), id(sel_i5)};
+          for (int i = 0; i < 5; i++) {
+            const bool sel = (i + 1) == id(g_sel_idx);
+            lv_obj_set_style_text_color(dots[i],
+              lv_color_hex(sel ? 0xF2F6F8 : 0x617681), LV_PART_MAIN);
+            lv_obj_set_style_text_opa(dots[i],
+              sel ? LV_OPA_COVER : LV_OPA_60, LV_PART_MAIN);
+          }
+
+  - id: sel_rotate
+    parameters:
+      direction: int
+    then:
+      - lambda: |-
+          id(g_sel_last_ms) = millis();
+          int next = id(g_sel_idx) + (direction > 0 ? 1 : -1);
+          if (next < 1) next = 5;
+          if (next > 5) next = 1;
+          id(g_sel_idx) = next;
+      - if:
+          condition: { lambda: 'return !id(g_sel_active);' }
+          then:
+            - script.execute: sel_show
+          else:
+            - script.execute: sel_render
+
+  # Enter a UI mode (1..5) from the lock screen. Handles the page transition,
+  # the priority-engine bootstrap for Home / Setting, and hides the selector.
+  - id: enter_ui_mode
+    parameters:
+      mode: int
+    then:
+      - script.execute: sel_hide
+      - lambda: |-
+          id(g_ui_mode) = mode;
+          id(g_sleeping) = false;
+          id(g_last_activity) = millis();
+          id(g_backlight_pct) = 100;
+          // Immediately exit music mode when leaving the lock; render_lockscreen
+          // owns the visual toggle, but the flag flip is needed for
+          // aod_music_spin to stop rotating the photo mid-transition.
+          id(g_music_mode) = false;
+          id(g_aod_music_active) = false;
+          lv_img_set_angle(id(img_aod_bg), 0);
+          id(g_aod_photo_angle) = 0;
+      - light.turn_on:
+          id: backlight_light
+          brightness: 100%
+      # Home + Setting bootstrap: Home reads the priority engine; Setting sits on
+      # top of the 本机 slot and does not go through it. Remote / Timer / Weather
+      # are purely presentational until their own knob handlers wake up.
+      - if:
+          condition: { lambda: 'return mode == 1;' }
+          then:
+            - script.execute: resolve_priority
+            - lvgl.page.show: { id: page_main, animation: fade_in, time: 250ms }
+      - if:
+          condition: { lambda: 'return mode == 2;' }
+          then:
+            - lvgl.page.show: { id: page_remote, animation: fade_in, time: 250ms }
+      - if:
+          condition: { lambda: 'return mode == 3;' }
+          then:
+            - script.execute: timer_render
+            - lvgl.page.show: { id: page_timer, animation: fade_in, time: 250ms }
+      - if:
+          condition: { lambda: 'return mode == 4;' }
+          then:
+            - script.execute: wx_render
+            - lvgl.page.show: { id: page_weather, animation: fade_in, time: 250ms }
+      - if:
+          condition: { lambda: 'return mode == 5;' }
+          then:
+            - script.execute: set_render
+            - lvgl.page.show: { id: page_setting, animation: fade_in, time: 250ms }
+
+  - id: enter_sleep
+    then:
+      # 2.0: sleep always returns to the lock. Whatever the user was in
+      # (Home / Remote / Timer / Weather / Setting) is dropped; the next
+      # activity has to pass through the mode selector.
+      - lambda: |-
+          id(g_sleeping) = true;
+          id(g_ui_mode) = 0;
+          id(g_sel_active) = false;
+      - script.execute: ring_update_state
+      - script.execute: render_lockscreen
+      - lvgl.widget.hide: sel_bar
+      - lvgl.page.show:
+          id: page_aod
+          animation: fade_in
+          time: 300ms
+      - light.turn_on:
+          id: backlight_light
+          brightness: !lambda 'return id(g_aod_backlight_pct) / 100.0f;'
+
+  - id: wake_display
+    then:
+      # 2.0: waking never lands on Home directly - it always lands on the lock
+      # so the mode selector can decide where to go next. The old "wake to
+      # page_main" path is retained conceptually via enter_ui_mode(1).
+      - lambda: |-
+          id(g_sleeping) = false;
+          id(g_last_activity) = millis();
+          id(g_manual_until) = 0;
+          id(g_backlight_pct) = 100;
+          id(g_ui_mode) = 0;
+      - light.turn_on:
+          id: backlight_light
+          brightness: 100%
+      - script.execute: render_lockscreen
+      - lvgl.page.show:
+          id: page_aod
+          animation: fade_in
+          time: 250ms
+
+  - id: cycle_target
+    parameters:
+      direction: int
+    then:
+      - lambda: |-
+          // 2.0: 本机 (target 7) has moved to Setting Mode, so Home now walks
+          // the seven device targets 0..6 only.
+          id(g_target) = (id(g_target) + (direction > 0 ? 1 : 6)) % 7;
+          id(g_control_mode) = 0;
+          id(g_optimistic_valid) = false;
+          id(g_manual_until) = millis() + 60000;
+      - script.execute: render_main
+      - script.execute: ring_device_feedback
+      - lambda: |-
+          // Lightweight target transition: the center stage fades in; the outer orbit stays fixed.
+          lv_obj_t *items[] = {id(lbl_value), id(lbl_unit), id(wheel_box)};
+          for (auto *item : items) {
+            // Drop any animation still running from a previous rapid swipe, otherwise its
+            // remaining frames keep writing stale values over the fresh layout.
+            lv_anim_del(item, nullptr);
+            lv_obj_set_style_opa(item, LV_OPA_20, LV_PART_MAIN);
+            lv_anim_t a; lv_anim_init(&a); lv_anim_set_var(&a, item);
+            lv_anim_set_values(&a, LV_OPA_20, LV_OPA_COVER); lv_anim_set_duration(&a, 240);
+            lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+            lv_anim_set_exec_cb(&a, [](void *o, int32_t v) { lv_obj_set_style_opa((lv_obj_t *) o, (lv_opa_t) v, LV_PART_MAIN); });
+            lv_anim_start(&a);
+          }
+          // Direction-aware fly-in for the device identity only. translate_x is used
+          // instead of x so the group centering computed by render_main stays intact;
+          // render_main also zeroes translate_x, so a cancelled animation self-heals.
+          const int32_t from_dx = direction > 0 ? 20 : -20;
+          lv_obj_t *identity[] = {id(dev_icon), id(lbl_device_name)};
+          for (auto *item : identity) {
+            lv_anim_del(item, nullptr);
+            lv_obj_set_style_translate_x(item, from_dx, LV_PART_MAIN);
+            lv_obj_set_style_opa(item, LV_OPA_20, LV_PART_MAIN);
+            lv_anim_t slide; lv_anim_init(&slide); lv_anim_set_var(&slide, item);
+            lv_anim_set_values(&slide, from_dx, 0); lv_anim_set_duration(&slide, 200);
+            lv_anim_set_path_cb(&slide, lv_anim_path_ease_in_out);
+            lv_anim_set_exec_cb(&slide, [](void *o, int32_t v) { lv_obj_set_style_translate_x((lv_obj_t *) o, v, LV_PART_MAIN); });
+            lv_anim_start(&slide);
+            lv_anim_t fade; lv_anim_init(&fade); lv_anim_set_var(&fade, item);
+            lv_anim_set_values(&fade, LV_OPA_20, LV_OPA_COVER); lv_anim_set_duration(&fade, 200);
+            lv_anim_set_path_cb(&fade, lv_anim_path_ease_in_out);
+            lv_anim_set_exec_cb(&fade, [](void *o, int32_t v) { lv_obj_set_style_opa((lv_obj_t *) o, (lv_opa_t) v, LV_PART_MAIN); });
+            lv_anim_start(&fade);
+          }
+      - homeassistant.event:
+          event: esphome.magic_dial_target_changed
+          data:
+            target: !lambda |-
+              switch (id(g_target)) {
+                case 0: return std::string("${tv_entity}");
+                case 1: return std::string("${homepod_entity}");
+                case 2: return std::string("${ceiling_light_entity}");
+                case 3: return std::string("${strip_light_entity}");
+                case 4: return std::string("${living_room_climate_entity}");
+                case 5: return std::string("${dining_room_climate_entity}");
+                case 6: return std::string("${floor_heating_entity}");
+                default: return std::string("local_speaker");
+              }
+
+  - id: switch_mode
+    parameters:
+      direction: int
+    then:
+      - lambda: |-
+          // 2.0: Home Mode only has real device targets 0..6, each with two
+          // control modes. The old 本机 four-mode wheel now lives in Setting.
+          const int mode_count = 2;
+          id(g_control_mode) = (id(g_control_mode) + (direction > 0 ? 1 : mode_count - 1)) % mode_count;
+          id(g_optimistic_valid) = false;
+          id(g_manual_until) = millis() + 60000;
+      - script.execute: render_main
+      - script.execute: ring_mode_feedback
+      - lambda: |-
+          lv_obj_t *items[] = {id(lbl_value), id(lbl_unit)};
+          for (auto *item : items) {
+            lv_obj_set_style_opa(item, LV_OPA_20, LV_PART_MAIN);
+            lv_anim_t a; lv_anim_init(&a); lv_anim_set_var(&a, item);
+            lv_anim_set_values(&a, LV_OPA_20, LV_OPA_COVER); lv_anim_set_duration(&a, 200);
+            lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+            lv_anim_set_exec_cb(&a, [](void *o, int32_t v) { lv_obj_set_style_opa((lv_obj_t *) o, (lv_opa_t) v, LV_PART_MAIN); });
+            lv_anim_start(&a);
+          }
+          // Wheel rotation: the whole three-slot stack travels one notch (26px, the
+          // tightened slot pitch) from the side the finger came from, while the new
+          // centre label fades up. direction > 0 (flick up) starts the stack low and
+          // lifts it, so the incoming option rises from the lower slot.
+          const int32_t from_y = 214 + (direction > 0 ? 26 : -26);
+          lv_anim_del(id(wheel_box), nullptr);
+          lv_obj_set_y(id(wheel_box), from_y);
+          lv_anim_t slide; lv_anim_init(&slide); lv_anim_set_var(&slide, id(wheel_box));
+          lv_anim_set_values(&slide, from_y, 214); lv_anim_set_duration(&slide, 200);
+          lv_anim_set_path_cb(&slide, lv_anim_path_ease_in_out);
+          lv_anim_set_exec_cb(&slide, [](void *o, int32_t v) { lv_obj_set_y((lv_obj_t *) o, v); });
+          lv_anim_start(&slide);
+          lv_obj_set_style_text_opa(id(lbl_mode), LV_OPA_40, LV_PART_MAIN);
+          lv_anim_t fade; lv_anim_init(&fade); lv_anim_set_var(&fade, id(lbl_mode));
+          lv_anim_set_values(&fade, LV_OPA_40, LV_OPA_COVER); lv_anim_set_duration(&fade, 200);
+          lv_anim_set_path_cb(&fade, lv_anim_path_ease_in_out);
+          lv_anim_set_exec_cb(&fade, [](void *o, int32_t v) { lv_obj_set_style_text_opa((lv_obj_t *) o, (lv_opa_t) v, LV_PART_MAIN); });
+          lv_anim_start(&fade);
+      - homeassistant.event:
+          event: esphome.magic_dial_mode_changed
+          data:
+            direction: !lambda 'return direction > 0 ? std::string("up") : std::string("down");'
+            mode: !lambda |-
+              if (id(g_target) <= 1) return id(g_control_mode) == 0 ? std::string("progress") : std::string("volume");
+              if (id(g_target) == 2) return id(g_control_mode) == 0 ? std::string("brightness") : std::string("color_temperature");
+              if (id(g_target) == 3) return id(g_control_mode) == 0 ? std::string("brightness") : std::string("hue");
+              if (id(g_target) == 4 || id(g_target) == 5 || id(g_target) == 6) return id(g_control_mode) == 0 ? std::string("target_temperature") : std::string("hvac_mode");
+              if (id(g_control_mode) == 3) return std::string("battery");
+              if (id(g_control_mode) == 2) return std::string("aod_brightness");
+              return id(g_control_mode) == 0 ? std::string("local_volume") : std::string("screen_brightness");
+
+  - id: handle_tap
+    then:
+      - if:
+          condition: { lambda: 'return id(g_target) == 0;' }
+          then:
+            - if:
+                # A dark TV cannot honour a transport command, so the first tap
+                # is spent powering it on; only a live TV gets mute / TogglePause.
+                condition:
+                  lambda: |-
+                    const std::string state = id(tv_state).state;
+                    return state == "off" || state == "unavailable";
+                then:
+                  - homeassistant.action:
+                      action: media_player.turn_on
+                      data:
+                        entity_id: ${tv_entity}
+                else:
+                  - if:
+                      # Mute belongs to 音量 (mode 1); 进度 (mode 0) taps toggle playback.
+                      condition: { lambda: 'return id(g_control_mode) == 1;' }
+                      then:
+                        - homeassistant.action:
+                            action: media_player.volume_mute
+                            data:
+                              entity_id: ${tv_entity}
+                              is_volume_muted: !lambda 'return id(tv_muted).state ? std::string("false") : std::string("true");'
+                      else:
+                        # Flip the local icon first for instant feedback, then toggle.
+                        # The Sony media_player entity does not accept transport
+                        # commands reliably, so the remote's Confirm key is used
+                        # (acts as play/pause confirm in most TV apps).
+                        - lambda: |-
+                            const bool currently_playing = id(g_tv_transport_optimistic) &&
+                              millis() - id(g_tv_transport_changed_ms) <= 2000
+                              ? id(g_tv_transport_playing) : id(tv_state).state == "playing";
+                            id(g_tv_transport_playing) = !currently_playing;
+                            id(g_tv_transport_optimistic) = true;
+                            id(g_tv_transport_changed_ms) = millis();
+                        - homeassistant.action:
+                            action: remote.send_command
+                            data:
+                              entity_id: ${tv_remote_entity}
+                              command: Confirm
+                        - script.execute: render_main
+                        - script.execute: tv_transport_settle
+      - if:
+          condition: { lambda: 'return id(g_target) == 1;' }
+          then:
+            - if:
+                # Mute belongs to 音量 (mode 1); 进度 (mode 0) taps toggle playback.
+                condition: { lambda: 'return id(g_control_mode) == 1;' }
+                then:
+                  - homeassistant.action:
+                      action: media_player.volume_mute
+                      data:
+                        entity_id: ${homepod_entity}
+                        is_volume_muted: !lambda 'return id(homepod_muted).state ? std::string("false") : std::string("true");'
+                else:
+                  - homeassistant.action: { action: media_player.media_play_pause, data: { entity_id: '${homepod_entity}' } }
+      - if:
+          condition: { lambda: 'return id(g_target) == 2;' }
+          then:
+            - homeassistant.action: { action: light.toggle, data: { entity_id: '${ceiling_light_entity}' } }
+      - if:
+          condition: { lambda: 'return id(g_target) == 3;' }
+          then:
+            - homeassistant.action: { action: light.toggle, data: { entity_id: '${strip_light_entity}' } }
+      - if:
+          condition: { lambda: 'return id(g_target) == 4;' }
+          then:
+            - homeassistant.action: { action: climate.toggle, data: { entity_id: '${living_room_climate_entity}' } }
+      - if:
+          condition: { lambda: 'return id(g_target) == 5;' }
+          then:
+            - homeassistant.action: { action: climate.toggle, data: { entity_id: '${dining_room_climate_entity}' } }
+      - if:
+          condition: { lambda: 'return id(g_target) == 6;' }
+          then:
+            - homeassistant.action: { action: climate.toggle, data: { entity_id: '${floor_heating_entity}' } }
+      - if:
+          condition: { lambda: 'return id(g_target) == 7;' }
+          then:
+            - if:
+                condition:
+                  lambda: |-
+                    const std::string state = id(tv_state).state;
+                    return state == "on" || state == "playing" || state == "paused";
+                then:
+                  - homeassistant.action:
+                      action: media_player.volume_mute
+                      data:
+                        entity_id: ${tv_entity}
+                        is_volume_muted: !lambda 'return id(tv_muted).state ? std::string("false") : std::string("true");'
+                else:
+                  - if:
+                      condition:
+                        lambda: |-
+                          const std::string state = id(homepod_state).state;
+                          return state == "on" || state == "playing" || state == "paused";
+                      then:
+                        - homeassistant.action:
+                            action: media_player.volume_mute
+                            data:
+                              entity_id: ${homepod_entity}
+                              is_volume_muted: !lambda 'return id(homepod_muted).state ? std::string("false") : std::string("true");'
+                      else:
+                        - switch.toggle: dac_unmute
+      # Haptic-style feedback runs last so it never delays the outbound command.
+      # Ring-only: the old wheel_pill flash is gone along with the pill background.
+      - script.execute: ring_tap_feedback
+
+  - id: dispatch_gesture
+    then:
+      # 2.0 gesture router.
+      #   Lock mode: any tap enters Home (or, if the selector is up, confirms
+      #     the highlighted entry). Swipes are ignored on the lock.
+      #   Home / other modes: pass through to the existing handlers.
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 0;' }
+          then:
+            - if:
+                condition: { lambda: 'return id(g_gesture) == 0;' }
+                then:
+                  - if:
+                      condition: { lambda: 'return id(g_sel_active);' }
+                      then:
+                        - script.execute:
+                            id: enter_ui_mode
+                            mode: !lambda 'return id(g_sel_idx);'
+                      else:
+                        - script.execute:
+                            id: enter_ui_mode
+                            mode: 1
+      # Timer + Weather + Setting modes: a tap performs the mode-specific action.
+      # Remote mode is presentational (its own on-screen buttons handle taps).
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 3 && id(g_gesture) == 0;' }
+          then:
+            - script.execute: timer_tap
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 4 && id(g_gesture) == 0;' }
+          then:
+            - script.execute: wx_tap
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 5 && id(g_gesture) == 0;' }
+          then:
+            - script.execute: setting_tap
+      # Home mode routes taps and swipes through the legacy handlers below.
+      # 本机 mode 3 (电量) has moved to Setting, so the read-only guard is dropped.
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 1 && id(g_gesture) == 0;' }
+          then:
+            - script.execute: handle_tap
+      # P6 defers Voice Assistant; a recognized long press is intentionally consumed.
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 1 && id(g_gesture) == 2;' }
+          then:
+            - script.execute: { id: cycle_target, direction: 1 }
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 1 && id(g_gesture) == 3;' }
+          then:
+            - script.execute: { id: cycle_target, direction: -1 }
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 1 && id(g_gesture) == 4;' }
+          then:
+            - script.execute: { id: switch_mode, direction: 1 }
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 1 && id(g_gesture) == 5;' }
+          then:
+            - script.execute: { id: switch_mode, direction: -1 }
+      # Setting mode: up/down swipe cycles the row.
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 5 && id(g_gesture) == 4;' }
+          then:
+            - script.execute: { id: setting_switch_row, direction: 1 }
+      - if:
+          condition: { lambda: 'return id(g_ui_mode) == 5 && id(g_gesture) == 5;' }
+          then:
+            - script.execute: { id: setting_switch_row, direction: -1 }
+
+  - id: handle_knob
+    parameters:
+      direction: int
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          const uint32_t previous_rotate = id(g_knob_last_rotate_ms);
+          id(g_last_activity) = now;
+          id(g_knob_last_rotate_ms) = now;
+          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+          lv_obj_set_style_arc_opa(id(arc_value), LV_OPA_COVER, LV_PART_INDICATOR);
+
+          // Reuse the pending value during a fast burst; never restart from a stale HA sensor.
+          const bool reuse = id(g_optimistic_valid) && id(g_optimistic_target) == id(g_target) &&
+            id(g_optimistic_mode) == id(g_control_mode) && now - previous_rotate <= 2000;
+          float value = reuse ? id(g_optimistic_value) : 0.0f;
+          bool optimistic = true;
+          const int target = id(g_target), mode = id(g_control_mode);
+          const float speed_pct = (float) id(g_knob_speed_pct);
+          auto endpoint_pct = [&](float normalized) -> float {
+            const float remaining = direction > 0 ? 100.0f - normalized : normalized;
+            return remaining < 5.0f ? 1.0f : speed_pct;
+          };
+          if (target == 0 && mode == 1) {
+            if (!reuse) value = isnan(id(tv_volume).state) ? 0.0f : id(tv_volume).state * 100.0f;
+            const float step = endpoint_pct(value);
+            value = fminf(100.0f, fmaxf(0.0f, value + direction * step));
+          } else if (target == 0 && mode == 0) {
+            optimistic = false;  // TV directional navigation has no synthetic progress value.
+          } else if (target == 1 && mode == 1) {
+            if (!reuse) value = isnan(id(homepod_volume).state) ? 0.0f : id(homepod_volume).state * 100.0f;
+            const float step = endpoint_pct(value);
+            value = fminf(100.0f, fmaxf(0.0f, value + direction * step));
+          } else if (target == 1 && mode == 0) {
+            if (!reuse) value = isnan(id(homepod_position).state) ? 0.0f : id(homepod_position).state;
+            const float duration = id(homepod_duration).state;
+            float seek_step;
+            if (!isnan(duration) && duration > 0) {
+              const float normalized = fminf(100.0f, fmaxf(0.0f, value / duration * 100.0f));
+              seek_step = duration * endpoint_pct(normalized) / 100.0f;
+            } else {
+              seek_step = speed_pct * 2.0f;  // 2..40 s fallback when duration is unknown.
+            }
+            value = fmaxf(0.0f, value + direction * seek_step);
+            if (!isnan(duration) && duration > 0) value = fminf(value, duration);
+          } else if (target == 2 && mode == 0) {
+            if (!reuse) value = isnan(id(ceiling_light_brightness).state) ? 0.0f : id(ceiling_light_brightness).state / 2.55f;
+            const float step = endpoint_pct(value);
+            value = fminf(100.0f, fmaxf(0.0f, value + direction * step));
+          } else if (target == 2 && mode == 1) {
+            if (!reuse) value = isnan(id(ceiling_light_color_temp).state) ? 4000.0f : id(ceiling_light_color_temp).state;
+            const float normalized = (value - 2000.0f) / 45.0f;
+            const float pct = endpoint_pct(fminf(100.0f, fmaxf(0.0f, normalized)));
+            const float kelvin_step = fmaxf(100.0f, roundf((4500.0f * pct / 100.0f) / 100.0f) * 100.0f);
+            value = roundf(fminf(6500.0f, fmaxf(2000.0f, value + direction * kelvin_step)) / 100.0f) * 100.0f;
+          } else if (target == 3 && mode == 0) {
+            if (!reuse) value = isnan(id(strip_light_brightness).state) ? 0.0f : id(strip_light_brightness).state / 2.55f;
+            const float step = endpoint_pct(value);
+            value = fminf(100.0f, fmaxf(0.0f, value + direction * step));
+          } else if (target == 3 && mode == 1) {
+            if (!reuse) value = isnan(id(strip_light_hue).state) ? 0.0f : id(strip_light_hue).state;
+            // Hue is the only mode with no natural quantum, so the raw
+            // 360 * pct / 100 mapping put a 72 deg jump on the top of the
+            // acceleration curve - a full quarter of the colour wheel per pulse.
+            // Clamped to 2..15 deg: the ceiling bites from ~5 % upward, so fast
+            // turns cross the wheel in 24 pulses at a constant, readable rate
+            // instead of teleporting between hues.
+            const float hue_step = fminf(15.0f, fmaxf(2.0f, 360.0f * speed_pct / 100.0f));
+            value = fmodf(value + direction * hue_step + 3600.0f, 360.0f);
+          } else if (target >= 4 && target <= 6 && mode == 0) {
+            if (!reuse) value = target == 4 ? id(climate_target_temperature).state :
+              (target == 5 ? id(dining_room_climate_target_temp).state : id(floor_heating_target_temp).state);
+            if (isnan(value)) value = 22.0f;
+            const float normalized = (value - 16.0f) / 15.0f * 100.0f;
+            const float pct = endpoint_pct(fminf(100.0f, fmaxf(0.0f, normalized)));
+            const float temp_step = fmaxf(0.5f, roundf((15.0f * pct / 100.0f) * 2.0f) / 2.0f);
+            value = roundf(fminf(31.0f, fmaxf(16.0f, value + direction * temp_step)) * 2.0f) / 2.0f;
+          } else if (target >= 4 && target <= 6 && mode == 1) {
+            if (!reuse) {
+              const std::string state = target == 4 ? id(climate_state).state :
+                (target == 5 ? id(dining_room_climate_state).state : id(floor_heating_state).state);
+              if (target == 6) {
+                static const char *modes[] = {"off", "auto", "heat"};
+                for (int i=0;i<3;i++) if (state == modes[i]) value = i;
+              } else {
+                static const char *modes[] = {"off", "auto", "cool", "heat", "dry", "fan_only"};
+                for (int i=0;i<6;i++) if (state == modes[i]) value = i;
+              }
+            }
+            const int count = target == 6 ? 3 : 6;
+            value = ((int) value + (direction > 0 ? 1 : count - 1)) % count;
+          } else if (target == 7 && mode == 0) {
+            if (!reuse) value = id(g_local_volume);
+            const float step = endpoint_pct(value);
+            value = fminf(100.0f, fmaxf(0.0f, value + direction * step));
+          } else if (target == 7 && mode == 1) {
+            if (!reuse) value = id(g_backlight_pct);
+            const float normalized = (value - 10.0f) / 90.0f * 100.0f;
+            const float step = endpoint_pct(fminf(100.0f, fmaxf(0.0f, normalized)));
+            value = fminf(100.0f, fmaxf(10.0f, value + direction * step));
+          } else if (target == 7 && mode == 2) {
+            // 锁屏亮度 5-50 %: a fixed 2 % detent. The acceleration curve used by
+            // the other percentage modes is deliberately skipped - the whole range
+            // is 45 points wide, so a linear step already crosses it in ~23 clicks.
+            if (!reuse) value = id(g_aod_backlight_pct);
+            const float step = 2.0f;
+            value = fminf(50.0f, fmaxf(5.0f, value + direction * step));
+          } else optimistic = false;   // mode 3 (电量) is read-only
+
+          id(g_optimistic_valid) = optimistic;
+          if (optimistic) {
+            id(g_optimistic_target) = target;
+            id(g_optimistic_mode) = mode;
+            id(g_optimistic_value) = value;
+          }
+      - script.execute: knob_visual_settle
+      - script.execute: optimistic_settle
+      - script.execute: render_main
+      - if:
+          condition: { lambda: 'return id(g_sleeping);' }
+          then:
+            - script.execute: wake_display
+      - script.execute:
+          id: ring_rotate_feedback
+          direction: !lambda 'return direction;'
+      # g_target == current_device_index; g_control_mode == current_mode_index.
+      # Every branch checks both values so knob actions always follow the visible mode.
+      - if:
+          condition: { lambda: 'return id(g_target) == 0 && id(g_control_mode) == 1;' }
+          then:
+            - homeassistant.action:
+                action: media_player.volume_set
+                data:
+                  entity_id: ${tv_entity}
+                  volume_level: !lambda |-
+                    const float value = id(g_optimistic_value) / 100.0f;
+                    char text[8]; snprintf(text, sizeof(text), "%.2f", value); return std::string(text);
+      - if:
+          condition: { lambda: 'return id(g_target) == 0 && id(g_control_mode) == 0;' }
+          then:
+            - if:
+                condition: { lambda: 'return direction > 0;' }
+                then:
+                  - homeassistant.action:
+                      action: remote.send_command
+                      data:
+                        entity_id: ${tv_remote_entity}
+                        command: Right
+                else:
+                  - homeassistant.action:
+                      action: remote.send_command
+                      data:
+                        entity_id: ${tv_remote_entity}
+                        command: Left
+      - if:
+          condition: { lambda: 'return id(g_target) == 1 && id(g_control_mode) == 1;' }
+          then:
+            - homeassistant.action:
+                action: media_player.volume_set
+                data:
+                  entity_id: ${homepod_entity}
+                  volume_level: !lambda |-
+                    const float value = id(g_optimistic_value) / 100.0f;
+                    char text[8]; snprintf(text, sizeof(text), "%.2f", value); return std::string(text);
+      - if:
+          condition: { lambda: 'return id(g_target) == 1 && id(g_control_mode) == 0;' }
+          then:
+            - homeassistant.action:
+                action: media_player.media_seek
+                data:
+                  entity_id: ${homepod_entity}
+                  seek_position: !lambda |-
+                    const float value = id(g_optimistic_value);
+                    char text[16]; snprintf(text, sizeof(text), "%.1f", value); return std::string(text);
+      - if:
+          condition: { lambda: 'return id(g_target) == 2 && id(g_control_mode) == 0;' }
+          then:
+            - homeassistant.action:
+                action: light.turn_on
+                data:
+                  entity_id: ${ceiling_light_entity}
+                  brightness: !lambda |-
+                    char text[8]; snprintf(text, sizeof(text), "%.0f", roundf(id(g_optimistic_value) * 2.55f)); return std::string(text);
+      - if:
+          condition: { lambda: 'return id(g_target) == 2 && id(g_control_mode) == 1;' }
+          then:
+            - homeassistant.action:
+                action: light.turn_on
+                data:
+                  entity_id: ${ceiling_light_entity}
+                  # HA has no color_temp_step action field; calculate the next valid Kelvin value.
+                  color_temp_kelvin: !lambda |-
+                    const float value = id(g_optimistic_value);
+                    char text[8]; snprintf(text, sizeof(text), "%.0f", value); return std::string(text);
+      - if:
+          condition: { lambda: 'return id(g_target) == 3 && id(g_control_mode) == 0;' }
+          then:
+            - homeassistant.action:
+                action: light.turn_on
+                data:
+                  entity_id: ${strip_light_entity}
+                  brightness_pct: !lambda |-
+                    char text[8]; snprintf(text, sizeof(text), "%.0f", id(g_optimistic_value)); return std::string(text);
+      - if:
+          condition: { lambda: 'return id(g_target) == 3 && id(g_control_mode) == 1;' }
+          then:
+            # hs_color must reach HA as a real 2-element list. Plain `data` sends
+            # everything as a string, which fails light.turn_on's schema, so the value
+            # goes through `variables` + `data_template` and HA parses the rendered
+            # "[h, 100]" back into a list.
+            - homeassistant.action:
+                action: light.turn_on
+                data:
+                  entity_id: ${strip_light_entity}
+                variables:
+                  hue_value: !lambda 'return id(g_optimistic_value);'
+                data_template:
+                  hs_color: "[{{ hue_value | float | round(0) }}, 100]"
+      - if:
+          condition: { lambda: 'return id(g_target) == 4 && id(g_control_mode) == 0;' }
+          then:
+            - homeassistant.action:
+                action: climate.set_temperature
+                data:
+                  entity_id: ${living_room_climate_entity}
+                  temperature: !lambda |-
+                    const float value = id(g_optimistic_value);
+                    char text[8]; snprintf(text, sizeof(text), "%.1f", value); return std::string(text);
+      - if:
+          condition: { lambda: 'return id(g_target) == 4 && id(g_control_mode) == 1;' }
+          then:
+            - homeassistant.action:
+                action: climate.set_hvac_mode
+                data:
+                  entity_id: ${living_room_climate_entity}
+                  hvac_mode: !lambda |-
+                    static const char *modes[] = {"off", "auto", "cool", "heat", "dry", "fan_only"};
+                    int current = (int) roundf(id(g_optimistic_value));
+                    if (current < 0) current = 0; if (current > 5) current = 5;
+                    return std::string(modes[current]);
+      - if:
+          condition: { lambda: 'return id(g_target) == 5 && id(g_control_mode) == 0;' }
+          then:
+            - homeassistant.action:
+                action: climate.set_temperature
+                data:
+                  entity_id: ${dining_room_climate_entity}
+                  temperature: !lambda |-
+                    const float value = id(g_optimistic_value);
+                    char text[8]; snprintf(text, sizeof(text), "%.1f", value); return std::string(text);
+      - if:
+          condition: { lambda: 'return id(g_target) == 5 && id(g_control_mode) == 1;' }
+          then:
+            - homeassistant.action:
+                action: climate.set_hvac_mode
+                data:
+                  entity_id: ${dining_room_climate_entity}
+                  hvac_mode: !lambda |-
+                    static const char *modes[] = {"off", "auto", "cool", "heat", "dry", "fan_only"};
+                    int current = (int) roundf(id(g_optimistic_value));
+                    if (current < 0) current = 0; if (current > 5) current = 5;
+                    return std::string(modes[current]);
+      - if:
+          condition: { lambda: 'return id(g_target) == 6 && id(g_control_mode) == 0;' }
+          then:
+            - homeassistant.action:
+                action: climate.set_temperature
+                data:
+                  entity_id: ${floor_heating_entity}
+                  temperature: !lambda |-
+                    const float value = id(g_optimistic_value);
+                    char text[8]; snprintf(text, sizeof(text), "%.1f", value); return std::string(text);
+      - if:
+          condition: { lambda: 'return id(g_target) == 6 && id(g_control_mode) == 1;' }
+          then:
+            - homeassistant.action:
+                action: climate.set_hvac_mode
+                data:
+                  entity_id: ${floor_heating_entity}
+                  hvac_mode: !lambda |-
+                    static const char *modes[] = {"off", "auto", "heat"};
+                    int current = (int) roundf(id(g_optimistic_value));
+                    if (current < 0) current = 0; if (current > 2) current = 2;
+                    return std::string(modes[current]);
+      - if:
+          condition: { lambda: 'return id(g_target) == 7 && id(g_control_mode) == 0;' }
+          then:
+            - lambda: 'id(g_local_volume) = id(g_optimistic_value);'
+            - script.execute: render_main
+      - if:
+          condition: { lambda: 'return id(g_target) == 7 && id(g_control_mode) == 1;' }
+          then:
+            - lambda: 'id(g_backlight_pct) = (int) roundf(id(g_optimistic_value));'
+            - light.turn_on:
+                id: backlight_light
+                brightness: !lambda 'return id(g_backlight_pct) / 100.0f;'
+            - script.execute: render_main
+      # 锁屏亮度 only takes effect the next time the dial falls asleep, so the
+      # backlight is deliberately NOT touched here.
+      - if:
+          condition: { lambda: 'return id(g_target) == 7 && id(g_control_mode) == 2;' }
+          then:
+            - lambda: 'id(g_aod_backlight_pct) = (int) roundf(id(g_optimistic_value));'
+            - script.execute: render_main
+      # Mirror the new value onto the Ulanzi pixel clock. Runs last so it always
+      # reflects the value that was just pushed to HA above.
+      - script.execute:
+          id: publish_knob_bar
+          force: false
+      - script.execute: knob_bar_trailing
+
+  # Renders the current knob value as a 52x16 full-screen bar and publishes it
+  # straight to the Ulanzi's custom app (`ulanzi_aa68/custom/test`). The frame is
+  # built on-device by ulanzi_bar.h, so nothing but the broker sits between the
+  # knob and the pixels - the bar is intentionally the highest-priority thing on
+  # the Ulanzi and does not take `input_text.ulanzi_display_owner`.
+  #
+  # `force: false` = called from handle_knob on every pulse, throttled to 200 ms
+  #                  so the Ulanzi is not flooded (see g_knob_pub_ms).
+  # `force: true`  = trailing call from knob_bar_trailing once the knob settles;
+  #                  ignores the throttle but skips duplicate values.
+  #
+  # pct and the accent color mirror the branch table in handle_knob one-for-one.
+  # `duration: 3` lets the frame time out on its own, so there is no clear message
+  # and whatever the Ulanzi was showing comes back by itself.
+  - id: publish_knob_bar
+    parameters:
+      force: bool
+    mode: single
+    then:
+      - lambda: |-
+          const int target = id(g_target), mode = id(g_control_mode);
+          const uint32_t now = millis();
+          id(g_knob_pub_ok) = false;
+
+          // Branches without a synthetic value (e.g. TV directional navigation)
+          // have nothing meaningful to show as a bar.
+          if (!id(g_optimistic_valid)) return;
+          const float v = id(g_optimistic_value);
+
+          float pct;
+          uint32_t rgb;
+          bool hue_mode = false;
+          if (target == 0 && mode == 1) {                      // TV volume
+            pct = v; rgb = 0x00B4D8;
+          } else if (target == 1 && mode == 1) {               // HomePod volume
+            pct = v; rgb = 0x00B4D8;
+          } else if (target == 1 && mode == 0) {               // HomePod seek
+            const float duration = id(homepod_duration).state;
+            if (isnan(duration) || duration <= 0) return;      // no scale -> no bar
+            pct = v / duration * 100.0f; rgb = 0xFFFFFF;
+          } else if (target == 2 && mode == 0) {               // ceiling brightness
+            pct = v; rgb = 0xFFD580;
+          } else if (target == 2 && mode == 1) {               // ceiling 2000-6500 K
+            pct = (v - 2000.0f) / 45.0f; rgb = 0x87CEEB;
+          } else if (target == 3 && mode == 0) {               // strip brightness
+            pct = v; rgb = 0xFFD580;
+          } else if (target == 3 && mode == 1) {               // strip hue 0-360
+            pct = v / 3.6f; rgb = 0; hue_mode = true;
+          } else if (target >= 4 && target <= 6 && mode == 0) {  // climate 16-31 C
+            pct = (v - 16.0f) / 15.0f * 100.0f; rgb = 0xFF6B35;
+          } else if (target >= 4 && target <= 6 && mode == 1) {  // hvac mode index
+            const int count = target == 6 ? 3 : 6;
+            pct = ((int) roundf(v)) * 100.0f / (count - 1);
+            rgb = 0xFF6B35;
+          } else if (target == 7 && mode == 0) {               // local speaker volume
+            pct = v; rgb = 0xAAAAAA;
+          } else if (target == 7 && mode == 1) {               // backlight 10-100 %
+            pct = (v - 10.0f) / 90.0f * 100.0f; rgb = 0xFFD580;
+          } else if (target == 7 && mode == 2) {               // aod backlight 5-50 %
+            pct = (v - 5.0f) / 45.0f * 100.0f; rgb = 0x4488FF;
+          } else {
+            return;
+          }
+
+          const int p = (int) roundf(fminf(100.0f, fmaxf(0.0f, pct)));
+          if (!force) {
+            if (now - id(g_knob_pub_ms) < 200) return;         // leading-edge throttle
+          } else if (p == id(g_knob_pub_pct)) {
+            return;                                            // trailing frame is a no-op
+          }
+
+          uint8_t r, g, b;
+          if (hue_mode) {
+            // The light-strip hue mode paints the bar in the hue being dialed in.
+            ulanzi_bar::hsv_to_rgb(v, r, g, b);
+          } else {
+            r = (rgb >> 16) & 0xFF; g = (rgb >> 8) & 0xFF; b = rgb & 0xFF;
+          }
+
+          id(g_knob_pub_ms) = now;
+          id(g_knob_pub_pct) = p;
+          id(g_knob_pub_payload) = ulanzi_bar::payload((float) p, r, g, b, 3);
+          id(g_knob_pub_ok) = true;
+      - if:
+          condition:
+            lambda: 'return id(g_knob_pub_ok) && id(mqtt_client)->is_connected();'
+          then:
+            - mqtt.publish:
+                topic: ulanzi_aa68/custom/test
+                qos: 0
+                retain: false
+                payload: !lambda 'return id(g_knob_pub_payload);'
+
+  # Trailing edge. Every knob pulse restarts this, so it fires 260 ms after the
+  # knob stops and guarantees the bar ends on the real value even when the 200 ms
+  # throttle dropped the final pulse.
+  - id: knob_bar_trailing
+    mode: restart
+    then:
+      - delay: 260ms
+      - script.execute:
+          id: publish_knob_bar
+          force: true
+
+  # ==================== 2.0: Timer Mode ====================
+  # Structure ported from base/core.yaml (MichalZaniewicz/…/-va): a MM:SS
+  # countdown ring where the knob sets minutes while stopped and the tap
+  # toggles start / pause. When the countdown reaches zero, alarm_start fires
+  # the WAV file until the user taps to acknowledge.
+  - id: timer_render
+    then:
+      - lvgl.label.update:
+          id: timer_big
+          text: !lambda |-
+            int s = id(g_timer_active) ? id(g_timer_secs) : id(g_set_min) * 60;
+            if (s < 0) s = 0;
+            char b[12]; snprintf(b, sizeof(b), "%d:%02d", s / 60, s % 60);
+            return std::string(b);
+      - lvgl.arc.update:
+          id: timer_arc
+          value: !lambda |-
+            if (!id(g_timer_active)) return 100.0f;
+            int tot = id(g_timer_total); if (tot <= 0) return 0.0f;
+            float f = 100.0f * id(g_timer_secs) / tot;
+            if (f < 0) f = 0; if (f > 100) f = 100;
+            return f;
+      - lvgl.label.update:
+          id: timer_cap
+          text: !lambda |-
+            if (id(g_alarm_active)) return std::string("ALARM");
+            if (!id(g_timer_active)) return std::string("SET");
+            return id(g_timer_paused) ? std::string("PAUSED") : std::string("RUNNING");
+      # Colour code the ring by remaining budget: green > 50 %, amber > 20 %,
+      # red for the last stretch. When stopped everything reverts to grey.
+      - if:
+          condition: { lambda: 'return !id(g_timer_active);' }
+          then:
+            - lvgl.arc.update: { id: timer_arc, indicator: { arc_color: 0x2FB85C } }
+            - lvgl.label.update: { id: timer_cap, text_color: 0x6F9A92 }
+            - lvgl.label.update: { id: timer_big, text_color: 0xFFFFFF }
+          else:
+            - if:
+                condition: { lambda: 'int t=id(g_timer_total); return t>0 && (long)id(g_timer_secs)*100 > (long)t*50;' }
+                then:
+                  - lvgl.arc.update: { id: timer_arc, indicator: { arc_color: 0x2FB85C } }
+                  - lvgl.label.update: { id: timer_cap, text_color: 0x2FB85C }
+                  - lvgl.label.update: { id: timer_big, text_color: 0xFFFFFF }
+                else:
+                  - if:
+                      condition: { lambda: 'int t=id(g_timer_total); return t>0 && (long)id(g_timer_secs)*100 > (long)t*20;' }
+                      then:
+                        - lvgl.arc.update: { id: timer_arc, indicator: { arc_color: 0xF5B83D } }
+                        - lvgl.label.update: { id: timer_cap, text_color: 0xF5B83D }
+                        - lvgl.label.update: { id: timer_big, text_color: 0xFFFFFF }
+                      else:
+                        - lvgl.arc.update: { id: timer_arc, indicator: { arc_color: 0xFF3B30 } }
+                        - lvgl.label.update: { id: timer_cap, text_color: 0xFF6B60 }
+                        - lvgl.label.update: { id: timer_big, text_color: 0xFF6B60 }
+
+  - id: timer_start
+    then:
+      - lambda: |-
+          id(g_timer_secs) = id(g_set_min) * 60;
+          id(g_timer_total) = id(g_timer_secs);
+          id(g_timer_active) = true;
+          id(g_timer_paused) = false;
+          id(g_timer_local) = true;
+      - script.execute: timer_render
+
+  - id: timer_toggle
+    then:
+      - lambda: 'id(g_timer_paused) = !id(g_timer_paused);'
+      - script.execute: timer_render
+
+  - id: timer_halt
+    then:
+      - lambda: 'id(g_timer_active) = false; id(g_timer_paused) = false; id(g_timer_secs) = 0;'
+      - script.execute: timer_render
+
+  # Timer tap logic: three-state (start / pause-resume / stop-after-alarm).
+  - id: timer_tap
+    then:
+      - if:
+          condition: { lambda: 'return id(g_alarm_active);' }
+          then:
+            - script.execute: alarm_stop
+          else:
+            - if:
+                condition: { lambda: 'return id(g_timer_active);' }
+                then:
+                  - script.execute: timer_toggle
+                else:
+                  - script.execute: timer_start
+
+  # Knob adjusts the setpoint (only while the timer is stopped). Uses the same
+  # acceleration percent that Home Mode dials in so a fast turn covers big
+  # spans; clamped to [1, 180] minutes.
+  - id: timer_knob
+    parameters:
+      direction: int
+    then:
+      - if:
+          condition: { lambda: 'return id(g_timer_active) || id(g_alarm_active);' }
+          then: []
+          else:
+            - lambda: |-
+                int step = 1;
+                const int speed = id(g_knob_speed_pct);
+                if (speed > 12) step = 10;
+                else if (speed > 6) step = 5;
+                else if (speed > 3) step = 2;
+                int m = id(g_set_min) + direction * step;
+                if (m < 1) m = 1;
+                if (m > 180) m = 180;
+                id(g_set_min) = m;
+            - script.execute: timer_render
+            - script.execute:
+                id: ring_rotate_feedback
+                direction: !lambda 'return direction;'
+
+  - id: alarm_start
+    then:
+      - lambda: |-
+          id(g_alarm_active) = true;
+          id(g_alarm_cnt) = 0;
+          id(g_timer_active) = false;
+          id(g_timer_paused) = false;
+          id(g_timer_secs) = 0;
+      - script.execute: timer_render
+      - media_player.speaker.play_on_device_media_file:
+          id: magic_dial_media
+          media_file: alarm_sound
+          announcement: true
+
+  - id: alarm_stop
+    then:
+      - lambda: |-
+          id(g_alarm_active) = false;
+          id(g_timer_active) = false;
+          id(g_timer_paused) = false;
+          id(g_timer_secs) = 0;
+      - media_player.stop:
+          id: magic_dial_media
+      - script.execute: timer_render
+
+  # ==================== 2.0: Weather Mode ====================
+  # Renders the centre stage (day name / hi-lo / condition / MDI glyph) plus a
+  # dial of MDI glyphs around the rim. Follows base/screens/weather.yaml but
+  # with the reference project's PNG sprites collapsed into a single MDI font
+  # so the flash footprint stays lean.
+  - id: wx_render
+    then:
+      - lambda: |-
+          int d = id(g_wx_day);
+          bool has = (id(g_wx_n) > 0 && d < id(g_wx_n));
+          id(g_wx_sel) = has ? id(g_wx_cond)[d] : id(g_wx_state_cur);
+          id(g_wx_tc)  = has ? id(g_wx_hi)[d] : id(g_wx_now);
+      - lvgl.label.update:
+          id: wx_day
+          text: !lambda |-
+            int d = id(g_wx_day);
+            if (id(g_wx_n) <= 0 || d >= id(g_wx_n)) return std::string("TODAY");
+            std::string s = id(g_wx_name)[d];
+            if (s == "Mon") return std::string("MONDAY");
+            if (s == "Tue") return std::string("TUESDAY");
+            if (s == "Wed") return std::string("WEDNESDAY");
+            if (s == "Thu") return std::string("THURSDAY");
+            if (s == "Fri") return std::string("FRIDAY");
+            if (s == "Sat") return std::string("SATURDAY");
+            if (s == "Sun") return std::string("SUNDAY");
+            return s;
+      - lvgl.label.update:
+          id: wx_htemp
+          text: !lambda |-
+            int d = id(g_wx_day);
+            bool f = id(g_wx_fahrenheit);
+            char u = f ? 'F' : 'C';
+            if (id(g_wx_n) <= 0 || d >= id(g_wx_n)) {
+              if (id(g_wx_now) > -100) { int n = id(g_wx_now); if (f) n = n*9/5+32; char b[12]; snprintf(b,sizeof(b),"%d\xC2\xB0%c",n,u); return std::string(b); }
+              return std::string("--");
+            }
+            int hi = id(g_wx_hi)[d], lo = id(g_wx_lo)[d];
+            if (f) { hi = hi*9/5+32; lo = lo*9/5+32; }
+            char b[24]; snprintf(b,sizeof(b),"%d\xC2\xB0/%d\xC2\xB0",hi,lo); return std::string(b);
+      - lvgl.label.update:
+          id: wx_cond
+          text: !lambda |-
+            if (id(g_wx_n) <= 0) return std::string("Add HA helper");
+            std::string s = id(g_wx_sel);
+            if (s == "sunny") return std::string("Sunny");
+            if (s == "clear-night") return std::string("Clear");
+            if (s == "partlycloudy") return std::string("Partly Cloudy");
+            if (s == "cloudy") return std::string("Cloudy");
+            if (s == "fog") return std::string("Fog");
+            if (s == "rainy") return std::string("Rainy");
+            if (s == "pouring") return std::string("Heavy Rain");
+            if (s == "lightning" || s == "lightning-rainy") return std::string("Storm");
+            if (s == "snowy" || s == "snowy-rainy") return std::string("Snow");
+            if (s == "hail") return std::string("Hail");
+            if (s == "windy" || s == "windy-variant") return std::string("Windy");
+            if (s == "exceptional") return std::string("Severe");
+            return s;
+      - lvgl.label.update:
+          id: wx_hero_icon
+          text: !lambda |-
+            std::string s = id(g_wx_sel);
+            if (s == "sunny") return std::string("\xF3\xB0\x9A\x99");         // 󰖙
+            if (s == "clear-night") return std::string("\xF3\xB0\x9A\x94");    // 󰖔
+            if (s == "partlycloudy") return std::string("\xF3\xB0\x9A\x95");   // 󰖕
+            if (s == "fog") return std::string("\xF3\xB0\x9A\x91");            // 󰖑
+            if (s == "windy" || s == "windy-variant") return std::string("\xF3\xB0\x9A\x9D");  // 󰖝
+            if (s == "lightning" || s == "lightning-rainy") return std::string("\xF3\xB0\x9A\x93"); // 󰖓
+            if (s == "pouring") return std::string("\xF3\xB0\x9A\x96");        // 󰖖
+            if (s == "rainy") return std::string("\xF3\xB0\x9A\x97");          // 󰖗
+            if (s == "snowy" || s == "snowy-rainy" || s == "hail") return std::string("\xF3\xB0\x9A\x98"); // 󰖘
+            return std::string("\xF3\xB0\x9A\x90");                             // 󰖐
+      # Colour code the hero temperature the same way the reference does.
+      - lvgl.label.update: { id: wx_htemp, text_color: 0xFFFFFF }
+      - if: { condition: { lambda: 'return id(g_wx_tc) > -100 && id(g_wx_tc) <= 0;' }, then: [ lvgl.label.update: { id: wx_htemp, text_color: 0x7FB2FF } ] }
+      - if: { condition: { lambda: 'return id(g_wx_tc) > 0 && id(g_wx_tc) < 10;' }, then: [ lvgl.label.update: { id: wx_htemp, text_color: 0x6FD0E8 } ] }
+      - if: { condition: { lambda: 'return id(g_wx_tc) >= 10 && id(g_wx_tc) < 18;' }, then: [ lvgl.label.update: { id: wx_htemp, text_color: 0x7FE6B0 } ] }
+      - if: { condition: { lambda: 'return id(g_wx_tc) >= 18 && id(g_wx_tc) < 25;' }, then: [ lvgl.label.update: { id: wx_htemp, text_color: 0xFFD061 } ] }
+      - if: { condition: { lambda: 'return id(g_wx_tc) >= 25;' }, then: [ lvgl.label.update: { id: wx_htemp, text_color: 0xFF7A4D } ] }
+      # 7-day glyphs along the rim. Positions are recomputed per render because
+      # the number of days can change (a fresh HA sensor push may drop 6 -> 7).
+      - lvgl.widget.update: { id: wx_glow, hidden: !lambda 'return id(g_wx_n) <= 0;' }
+      - lvgl.widget.update: { id: wx_d0, hidden: !lambda 'return 0 >= id(g_wx_n);', x: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(140.0f * sinf(0 * 6.2831853f / n));', y: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(-140.0f * cosf(0 * 6.2831853f / n));' }
+      - lvgl.label.update:  { id: wx_d0, text: !lambda 'return id(g_wx_n) > 0 ? id(g_wx_icon)[0] : std::string("");' }
+      - lvgl.widget.update: { id: wx_d1, hidden: !lambda 'return 1 >= id(g_wx_n);', x: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(140.0f * sinf(1 * 6.2831853f / n));', y: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(-140.0f * cosf(1 * 6.2831853f / n));' }
+      - lvgl.label.update:  { id: wx_d1, text: !lambda 'return id(g_wx_n) > 1 ? id(g_wx_icon)[1] : std::string("");' }
+      - lvgl.widget.update: { id: wx_d2, hidden: !lambda 'return 2 >= id(g_wx_n);', x: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(140.0f * sinf(2 * 6.2831853f / n));', y: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(-140.0f * cosf(2 * 6.2831853f / n));' }
+      - lvgl.label.update:  { id: wx_d2, text: !lambda 'return id(g_wx_n) > 2 ? id(g_wx_icon)[2] : std::string("");' }
+      - lvgl.widget.update: { id: wx_d3, hidden: !lambda 'return 3 >= id(g_wx_n);', x: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(140.0f * sinf(3 * 6.2831853f / n));', y: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(-140.0f * cosf(3 * 6.2831853f / n));' }
+      - lvgl.label.update:  { id: wx_d3, text: !lambda 'return id(g_wx_n) > 3 ? id(g_wx_icon)[3] : std::string("");' }
+      - lvgl.widget.update: { id: wx_d4, hidden: !lambda 'return 4 >= id(g_wx_n);', x: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(140.0f * sinf(4 * 6.2831853f / n));', y: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(-140.0f * cosf(4 * 6.2831853f / n));' }
+      - lvgl.label.update:  { id: wx_d4, text: !lambda 'return id(g_wx_n) > 4 ? id(g_wx_icon)[4] : std::string("");' }
+      - lvgl.widget.update: { id: wx_d5, hidden: !lambda 'return 5 >= id(g_wx_n);', x: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(140.0f * sinf(5 * 6.2831853f / n));', y: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(-140.0f * cosf(5 * 6.2831853f / n));' }
+      - lvgl.label.update:  { id: wx_d5, text: !lambda 'return id(g_wx_n) > 5 ? id(g_wx_icon)[5] : std::string("");' }
+      - lvgl.widget.update: { id: wx_d6, hidden: !lambda 'return 6 >= id(g_wx_n);', x: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(140.0f * sinf(6 * 6.2831853f / n));', y: !lambda 'int n=id(g_wx_n); if(n<1)n=1; return (int) lroundf(-140.0f * cosf(6 * 6.2831853f / n));' }
+      - lvgl.label.update:  { id: wx_d6, text: !lambda 'return id(g_wx_n) > 6 ? id(g_wx_icon)[6] : std::string("");' }
+
+  - id: wx_knob
+    parameters:
+      direction: int
+    then:
+      - lambda: |-
+          int mx = (id(g_wx_n) > 0) ? id(g_wx_n) - 1 : 0;
+          int d = id(g_wx_day) + direction;
+          if (d < 0) d = 0;
+          if (d > mx) d = mx;
+          id(g_wx_day) = d;
+      - script.execute: wx_render
+      - script.execute:
+          id: ring_rotate_feedback
+          direction: !lambda 'return direction;'
+
+  - id: wx_tap
+    then:
+      - lambda: 'id(g_wx_fahrenheit) = !id(g_wx_fahrenheit);'
+      - script.execute: wx_render
+
+  # ==================== 2.0: Setting Mode ====================
+  # Four rows selected by up/down swipe. Knob adjusts the current row (rows
+  # 0..2), row 3 (电量) is read-only. Tap does the mute-cascade.
+  - id: set_render
+    then:
+      - lvgl.label.update:
+          id: set_row_name
+          text: !lambda |-
+            switch (id(g_set_row)) {
+              case 0: return std::string("本机音量");
+              case 1: return std::string("屏幕亮度");
+              case 2: return std::string("锁屏亮度");
+              default: return id(g_charging) ? std::string("充电中") : std::string("电量");
+            }
+      - lvgl.label.update:
+          id: set_value
+          text: !lambda |-
+            char b[8];
+            switch (id(g_set_row)) {
+              case 0: snprintf(b, sizeof(b), "%d", (int) roundf(id(g_local_volume))); break;
+              case 1: snprintf(b, sizeof(b), "%d", id(g_backlight_pct)); break;
+              case 2: snprintf(b, sizeof(b), "%d", id(g_aod_backlight_pct)); break;
+              default:
+                if (id(g_batt) < 0) return std::string("--");
+                snprintf(b, sizeof(b), "%d", id(g_batt));
+                break;
+            }
+            return std::string(b);
+      - lvgl.label.update: { id: set_unit, text: "%" }
+      - lvgl.arc.update:
+          id: set_arc
+          value: !lambda |-
+            float v = 0;
+            switch (id(g_set_row)) {
+              case 0: v = id(g_local_volume); break;
+              case 1: v = (id(g_backlight_pct) - 10.0f) / 90.0f * 100.0f; break;
+              case 2: v = (id(g_aod_backlight_pct) - 5.0f) / 45.0f * 100.0f; break;
+              default: v = id(g_batt) < 0 ? 0 : (float) id(g_batt); break;
+            }
+            if (v < 0) v = 0; if (v > 100) v = 100;
+            return v;
+      - lambda: |-
+          lv_obj_t *dots[4] = {id(set_dot0), id(set_dot1), id(set_dot2), id(set_dot3)};
+          for (int i = 0; i < 4; i++) {
+            const bool s = i == id(g_set_row);
+            lv_obj_set_style_bg_color(dots[i], lv_color_hex(s ? 0xF2F6F8 : 0x37464D), LV_PART_MAIN);
+          }
+
+  - id: setting_switch_row
+    parameters:
+      direction: int
+    then:
+      - lambda: |-
+          int r = id(g_set_row) + (direction > 0 ? 1 : -1);
+          if (r < 0) r = 3;
+          if (r > 3) r = 0;
+          id(g_set_row) = r;
+      - script.execute: set_render
+      - script.execute: ring_mode_feedback
+
+  - id: setting_knob
+    parameters:
+      direction: int
+    then:
+      - lambda: |-
+          const int speed = id(g_knob_speed_pct);
+          if (id(g_set_row) == 0) {
+            float v = id(g_local_volume) + direction * speed;
+            if (v < 0) v = 0;
+            if (v > 100) v = 100;
+            id(g_local_volume) = v;
+          } else if (id(g_set_row) == 1) {
+            int v = id(g_backlight_pct) + direction * speed;
+            if (v < 10) v = 10;
+            if (v > 100) v = 100;
+            id(g_backlight_pct) = v;
+          } else if (id(g_set_row) == 2) {
+            int v = id(g_aod_backlight_pct) + direction * 2;
+            if (v < 5) v = 5;
+            if (v > 50) v = 50;
+            id(g_aod_backlight_pct) = v;
+          }
+      - if:
+          condition: { lambda: 'return id(g_set_row) == 1;' }
+          then:
+            - light.turn_on:
+                id: backlight_light
+                brightness: !lambda 'return id(g_backlight_pct) / 100.0f;'
+      - script.execute: set_render
+      - script.execute:
+          id: ring_rotate_feedback
+          direction: !lambda 'return direction;'
+
+  # Setting mode tap: 电视在放 → 静音电视；否则 HomePod 在放 → 静音 HomePod；
+  # 都没放 → toggle dac_unmute.
+  - id: setting_tap
+    then:
+      - if:
+          condition:
+            lambda: |-
+              const std::string s = id(tv_state).state;
+              return s == "on" || s == "playing" || s == "paused";
+          then:
+            - homeassistant.action:
+                action: media_player.volume_mute
+                data:
+                  entity_id: ${tv_entity}
+                  is_volume_muted: !lambda 'return id(tv_muted).state ? std::string("false") : std::string("true");'
+          else:
+            - if:
+                condition:
+                  lambda: |-
+                    const std::string s = id(homepod_state).state;
+                    return s == "on" || s == "playing" || s == "paused";
+                then:
+                  - homeassistant.action:
+                      action: media_player.volume_mute
+                      data:
+                        entity_id: ${homepod_entity}
+                        is_volume_muted: !lambda 'return id(homepod_muted).state ? std::string("false") : std::string("true");'
+                else:
+                  - switch.toggle: dac_unmute
+      - script.execute: ring_tap_feedback
+
+interval:
+  # Arc easing - the visual half of the "smoother knob" change. render_main only
+  # writes g_arc_target_pct now; this walks g_arc_display_pct toward it so a knob
+  # pulse slides the indicator instead of teleporting it.
+  #
+  # Each frame closes 35 % of the remaining distance with a 0.6 pp floor so it
+  # cannot crawl: a 20 pp step (top of the acceleration curve) lands in ~150 ms,
+  # a 1 pp step in one frame. Cost when idle is two float compares - the guards
+  # return before any LVGL call - and lv_arc invalidates only the sector that
+  # actually changed, so an easing frame repaints a thin band, not the 316 px ring.
+  - interval: 30ms
+    then:
+      - lambda: |-
+          if (id(g_sleeping)) return;
+          const float target = id(g_arc_target_pct);
+          float disp = id(g_arc_display_pct);
+          const float delta = target - disp;
+          if (fabsf(delta) < 0.05f) return;
+          if (fabsf(delta) < 0.55f) {
+            disp = target;
+          } else {
+            float step = delta * 0.35f;
+            if (fabsf(step) < 0.6f) step = delta > 0 ? 0.6f : -0.6f;
+            disp += step;
+          }
+          id(g_arc_display_pct) = disp;
+          const int pct = (int) roundf(disp);
+          if (pct == id(g_arc_pct)) return;
+          id(g_arc_pct) = pct;
+          lv_arc_set_value(id(arc_value), pct);
+          // Keep the glowing endpoint locked to the eased value. Same geometry as
+          // render_main: centre (180,180), 154 px centre-line radius, 135 deg start
+          // over a 270 deg sweep, minus half the 8 px dot.
+          if (id(g_target_online)) {
+            const float angle_rad = (135.0f + pct / 100.0f * 270.0f) * 3.14159265f / 180.0f;
+            lv_obj_set_pos(id(arc_dot),
+              (int) roundf(180.0f + 154.0f * cosf(angle_rad)) - 4,
+              (int) roundf(180.0f + 154.0f * sinf(angle_rad)) - 4);
+          }
+
+  - interval: 1s
+    then:
+      # Charging "filling" animation, ported from upstream. Only advanced while 本机
+      # mode 3 (电量) is on screen, so it costs nothing the rest of the time.
+      - if:
+          condition:
+            lambda: 'return id(g_charging) && !id(g_sleeping) && id(g_ui_mode) == 5 && id(g_set_row) == 3;'
+          then:
+            - lambda: 'id(g_chg_anim) = (id(g_chg_anim) + 1) % 5;'
+            - script.execute: set_render
+      # 2.0: Timer Mode countdown. Runs whenever a session is active and not
+      # paused; ticks down g_timer_secs each second and fires alarm_start when
+      # it hits zero. The alarm loops the WAV via alarm_start each 4 s until
+      # the user taps to acknowledge.
+      - if:
+          condition:
+            lambda: 'return id(g_timer_active) && !id(g_timer_paused);'
+          then:
+            - lambda: 'id(g_timer_secs)--;'
+            - script.execute: timer_render
+            - if:
+                condition: { lambda: 'return id(g_timer_local) && id(g_timer_secs) <= 0;' }
+                then:
+                  - script.execute: alarm_start
+      - if:
+          condition: { lambda: 'return id(g_alarm_active);' }
+          then:
+            - lambda: 'id(g_alarm_cnt)++;'
+            - if:
+                condition: { lambda: 'return id(g_alarm_cnt) % 4 == 0;' }
+                then:
+                  - media_player.speaker.play_on_device_media_file:
+                      id: magic_dial_media
+                      media_file: alarm_sound
+                      announcement: true
+      - if:
+          condition:
+            lambda: 'return !id(g_sleeping) && millis() - id(g_last_activity) >= 60000;'
+          then:
+            - script.execute: enter_sleep
+
+  # 2.0: mode selector 2 s idle timeout. Only ticks while the selector is up.
+  - interval: 200ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(g_sel_active) && millis() - id(g_sel_last_ms) >= 2000;'
+          then:
+            - script.execute: sel_hide
+
+  # 2.0: music mode photo rotation. 15 deg / 500 ms = ~12 s revolution, which
+  # keeps CPU load negligible on the ST77916 QSPI panel.
+  - interval: 500ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(g_aod_music_active);'
+          then:
+            - lambda: |-
+                // lv_img_set_angle takes 0.1 deg units (0..3600).
+                int a = id(g_aod_photo_angle) + 150;
+                if (a >= 3600) a -= 3600;
+                id(g_aod_photo_angle) = a;
+                lv_img_set_angle(id(img_aod_bg), a);
+
+image:
+  - platform: file
+    file: lockscreen_bg.jpg
+    id: img_lockscreen_bg
+    type: RGB565
+
+font:
+  # P6 typography. Local TTFs are used instead of `gfonts://` so the exact
+  # Roboto Mono Medium / Noto Sans SC weights are embedded deterministically and
+  # the build never silently falls back to the LVGL default font.
+  # Latin coverage is spelled out explicitly rather than via GF_Latin_Core,
+  # which pulled in 96 accented glyphs the UI never shows.
+  # Material Design Icons webfont, the same source the reference Guition project
+  # uses. An icon font sidesteps PNG asset paths entirely and lets the icon take
+  # the label's text color.
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: font_icons_28
+    size: 28
+    bpp: 4
+    glyphs:
+      - "󰔂"  # mdi-television
+      - "󰓃"  # mdi-speaker
+      - "󰝩"  # mdi-ceiling-light
+      - "󰟖"  # mdi-led-strip
+      - "󰀛"  # mdi-air-conditioner
+      - "󰐸"  # mdi-radiator
+      - "󱮖"  # mdi-knob
+      # Battery page: static level icons ...
+      - "󰁹"  # mdi-battery
+      - "󰂁"  # mdi-battery-80
+      - "󰁿"  # mdi-battery-60
+      - "󰁽"  # mdi-battery-40
+      - "󰁻"  # mdi-battery-20
+      - "󰂎"  # mdi-battery-outline (no reading yet)
+      # ... plus the five charging animation frames.
+      - "󰂆"  # mdi-battery-charging-20
+      - "󰂈"  # mdi-battery-charging-40
+      - "󰂉"  # mdi-battery-charging-60
+      - "󰂊"  # mdi-battery-charging-80
+      - "󰂅"  # mdi-battery-charging-100
+  # AOD lock screen: Pacifico script face. In 2.0 the lock displays a MM.DD date
+  # (e.g. "08.17") so the glyph set is digits + dot; the colon is kept in case the
+  # user reverts to a time layout later.
+  - file: fonts/Pacifico.ttf
+    id: font_pacifico_aod
+    size: 138
+    bpp: 4
+    glyphs: "0123456789:."
+  # Big Material Design music-note glyph rendered on the lockscreen while the HomePod
+  # is playing. Pacifico does not ship ♫, so we ride the same MDI webfont the P6
+  # dashboard already uses. Only one glyph is embedded, so the extra font barely
+  # increases the flash footprint.
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: font_music_aod
+    size: 132
+    bpp: 4
+    glyphs:
+      - "󰝚"  # mdi-music
+  # Mode-selector labels + icons live on the bottom rim of the lock screen.
+  # The mode names are the short English words Home / Remote / Timer /
+  # Weather / Setting; NotoSansSC-Medium already ships uppercase & lowercase
+  # Latin so a minimal glyph roster is enough.
+  - file: fonts/NotoSansSC-Medium.ttf
+    id: font_sel_18
+    size: 18
+    bpp: 4
+    glyphs: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .:%"
+  # Mode-selector icons at the same weight/size, plus an alarm icon reused by the
+  # Timer overlay when the alarm fires, plus the compact weather glyphs painted
+  # around the Weather Mode rim.
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: font_sel_icons_32
+    size: 32
+    bpp: 4
+    glyphs:
+      - "󰋜"  # mdi-home
+      - "󰐳"  # mdi-remote-tv (Remote mode)
+      - "󰔛"  # mdi-timer-outline
+      - "󰖙"  # mdi-weather-sunny
+      - "󰢻"  # mdi-cog-outline (Setting)
+      - "󰀳"  # mdi-alarm (timer alarm)
+      # Weather rim glyphs (reused by wx_render).
+      - "󰖔"  # weather-night
+      - "󰖕"  # partly cloudy
+      - "󰖑"  # fog
+      - "󰖝"  # windy
+      - "󰖓"  # lightning
+      - "󰖖"  # pouring
+      - "󰖗"  # rainy
+      - "󰖘"  # snowy
+      - "󰖐"  # cloudy
+      - "󱩸"  # TV remote-tv fallback
+  # Big hero weather glyph for the centre of the Weather page. Kept as its own
+  # font id so the small rim glyphs stay light.
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: font_wx_hero
+    size: 90
+    bpp: 4
+    glyphs:
+      - "󰖙"  # sunny
+      - "󰖔"  # clear-night
+      - "󰖕"  # partly cloudy
+      - "󰖑"  # fog
+      - "󰖝"  # windy
+      - "󰖓"  # storm
+      - "󰖖"  # pouring
+      - "󰖗"  # rainy
+      - "󰖘"  # snowy
+      - "󰖐"  # cloudy
+  # Weather Mode temperature hero (Roboto Mono at 40px, reused for Timer countdown).
+  - file: fonts/RobotoMono-Medium.ttf
+    id: font_mono_40
+    size: 40
+    bpp: 4
+    glyphs: "0123456789:.-—°/CF "
+  - file: fonts/RobotoMono-Medium.ttf
+    id: font_mono_76
+    size: 76
+    bpp: 4
+    glyphs: &mono_glyphs "0123456789:.-—"
+  - file: fonts/RobotoMono-Medium.ttf
+    id: font_mono_68
+    size: 68
+    bpp: 4
+    glyphs: *mono_glyphs
+  - file: fonts/NotoSansSC-Medium.ttf
+    id: font_sc_24
+    size: 24
+    bpp: 4
+    glyphs: &p6_glyphs " !%()+,-./0123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz年月日星期一二三四五六天·客餐厅电视音量箱吸顶灯带亮度色温相空调目标模式本机屏幕进设备离线正在同步时间低中高制冷热自动送风除湿关闭已打开暂停播放当前魔法旋钮元旦春节清明劳端午秋国庆圣诞复活万情人母父感恩无效连接失败听请重试上下左右暖扇扬声器圆盘地↔▶Ⅱ°—充锁"
+  # Hero value fonts run at bpp 4 again: the 16 MB partition table (~7.94 MB app
+  # slot) leaves plenty of room, so the ~400 KB of 52 px / 44 px bitmaps that
+  # forced the earlier bpp 2 downgrade are no longer a problem. Glyph sets stay
+  # trimmed - these fonts only ever render a handful of characters.
+  - file: fonts/NotoSansSC-Medium.ttf
+    id: font_sc_52
+    size: 52
+    bpp: 4
+    # Hero font only ever renders: ▶ / Ⅱ (TV transport), 暖↔冷 (color temp),
+    # 低 / 中 / 高 (screen brightness), plus a digit/em-dash safety net for the
+    # single frame between a text update and the font switch. 202 -> 23 glyphs.
+    glyphs: "%-.0123456789:—Ⅱ↔▶中低冷暖高"
+  - file: fonts/NotoSansSC-Medium.ttf
+    id: font_sc_44
+    size: 44
+    bpp: 4
+    # Only the climate mode names: 关闭/自动/制冷/制热/除湿/送风 (+ digit safety net).
+    glyphs: "%-.0123456789:—关冷制动湿热自送闭除风"
+  - file: fonts/NotoSansSC-Regular.ttf
+    id: font_sc_20
+    size: 20
+    bpp: 4
+    glyphs: *p6_glyphs
+  - file: fonts/NotoSansSC-Regular.ttf
+    id: font_sc_18
+    size: 18
+    bpp: 4
+    glyphs: *p6_glyphs
+  - file: fonts/NotoSansSC-Medium.ttf
+    id: font_sc_16
+    size: 16
+    bpp: 4
+    glyphs: *p6_glyphs
+
+lvgl:
+  buffer_size: 24%
+  # Charging port down: LVGL owns the rotation because the display component
+  # rejects `rotation` when LVGL is attached.
+  rotation: 180
+  # Every label sets `text_font` explicitly; this default only guards widgets
+  # that have no text of their own.
+  default_font: font_sc_16
+  displays:
+    - main_display
+  touchscreens:
+    - main_touchscreen
+  pages:
+    # P6 Midnight Orbit: a frameless center stage inside a 316 px / 270° instrument arc.
+    - id: page_main
+      bg_color: ${color_bg_canvas}
+      widgets:
+        - arc:
+            id: arc_value
+            align: CENTER
+            width: 316
+            height: 316
+            arc_width: 8
+            adjustable: false
+            min_value: 0
+            max_value: 100
+            value: 50
+            start_angle: 135
+            end_angle: 45
+            arc_color: ${color_line_track}
+            indicator:
+              arc_color: ${color_local}
+              arc_width: 8
+        # Glowing endpoint that rides the arc. Positioned by render_main from the arc
+        # percentage; align TOP_LEFT so lv_obj_set_pos takes plain page coordinates.
+        - obj:
+            id: arc_dot
+            align: TOP_LEFT
+            x: 176
+            y: 22
+            width: 8
+            height: 8
+            radius: 4
+            bg_color: 0xFFFFFF
+            bg_opa: COVER
+            border_width: 0
+            hidden: true
+            clickable: false
+            scrollable: false
+        # 28 radial hairline ticks spread over the 270 deg track. They sit at
+        # radius 136-146 px, i.e. inside the 8 px arc band (150-158 px), so the
+        # arc no longer paints over them like the previous 151-157 px ticks did.
+        - line: { id: tick_0, align: CENTER, x: -100, y: 100, points: [[7, 0], [0, 7]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_1, align: CENTER, x: -116, y: 81, points: [[8, 0], [0, 6]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_2, align: CENTER, x: -128, y: 60, points: [[9, 0], [0, 4]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_3, align: CENTER, x: -136, y: 36, points: [[10, 0], [0, 3]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_4, align: CENTER, x: -140, y: 12, points: [[10, 0], [0, 1]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_5, align: CENTER, x: -140, y: -12, points: [[10, 1], [0, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_6, align: CENTER, x: -136, y: -36, points: [[10, 3], [0, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_7, align: CENTER, x: -128, y: -60, points: [[9, 4], [0, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_8, align: CENTER, x: -116, y: -81, points: [[8, 6], [0, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_9, align: CENTER, x: -100, y: -100, points: [[7, 7], [0, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_10, align: CENTER, x: -81, y: -116, points: [[6, 8], [0, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_11, align: CENTER, x: -60, y: -128, points: [[4, 9], [0, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_12, align: CENTER, x: -36, y: -136, points: [[3, 10], [0, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_13, align: CENTER, x: -12, y: -140, points: [[1, 10], [0, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_14, align: CENTER, x: 12, y: -140, points: [[0, 10], [1, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_15, align: CENTER, x: 36, y: -136, points: [[0, 10], [3, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_16, align: CENTER, x: 60, y: -128, points: [[0, 9], [4, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_17, align: CENTER, x: 81, y: -116, points: [[0, 8], [6, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_18, align: CENTER, x: 100, y: -100, points: [[0, 7], [7, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_19, align: CENTER, x: 116, y: -81, points: [[0, 6], [8, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_20, align: CENTER, x: 128, y: -60, points: [[0, 4], [9, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_21, align: CENTER, x: 136, y: -36, points: [[0, 3], [10, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_22, align: CENTER, x: 140, y: -12, points: [[0, 1], [10, 0]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_23, align: CENTER, x: 140, y: 12, points: [[0, 0], [10, 1]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_24, align: CENTER, x: 136, y: 36, points: [[0, 0], [10, 3]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_25, align: CENTER, x: 128, y: 60, points: [[0, 0], [9, 4]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_26, align: CENTER, x: 116, y: 81, points: [[0, 0], [8, 6]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        - line: { id: tick_27, align: CENTER, x: 100, y: 100, points: [[0, 0], [7, 7]], line_width: 2, line_rounded: true, line_color: 0x263945, line_opa: 85%, clickable: false }
+        # Device group: doc center (180,79), 230x32. The 28 px icon sits left of
+        # the name with an 8 px gap; both are placed relative to x=180 so the
+        # pair reads as one centered group.
+        - label:
+            id: dev_icon
+            align: TOP_LEFT
+            x: 60
+            y: 64
+            text: "󱮖"
+            text_font: font_icons_28
+            text_color: 0xBFD0D8
+        - label:
+            id: lbl_device_name
+            align: TOP_LEFT
+            x: 96
+            y: 63
+            text: "Magic Dial"
+            text_font: font_sc_24
+            text_color: 0xBFD0D8
+        # Hero value: content-sized and CENTER-aligned, so the digits are always
+        # optically centered on x=180 no matter how many of them there are.
+        # y=-15 puts the baseline at 190 per the design doc.
+        - label:
+            id: lbl_value
+            align: CENTER
+            y: -15
+            text: "50"
+            text_font: font_mono_76
+            text_color: ${color_text_primary}
+        # Unit hangs off the value's bottom-right. Its x is recomputed on every
+        # render from the measured value width, so it tracks 1-digit, 2-digit and
+        # decimal values without ever pushing the digits off-center.
+        - label:
+            id: lbl_unit
+            align: TOP_LEFT
+            x: 214
+            y: 168
+            text: "%"
+            text_font: font_sc_18
+            text_color: 0x60747E
+        - label:
+            id: lbl_value_text
+            align: TOP_MID
+            y: 126
+            width: 250
+            text_align: CENTER
+            hidden: true
+            text: "中"
+            text_font: font_sc_24
+            text_color: ${color_text_primary}
+        # Mode pill: doc center (180,250), height 30 -> top = 250 - 15 = 235.
+        # Mode selector: a 3-slot vertical wheel. A rounded block backs the
+        # current mode; the neighbouring modes sit above/below, one size down and
+        # dimmed. This replaces the single pill and all four chevrons.
+        - obj:
+            id: wheel_pill
+            align: TOP_MID
+            y: 246
+            width: 120
+            height: 28
+            radius: 14
+            bg_color: 0x1A2E38
+            # Background permanently removed: the wheel reads purely through type size,
+            # color and opacity. Nothing animates this object any more.
+            bg_opa: TRANSP
+            border_width: 0
+            clickable: false
+            scrollable: false
+        - obj:
+            id: offline_dot
+            align: TOP_MID
+            x: -74
+            y: 270
+            width: 4
+            height: 4
+            radius: 2
+            bg_color: ${color_offline}
+            border_width: 0
+            hidden: true
+            clickable: false
+            scrollable: false
+        - obj:
+            id: wheel_box
+            align: TOP_MID
+            y: 214
+            width: 200
+            height: 96
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            scrollable: false
+            widgets:
+              - label:
+                  # Upper slot: previous option, bleeding in ghosted.
+                  id: lbl_wheel_prev
+                  align: TOP_MID
+                  y: 6
+                  width: 190
+                  text_align: CENTER
+                  text: ""
+                  text_font: font_sc_16
+                  text_color: 0x36505D
+                  text_opa: 40%
+              - label:
+                  # Centre slot (28-68): the selected mode, full size and colour.
+                  id: lbl_mode
+                  align: TOP_MID
+                  y: 34
+                  width: 190
+                  text_align: CENTER
+                  text: "本机音量"
+                  text_font: font_sc_20
+                  text_color: ${color_local}
+              - label:
+                  # Lower slot: next option, bleeding in ghosted.
+                  id: lbl_wheel_next
+                  align: TOP_MID
+                  y: 66
+                  width: 190
+                  text_align: CENTER
+                  text: ""
+                  text_font: font_sc_16
+                  text_color: 0x36505D
+                  text_opa: 40%
+        # Seven reusable dots are dynamically centered/hidden by render_main.
+        - obj: { id: dot_0, align: TOP_MID, x: -48, y: 311, width: 6, height: 6, radius: 3, bg_color: '${color_text_tertiary}', border_width: 0, clickable: false, scrollable: false }
+        - obj: { id: dot_1, align: TOP_MID, x: -32, y: 311, width: 6, height: 6, radius: 3, bg_color: '${color_text_tertiary}', border_width: 0, clickable: false, scrollable: false }
+        - obj: { id: dot_2, align: TOP_MID, x: -16, y: 311, width: 6, height: 6, radius: 3, bg_color: '${color_text_tertiary}', border_width: 0, clickable: false, scrollable: false }
+        - obj: { id: dot_3, align: TOP_MID, x: 0,   y: 311, width: 6, height: 6, radius: 3, bg_color: '${color_text_tertiary}', border_width: 0, clickable: false, scrollable: false }
+        - obj: { id: dot_4, align: TOP_MID, x: 16,  y: 311, width: 6, height: 6, radius: 3, bg_color: '${color_text_tertiary}', border_width: 0, clickable: false, scrollable: false }
+        - obj: { id: dot_5, align: TOP_MID, x: 32,  y: 311, width: 6, height: 6, radius: 3, bg_color: '${color_text_tertiary}', border_width: 0, clickable: false, scrollable: false }
+        - obj: { id: dot_6, align: TOP_MID, x: 48,  y: 311, width: 6, height: 6, radius: 3, bg_color: '${color_text_tertiary}', border_width: 0, clickable: false, scrollable: false }
+
+    # Low-refresh LCD AOD: exact P6 geometry, minute-only updates, no calendar placeholder.
+    - id: page_aod
+      bg_color: ${color_bg_aod}
+      widgets:
+        # 2.0: the family photo can spin during music mode, so LVGL needs the
+        # pivot at the image centre. The pivot is set once here; nothing else
+        # changes about the base layout.
+        - image:
+            id: img_aod_bg
+            src: img_lockscreen_bg
+            x: 0
+            y: 0
+            align: TOP_LEFT
+            pivot_x: 180
+            pivot_y: 180
+            clickable: false
+        # Four dark offset copies form the glow/outline halo that keeps the
+        # white Pacifico digits legible over the photo. They are declared first
+        # so the crisp white glyphs always render on top of them.
+        - label:
+            id: lbl_aod_time_g1
+            align: CENTER
+            x: -3
+            y: -27
+            width: 360
+            text_align: CENTER
+            text: "--:--"
+            text_font: font_pacifico_aod
+            text_color: 0x000000
+            text_opa: 70%
+            bg_opa: TRANSP
+            clickable: false
+        - label:
+            id: lbl_aod_time_g2
+            align: CENTER
+            x: 3
+            y: -27
+            width: 360
+            text_align: CENTER
+            text: "--:--"
+            text_font: font_pacifico_aod
+            text_color: 0x000000
+            text_opa: 70%
+            bg_opa: TRANSP
+            clickable: false
+        - label:
+            id: lbl_aod_time_g3
+            align: CENTER
+            x: 0
+            y: -30
+            width: 360
+            text_align: CENTER
+            text: "--:--"
+            text_font: font_pacifico_aod
+            text_color: 0x000000
+            text_opa: 70%
+            bg_opa: TRANSP
+            clickable: false
+        - label:
+            id: lbl_aod_time_g4
+            align: CENTER
+            x: 0
+            y: -24
+            width: 360
+            text_align: CENTER
+            text: "--:--"
+            text_font: font_pacifico_aod
+            text_color: 0x000000
+            text_opa: 70%
+            bg_opa: TRANSP
+            clickable: false
+        - label:
+            id: lbl_aod_time
+            align: CENTER
+            x: 0
+            y: -27
+            width: 360
+            text_align: CENTER
+            text: "--:--"
+            text_font: font_pacifico_aod
+            text_color: 0xFFFFFF
+            bg_opa: TRANSP
+            clickable: false
+        - label:
+            id: lbl_aod_date
+            align: TOP_MID
+            y: 197
+            width: 240
+            height: 28
+            text_align: CENTER
+            hidden: true
+            text: "正在同步时间"
+            text_font: font_sc_20
+            text_color: 0xFFFFFF
+            bg_opa: TRANSP
+        - label:
+            id: lbl_aod_holiday
+            align: TOP_MID
+            y: 255
+            width: 250
+            height: 26
+            text_align: CENTER
+            long_mode: CLIP
+            hidden: true
+            text: ""
+            text_font: font_sc_18
+            text_color: 0xFFFFFF
+            bg_color: 0x000000
+            bg_opa: 40%
+            radius: 8
+            pad_all: 2
+        # 2.0: music mode swaps the Pacifico date for a big MDI music note.
+        # Hidden by default; render_lockscreen toggles it when the HomePod
+        # starts / stops playing while the lock is on screen.
+        - label:
+            id: lbl_aod_music
+            align: CENTER
+            y: -27
+            width: 200
+            text_align: CENTER
+            hidden: true
+            text: "\U000F0759"  # mdi-music
+            text_font: font_music_aod
+            text_color: 0xFFFFFF
+            bg_opa: TRANSP
+            clickable: false
+        # Mode selector overlay: a rounded translucent bar hugging the bottom
+        # edge, holding 5 mode icons and a name label. Hidden until the knob
+        # is rotated on the lock; the interval above auto-hides after 2 s idle.
+        - obj:
+            id: sel_bar
+            align: BOTTOM_MID
+            x: 0
+            y: -8
+            width: 320
+            height: 82
+            radius: 41
+            bg_color: 0x0A0F14
+            bg_opa: 88%
+            border_width: 1
+            border_color: 0x263945
+            border_opa: 60%
+            pad_all: 8
+            clickable: false
+            scrollable: false
+            hidden: true
+            widgets:
+              - label:
+                  id: sel_i1
+                  align: LEFT_MID
+                  x: 16
+                  y: -8
+                  text: "\U000F015C"  # mdi-home
+                  text_font: font_sel_icons_32
+                  text_color: 0xF2F6F8
+              - label:
+                  id: sel_i2
+                  align: LEFT_MID
+                  x: 72
+                  y: -8
+                  text: "\U000F0433"  # mdi-remote-tv
+                  text_font: font_sel_icons_32
+                  text_color: 0x617681
+              - label:
+                  id: sel_i3
+                  align: LEFT_MID
+                  x: 132
+                  y: -8
+                  text: "\U000F051B"  # mdi-timer-outline
+                  text_font: font_sel_icons_32
+                  text_color: 0x617681
+              - label:
+                  id: sel_i4
+                  align: LEFT_MID
+                  x: 192
+                  y: -8
+                  text: "\U000F0599"  # mdi-weather-sunny
+                  text_font: font_sel_icons_32
+                  text_color: 0x617681
+              - label:
+                  id: sel_i5
+                  align: LEFT_MID
+                  x: 252
+                  y: -8
+                  text: "\U000F08BB"  # mdi-cog-outline
+                  text_font: font_sel_icons_32
+                  text_color: 0x617681
+              - label:
+                  id: sel_name
+                  align: BOTTOM_MID
+                  y: -4
+                  width: 200
+                  text_align: CENTER
+                  text: "Home"
+                  text_font: font_sel_18
+                  text_color: 0xF2F6F8
+
+    # =============== 2.0: Remote Mode ===============
+    # Sony TV remote UI: 4 directional buttons + Confirm + Back + Power.
+    # Every button dispatches the matching command via remote.send_command; the
+    # visual layout uses a diamond of arrow labels around a central Confirm
+    # button, with Back and Power flanking the bottom edge.
+    - id: page_remote
+      bg_color: ${color_bg_canvas}
+      widgets:
+        - obj:
+            align: CENTER
+            width: 320
+            height: 320
+            radius: 160
+            bg_opa: TRANSP
+            border_width: 2
+            border_color: 0x263945
+            border_opa: 65%
+            clickable: false
+            scrollable: false
+        - label:
+            align: TOP_MID
+            y: 26
+            text: "Remote"
+            text_font: font_sc_20
+            text_color: 0xBFD0D8
+        # 4-way directional pad
+        - button:
+            id: rmt_up
+            align: CENTER
+            x: 0
+            y: -78
+            width: 68
+            height: 60
+            radius: 14
+            bg_color: 0x14222C
+            bg_opa: COVER
+            border_width: 1
+            border_color: 0x263945
+            on_click:
+              - homeassistant.action:
+                  action: remote.send_command
+                  data: { entity_id: '${tv_remote_entity}', command: Up }
+              - script.execute: ring_tap_feedback
+            widgets:
+              - label: { align: CENTER, text: "\u25B2", text_font: font_sc_44, text_color: 0xF2F6F8 }
+        - button:
+            id: rmt_down
+            align: CENTER
+            x: 0
+            y: 78
+            width: 68
+            height: 60
+            radius: 14
+            bg_color: 0x14222C
+            bg_opa: COVER
+            border_width: 1
+            border_color: 0x263945
+            on_click:
+              - homeassistant.action:
+                  action: remote.send_command
+                  data: { entity_id: '${tv_remote_entity}', command: Down }
+              - script.execute: ring_tap_feedback
+            widgets:
+              - label: { align: CENTER, text: "\u25BC", text_font: font_sc_44, text_color: 0xF2F6F8 }
+        - button:
+            id: rmt_left
+            align: CENTER
+            x: -95
+            y: 0
+            width: 60
+            height: 68
+            radius: 14
+            bg_color: 0x14222C
+            bg_opa: COVER
+            border_width: 1
+            border_color: 0x263945
+            on_click:
+              - homeassistant.action:
+                  action: remote.send_command
+                  data: { entity_id: '${tv_remote_entity}', command: Left }
+              - script.execute: ring_tap_feedback
+            widgets:
+              - label: { align: CENTER, text: "\u25C0", text_font: font_sc_44, text_color: 0xF2F6F8 }
+        - button:
+            id: rmt_right
+            align: CENTER
+            x: 95
+            y: 0
+            width: 60
+            height: 68
+            radius: 14
+            bg_color: 0x14222C
+            bg_opa: COVER
+            border_width: 1
+            border_color: 0x263945
+            on_click:
+              - homeassistant.action:
+                  action: remote.send_command
+                  data: { entity_id: '${tv_remote_entity}', command: Right }
+              - script.execute: ring_tap_feedback
+            widgets:
+              - label: { align: CENTER, text: "\u25B6", text_font: font_sc_44, text_color: 0xF2F6F8 }
+        # Centre Confirm
+        - button:
+            id: rmt_ok
+            align: CENTER
+            x: 0
+            y: 0
+            width: 82
+            height: 82
+            radius: 41
+            bg_color: 0x1E3A4A
+            bg_opa: COVER
+            border_width: 2
+            border_color: 0x49A8FF
+            on_click:
+              - homeassistant.action:
+                  action: remote.send_command
+                  data: { entity_id: '${tv_remote_entity}', command: Confirm }
+              - script.execute: ring_tap_feedback
+            widgets:
+              - label: { align: CENTER, text: "OK", text_font: font_sc_24, text_color: 0xF2F6F8 }
+        # Back (bottom-left corner)
+        - button:
+            id: rmt_back
+            align: BOTTOM_MID
+            x: -90
+            y: -20
+            width: 68
+            height: 42
+            radius: 21
+            bg_color: 0x14222C
+            bg_opa: COVER
+            border_width: 1
+            border_color: 0x263945
+            on_click:
+              - homeassistant.action:
+                  action: remote.send_command
+                  data: { entity_id: '${tv_remote_entity}', command: Back }
+              - script.execute: ring_tap_feedback
+            widgets:
+              - label: { align: CENTER, text: "Back", text_font: font_sc_18, text_color: 0xF2F6F8 }
+        # Power (bottom-right, red)
+        - button:
+            id: rmt_power
+            align: BOTTOM_MID
+            x: 90
+            y: -20
+            width: 68
+            height: 42
+            radius: 21
+            bg_color: 0x8B1F2A
+            bg_opa: COVER
+            border_width: 1
+            border_color: 0xE66472
+            on_click:
+              - homeassistant.action:
+                  action: media_player.toggle
+                  data: { entity_id: '${tv_entity}' }
+              - script.execute: ring_tap_feedback
+            widgets:
+              - label: { align: CENTER, text: "PWR", text_font: font_sc_18, text_color: 0xF2F6F8 }
+
+    # =============== 2.0: Timer Mode ===============
+    # Countdown ring + big MM:SS display. Ported from base/screens/timer.yaml
+    # via base/core.yaml's page_timer, remapped to Magic Dial's own colour
+    # tokens. Buttons on-screen mirror the tap dispatcher (start / pause /
+    # halt) so a user without knob access can still operate it.
+    - id: page_timer
+      bg_color: ${color_bg_canvas}
+      widgets:
+        - obj:
+            id: timer_ring_out
+            align: CENTER
+            width: 332
+            height: 332
+            radius: 166
+            bg_opa: TRANSP
+            border_width: 2
+            border_color: 0x263945
+            border_opa: 65%
+            clickable: false
+            scrollable: false
+        - arc:
+            id: timer_arc
+            align: CENTER
+            width: 300
+            height: 300
+            arc_width: 14
+            adjustable: false
+            min_value: 0
+            max_value: 100
+            value: 100
+            start_angle: 271
+            end_angle: 269
+            arc_color: 0x1C2027
+            indicator:
+              arc_color: 0x2FB85C
+              arc_width: 14
+        - label:
+            id: timer_cap
+            align: CENTER
+            y: -72
+            text: "SET"
+            text_font: font_sc_20
+            text_color: 0x6F9A92
+        - label:
+            id: timer_big
+            align: CENTER
+            y: -14
+            text: "5:00"
+            text_font: font_mono_76
+            text_color: 0xFFFFFF
+        - label:
+            align: CENTER
+            y: 42
+            text: "点击/旋钮"
+            text_font: font_sc_16
+            text_color: 0x617681
+
+    # =============== 2.0: Weather Mode ===============
+    # Copied from base/screens/weather.yaml (the reference project) with the
+    # PNG-sprite animation replaced by a single MDI hero glyph so the flash
+    # footprint stays reasonable.
+    - id: page_weather
+      bg_color: 0x0B1020
+      widgets:
+        - obj:
+            id: wx_bg
+            align: CENTER
+            x: 0
+            y: 0
+            width: 360
+            height: 360
+            radius: 0
+            bg_color: 0x1C2838
+            bg_opa: COVER
+            border_width: 0
+        - obj:
+            id: wx_ring_out
+            align: CENTER
+            width: 348
+            height: 348
+            radius: 174
+            bg_opa: TRANSP
+            border_width: 2
+            border_color: 0x33455C
+            border_opa: 55%
+            clickable: false
+            scrollable: false
+        - obj:
+            id: wx_glow
+            x: 152
+            y: 12
+            width: 56
+            height: 56
+            radius: 28
+            bg_color: 0xCAD6E8
+            bg_opa: 30%
+            border_width: 0
+            hidden: true
+        # 7 rim glyphs; positioned by wx_render based on how many days the HA
+        # helper actually returned.
+        - label: { id: wx_d0, align: CENTER, x: 0, y: 0, text: "", text_font: font_sel_icons_32, text_color: 0xDCE6F2, hidden: true }
+        - label: { id: wx_d1, align: CENTER, x: 0, y: 0, text: "", text_font: font_sel_icons_32, text_color: 0xDCE6F2, hidden: true }
+        - label: { id: wx_d2, align: CENTER, x: 0, y: 0, text: "", text_font: font_sel_icons_32, text_color: 0xDCE6F2, hidden: true }
+        - label: { id: wx_d3, align: CENTER, x: 0, y: 0, text: "", text_font: font_sel_icons_32, text_color: 0xDCE6F2, hidden: true }
+        - label: { id: wx_d4, align: CENTER, x: 0, y: 0, text: "", text_font: font_sel_icons_32, text_color: 0xDCE6F2, hidden: true }
+        - label: { id: wx_d5, align: CENTER, x: 0, y: 0, text: "", text_font: font_sel_icons_32, text_color: 0xDCE6F2, hidden: true }
+        - label: { id: wx_d6, align: CENTER, x: 0, y: 0, text: "", text_font: font_sel_icons_32, text_color: 0xDCE6F2, hidden: true }
+        # Hero glyph in the centre stage.
+        - label:
+            id: wx_hero_icon
+            align: CENTER
+            x: 0
+            y: -60
+            text: "\U000F0599"  # mdi-weather-sunny
+            text_font: font_wx_hero
+            text_color: 0xFFD061
+        - label:
+            id: wx_day
+            align: CENTER
+            x: 0
+            y: 6
+            text: "TODAY"
+            text_font: font_sc_18
+            text_color: 0x9AA6B2
+        - label:
+            id: wx_htemp
+            align: CENTER
+            x: 0
+            y: 40
+            text: "--"
+            text_font: font_mono_40
+            text_color: 0xFFFFFF
+        - label:
+            id: wx_cond
+            align: CENTER
+            x: 0
+            y: 82
+            text: ""
+            text_font: font_sc_18
+            text_color: 0xCFE0F2
+
+    # =============== 2.0: Setting Mode ===============
+    # Four-row control panel. Row indicator dots at the top, the current name
+    # + value in the centre, an arc showing the numeric value. Swipe up/down
+    # cycles rows; the knob adjusts the current row; a tap runs the mute
+    # cascade defined by setting_tap.
+    - id: page_setting
+      bg_color: ${color_bg_canvas}
+      widgets:
+        - arc:
+            id: set_arc
+            align: CENTER
+            width: 316
+            height: 316
+            arc_width: 8
+            adjustable: false
+            min_value: 0
+            max_value: 100
+            value: 50
+            start_angle: 135
+            end_angle: 45
+            arc_color: ${color_line_track}
+            indicator:
+              arc_color: ${color_local}
+              arc_width: 8
+        - label:
+            align: TOP_MID
+            y: 40
+            text: "设置"
+            text_font: font_sc_20
+            text_color: 0xBFD0D8
+        - label:
+            id: set_row_name
+            align: CENTER
+            y: -70
+            text: "本机音量"
+            text_font: font_sc_24
+            text_color: 0xBFD0D8
+        - label:
+            id: set_value
+            align: CENTER
+            y: -8
+            text: "50"
+            text_font: font_mono_76
+            text_color: ${color_text_primary}
+        - label:
+            id: set_unit
+            align: CENTER
+            x: 88
+            y: 12
+            text: "%"
+            text_font: font_sc_20
+            text_color: 0x60747E
+        # 4 row dots at the bottom
+        - obj: { id: set_dot0, align: BOTTOM_MID, x: -30, y: -50, width: 8, height: 8, radius: 4, bg_color: 0xF2F6F8, border_width: 0, clickable: false, scrollable: false }
+        - obj: { id: set_dot1, align: BOTTOM_MID, x: -10, y: -50, width: 8, height: 8, radius: 4, bg_color: 0x37464D, border_width: 0, clickable: false, scrollable: false }
+        - obj: { id: set_dot2, align: BOTTOM_MID, x: 10,  y: -50, width: 8, height: 8, radius: 4, bg_color: 0x37464D, border_width: 0, clickable: false, scrollable: false }
+        - obj: { id: set_dot3, align: BOTTOM_MID, x: 30,  y: -50, width: 8, height: 8, radius: 4, bg_color: 0x37464D, border_width: 0, clickable: false, scrollable: false }
