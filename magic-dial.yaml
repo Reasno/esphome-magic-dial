@@ -49,12 +49,9 @@ esphome:
       - lambda: |-
           id(g_last_activity) = millis();
           id(g_backlight_pct) = 100;
-          id(g_sleeping) = true;
-          id(g_current_page) = 0;
-      - script.execute: render_aod
-      - script.execute: lock_rotation
+      - script.execute: resolve_priority
       - lvgl.page.show:
-          id: page_lock
+          id: page_main
           animation: fade_in
           time: 250ms
 
@@ -159,16 +156,10 @@ binary_sensor:
     on_press:
       - lambda: |-
           const uint32_t now = millis();
-          // The first knob pulse on the lock page is consumed: wake only.
-          if (id(g_current_page) == 0) {
+          // The first knob pulse in AOD is consumed: wake only, never mutate state.
+          if (id(g_sleeping)) {
             id(g_last_activity) = now;
             id(wake_display).execute();
-            return;
-          }
-          // Timer fields are edited locally and never fall through to Home controls.
-          if (id(g_current_page) == 3) {
-            id(g_last_activity) = now;
-            id(timer_adjust).execute(-1);
             return;
           }
           const uint32_t elapsed = id(g_knob_last_pulse_ms) == 0 ? UINT32_MAX : now - id(g_knob_last_pulse_ms);
@@ -217,16 +208,10 @@ binary_sensor:
     on_press:
       - lambda: |-
           const uint32_t now = millis();
-          // The first knob pulse on the lock page is consumed: wake only.
-          if (id(g_current_page) == 0) {
+          // The first knob pulse in AOD is consumed: wake only, never mutate state.
+          if (id(g_sleeping)) {
             id(g_last_activity) = now;
             id(wake_display).execute();
-            return;
-          }
-          // Timer fields are edited locally and never fall through to Home controls.
-          if (id(g_current_page) == 3) {
-            id(g_last_activity) = now;
-            id(timer_adjust).execute(1);
             return;
           }
           const uint32_t elapsed = id(g_knob_last_pulse_ms) == 0 ? UINT32_MAX : now - id(g_knob_last_pulse_ms);
@@ -680,7 +665,6 @@ text_sensor:
     internal: true
     on_value:
       - script.execute: sync_from_ha
-      - script.execute: lock_rotation
 
   - platform: homeassistant
     id: ceiling_light_state
@@ -912,35 +896,6 @@ sensor:
             - script.execute: render_main
 
 globals:
-  # Magic Dial 3.0 page state: 0 lock, 1 home, 2 remote, 3 timer.
-  - id: g_current_page
-    type: int
-    restore_value: no
-    initial_value: '0'
-  - id: g_timer_minutes
-    type: int
-    restore_value: no
-    initial_value: '5'
-  - id: g_timer_seconds
-    type: int
-    restore_value: no
-    initial_value: '0'
-  - id: g_timer_remaining
-    type: int
-    restore_value: no
-    initial_value: '300'
-  - id: g_timer_total
-    type: int
-    restore_value: no
-    initial_value: '300'
-  - id: g_timer_edit_field
-    type: int
-    restore_value: no
-    initial_value: '0'
-  - id: g_timer_running
-    type: bool
-    restore_value: no
-    initial_value: 'false'
   # AOD clock string, shared by the visible label and its four glow copies.
   - id: g_aod_clock
     type: std::string
@@ -1759,6 +1714,8 @@ script:
 
   - id: render_aod
     then:
+      # One shared clock string, pushed to the main label plus the four glow
+      # copies so the halo never drifts out of sync with the visible digits.
       - lambda: |-
           auto now = id(ha_time).now();
           if (!now.is_valid()) {
@@ -1769,40 +1726,56 @@ script:
             id(g_aod_clock) = text;
           }
       - lvgl.label.update:
-          id: lbl_lock_time
+          id: lbl_aod_time_g1
           text: !lambda 'return id(g_aod_clock);'
-
-  - id: lock_rotation
-    mode: restart
-    then:
+      - lvgl.label.update:
+          id: lbl_aod_time_g2
+          text: !lambda 'return id(g_aod_clock);'
+      - lvgl.label.update:
+          id: lbl_aod_time_g3
+          text: !lambda 'return id(g_aod_clock);'
+      - lvgl.label.update:
+          id: lbl_aod_time_g4
+          text: !lambda 'return id(g_aod_clock);'
+      - lvgl.label.update:
+          id: lbl_aod_time
+          text: !lambda 'return id(g_aod_clock);'
+      - lvgl.label.update:
+          id: lbl_aod_date
+          text: !lambda |-
+            auto now = id(ha_time).now();
+            if (!now.is_valid()) return std::string("正在同步时间");
+            static const char *weekdays[] = {
+              "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"
+            };
+            char text[40];
+            snprintf(text, sizeof(text), "%d月%d日 · %s", now.month, now.day_of_month, weekdays[now.day_of_week - 1]);
+            return std::string(text);
+      - lvgl.label.update:
+          id: lbl_aod_holiday
+          text: !lambda |-
+            if (id(holiday_calendar_state).state == "on" &&
+                !id(holiday_calendar_name).state.empty() &&
+                id(holiday_calendar_name).state != "unknown" &&
+                id(holiday_calendar_name).state != "unavailable") {
+              return id(holiday_calendar_name).state;
+            }
+            return std::string("");
       - lambda: |-
-          lv_anim_del(id(img_lock_bg), nullptr);
-          if (id(homepod_state).state == "playing") {
-            lv_anim_t anim;
-            lv_anim_init(&anim);
-            lv_anim_set_var(&anim, id(img_lock_bg));
-            lv_anim_set_values(&anim, 0, 3600);
-            lv_anim_set_time(&anim, 60000);
-            lv_anim_set_repeat_count(&anim, LV_ANIM_REPEAT_INFINITE);
-            lv_anim_set_path_cb(&anim, lv_anim_path_linear);
-            lv_anim_set_exec_cb(&anim, [](void *obj, int32_t value) {
-              lv_obj_set_style_transform_rotation((lv_obj_t *) obj, value, LV_PART_MAIN);
-            });
-            lv_anim_start(&anim);
-          } else {
-            lv_obj_set_style_transform_rotation(id(img_lock_bg), 0, LV_PART_MAIN);
-          }
+          const bool show = id(holiday_calendar_state).state == "on" &&
+            !id(holiday_calendar_name).state.empty() &&
+            id(holiday_calendar_name).state != "unknown" &&
+            id(holiday_calendar_name).state != "unavailable";
+          if (show) lv_obj_clear_flag(id(lbl_aod_holiday), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_add_flag(id(lbl_aod_holiday), LV_OBJ_FLAG_HIDDEN);
 
   - id: enter_sleep
     then:
-      - lambda: |-
-          id(g_sleeping) = true;
-          id(g_current_page) = 0;
+      - lambda: 'id(g_sleeping) = true;'
       - script.execute: ring_update_state
       - script.execute: render_aod
-      - script.execute: lock_rotation
       - lvgl.page.show:
-          id: page_lock
+          id: page_aod
           animation: fade_in
           time: 300ms
       - light.turn_on:
@@ -1813,7 +1786,6 @@ script:
     then:
       - lambda: |-
           id(g_sleeping) = false;
-          id(g_current_page) = 1;
           id(g_last_activity) = millis();
           id(g_manual_until) = 0;
           id(g_backlight_pct) = 100;
@@ -1822,7 +1794,7 @@ script:
           brightness: 100%
       - script.execute: resolve_priority
       - lvgl.page.show:
-          id: page_home
+          id: page_main
           animation: fade_in
           time: 250ms
 
@@ -2055,106 +2027,28 @@ script:
       # Ring-only: the old wheel_pill flash is gone along with the pill background.
       - script.execute: ring_tap_feedback
 
-  - id: show_app_page
-    parameters:
-      page: int
-    then:
-      - lambda: |-
-          id(g_current_page) = page;
-          id(g_sleeping) = false;
-          id(g_last_activity) = millis();
-      - if:
-          condition: { lambda: 'return page == 1;' }
-          then:
-            - lvgl.page.show: { id: page_home, animation: move_right, time: 220ms }
-      - if:
-          condition: { lambda: 'return page == 2;' }
-          then:
-            - lvgl.page.show: { id: page_remote, animation: fade_in, time: 220ms }
-      - if:
-          condition: { lambda: 'return page == 3;' }
-          then:
-            - script.execute: timer_render
-            - lvgl.page.show: { id: page_timer, animation: move_left, time: 220ms }
-
-  - id: timer_render
-    then:
-      - lambda: |-
-          const int remaining = id(g_timer_remaining);
-          id(g_timer_minutes) = remaining / 60;
-          id(g_timer_seconds) = remaining % 60;
-          lv_label_set_text_fmt(id(lbl_timer_mm), "%02d", id(g_timer_minutes));
-          lv_label_set_text_fmt(id(lbl_timer_ss), "%02d", id(g_timer_seconds));
-          lv_obj_set_style_text_color(id(lbl_timer_mm), lv_color_hex(id(g_timer_edit_field) == 0 ? 0x45D6C5 : 0xF2F6F8), LV_PART_MAIN);
-          lv_obj_set_style_text_color(id(lbl_timer_ss), lv_color_hex(id(g_timer_edit_field) == 1 ? 0x45D6C5 : 0xF2F6F8), LV_PART_MAIN);
-          int pct = id(g_timer_total) > 0 ? (remaining * 100 / id(g_timer_total)) : 0;
-          lv_arc_set_value(id(arc_timer), pct);
-          lv_label_set_text(id(lbl_timer_start), id(g_timer_running) ? "Ⅱ" : "▶");
-
-  - id: timer_adjust
-    parameters:
-      direction: int
-    then:
-      - if:
-          condition: { lambda: 'return !id(g_timer_running);' }
-          then:
-            - lambda: |-
-                int mm = id(g_timer_remaining) / 60;
-                int ss = id(g_timer_remaining) % 60;
-                if (id(g_timer_edit_field) == 0) mm = std::max(0, std::min(99, mm + direction));
-                else ss = std::max(0, std::min(59, ss + direction));
-                id(g_timer_remaining) = mm * 60 + ss;
-                id(g_timer_total) = id(g_timer_remaining);
-            - script.execute: timer_render
-
-  - id: timer_toggle
-    then:
-      - lambda: |-
-          if (id(g_timer_running)) id(g_timer_running) = false;
-          else if (id(g_timer_remaining) > 0) {
-            id(g_timer_total) = id(g_timer_remaining);
-            id(g_timer_running) = true;
-          }
-      - script.execute: timer_render
-
-  - id: timer_reset
-    then:
-      - lambda: |-
-          id(g_timer_running) = false;
-          id(g_timer_remaining) = 0;
-          id(g_timer_total) = 0;
-      - script.execute: timer_render
-
   - id: dispatch_gesture
     then:
-      # Horizontal app navigation. Gesture ids: 2 left, 3 right.
+      # 本机 mode 3 (电量) is a read-only readout, so a tap there does nothing at all.
       - if:
-          condition: { lambda: 'return id(g_current_page) == 1 && id(g_gesture) == 2;' }
-          then: [ { script.execute: { id: show_app_page, page: 2 } } ]
-      - if:
-          condition: { lambda: 'return id(g_current_page) == 2 && id(g_gesture) == 2;' }
-          then: [ { script.execute: { id: show_app_page, page: 3 } } ]
-      - if:
-          condition: { lambda: 'return id(g_current_page) == 2 && id(g_gesture) == 3;' }
-          then: [ { script.execute: { id: show_app_page, page: 1 } } ]
-      - if:
-          condition: { lambda: 'return id(g_current_page) == 3 && id(g_gesture) == 3;' }
-          then: [ { script.execute: { id: show_app_page, page: 2 } } ]
-      # Preserve every original Home tap and vertical mode gesture.
-      - if:
-          condition: { lambda: 'return id(g_current_page) == 1 && id(g_gesture) == 0 && !(id(g_target) == 7 && id(g_control_mode) == 3);' }
+          condition: { lambda: 'return id(g_gesture) == 0 && !(id(g_target) == 7 && id(g_control_mode) == 3);' }
           then:
             - script.execute: handle_tap
+      # P6 defers Voice Assistant; a recognized long press is intentionally consumed.
       - if:
-          condition: { lambda: 'return id(g_current_page) == 1 && id(g_gesture) == 3;' }
+          condition: { lambda: 'return id(g_gesture) == 2;' }
+          then:
+            - script.execute: { id: cycle_target, direction: 1 }
+      - if:
+          condition: { lambda: 'return id(g_gesture) == 3;' }
           then:
             - script.execute: { id: cycle_target, direction: -1 }
       - if:
-          condition: { lambda: 'return id(g_current_page) == 1 && id(g_gesture) == 4;' }
+          condition: { lambda: 'return id(g_gesture) == 4;' }
           then:
             - script.execute: { id: switch_mode, direction: 1 }
       - if:
-          condition: { lambda: 'return id(g_current_page) == 1 && id(g_gesture) == 5;' }
+          condition: { lambda: 'return id(g_gesture) == 5;' }
           then:
             - script.execute: { id: switch_mode, direction: -1 }
 
@@ -2584,17 +2478,6 @@ interval:
             - script.execute: render_main
       - if:
           condition:
-            lambda: 'return id(g_timer_running);'
-          then:
-            - lambda: |-
-                if (id(g_timer_remaining) > 0) id(g_timer_remaining)--;
-                if (id(g_timer_remaining) <= 0) {
-                  id(g_timer_remaining) = 0;
-                  id(g_timer_running) = false;
-                }
-            - script.execute: timer_render
-      - if:
-          condition:
             lambda: 'return !id(g_sleeping) && millis() - id(g_last_activity) >= 60000;'
           then:
             - script.execute: enter_sleep
@@ -2708,7 +2591,7 @@ lvgl:
     - main_touchscreen
   pages:
     # P6 Midnight Orbit: a frameless center stage inside a 316 px / 270° instrument arc.
-    - id: page_home
+    - id: page_main
       bg_color: ${color_bg_canvas}
       widgets:
         - arc:
@@ -2879,23 +2762,74 @@ lvgl:
         - obj: { id: dot_5, align: TOP_MID, x: 32,  y: 311, width: 6, height: 6, radius: 3, bg_color: '${color_text_tertiary}', border_width: 0, clickable: false, scrollable: false }
         - obj: { id: dot_6, align: TOP_MID, x: 48,  y: 311, width: 6, height: 6, radius: 3, bg_color: '${color_text_tertiary}', border_width: 0, clickable: false, scrollable: false }
 
-    # Magic Dial 3.0 lock page: full-screen artwork and one clock label only.
-    - id: page_lock
+    # Low-refresh LCD AOD: exact P6 geometry, minute-only updates, no calendar placeholder.
+    - id: page_aod
       bg_color: ${color_bg_aod}
       widgets:
         - image:
-            id: img_lock_bg
+            id: img_aod_bg
             src: img_lockscreen_bg
             x: 0
             y: 0
             align: TOP_LEFT
+            clickable: false
+        # Four dark offset copies form the glow/outline halo that keeps the
+        # white Pacifico digits legible over the photo. They are declared first
+        # so the crisp white glyphs always render on top of them.
+        - label:
+            id: lbl_aod_time_g1
+            align: CENTER
+            x: -3
+            y: -27
             width: 360
-            height: 360
-            transform_pivot_x: 180
-            transform_pivot_y: 180
+            text_align: CENTER
+            text: "--:--"
+            text_font: font_pacifico_aod
+            text_color: 0x000000
+            text_opa: 70%
+            bg_opa: TRANSP
             clickable: false
         - label:
-            id: lbl_lock_time
+            id: lbl_aod_time_g2
+            align: CENTER
+            x: 3
+            y: -27
+            width: 360
+            text_align: CENTER
+            text: "--:--"
+            text_font: font_pacifico_aod
+            text_color: 0x000000
+            text_opa: 70%
+            bg_opa: TRANSP
+            clickable: false
+        - label:
+            id: lbl_aod_time_g3
+            align: CENTER
+            x: 0
+            y: -30
+            width: 360
+            text_align: CENTER
+            text: "--:--"
+            text_font: font_pacifico_aod
+            text_color: 0x000000
+            text_opa: 70%
+            bg_opa: TRANSP
+            clickable: false
+        - label:
+            id: lbl_aod_time_g4
+            align: CENTER
+            x: 0
+            y: -24
+            width: 360
+            text_align: CENTER
+            text: "--:--"
+            text_font: font_pacifico_aod
+            text_color: 0x000000
+            text_opa: 70%
+            bg_opa: TRANSP
+            clickable: false
+        - label:
+            id: lbl_aod_time
             align: CENTER
             x: 0
             y: -27
@@ -2906,179 +2840,31 @@ lvgl:
             text_color: 0xFFFFFF
             bg_opa: TRANSP
             clickable: false
-
-    # Compact television remote made from individual button widgets.
-    - id: page_remote
-      bg_color: ${color_bg_canvas}
-      widgets:
-        - label: { align: TOP_MID, y: 18, text: "REMOTE", text_font: font_sc_24, text_color: 0xA5B4BD }
-        - button:
+        - label:
+            id: lbl_aod_date
             align: TOP_MID
-            y: 52
-            width: 68
-            height: 42
-            radius: 21
-            bg_color: 0x32151B
-            on_click:
-              - if:
-                  condition: { lambda: 'const auto s=id(tv_state).state; return s=="off" || s=="unavailable";' }
-                  then:
-                    - homeassistant.action: { action: media_player.turn_on, data: { entity_id: '${tv_entity}' } }
-                  else:
-                    - homeassistant.action: { action: media_player.turn_off, data: { entity_id: '${tv_entity}' } }
-            widgets:
-              - label: { align: CENTER, text: "PWR", text_font: font_sc_18, text_color: 0xE66472 }
-        - button:
-            align: CENTER
-            y: -62
-            width: 58
-            height: 48
-            radius: 20
-            on_click: [ { homeassistant.action: { action: remote.send_command, data: { entity_id: '${tv_remote_entity}', command: Up } } } ]
-            widgets: [ { label: { align: CENTER, text: "UP", text_font: font_sc_20 } } ]
-        - button:
-            align: CENTER
-            x: -62
-            y: -5
-            width: 58
-            height: 48
-            radius: 20
-            on_click: [ { homeassistant.action: { action: remote.send_command, data: { entity_id: '${tv_remote_entity}', command: Left } } } ]
-            widgets: [ { label: { align: CENTER, text: "L", text_font: font_sc_24 } } ]
-        - button:
-            align: CENTER
-            width: 62
-            height: 54
-            radius: 27
-            bg_color: 0x16675F
-            on_click: [ { homeassistant.action: { action: remote.send_command, data: { entity_id: '${tv_remote_entity}', command: Confirm } } } ]
-            widgets: [ { label: { align: CENTER, text: "OK", text_font: font_sc_20 } } ]
-        - button:
-            align: CENTER
-            x: 62
-            y: -5
-            width: 58
-            height: 48
-            radius: 20
-            on_click: [ { homeassistant.action: { action: remote.send_command, data: { entity_id: '${tv_remote_entity}', command: Right } } } ]
-            widgets: [ { label: { align: CENTER, text: "R", text_font: font_sc_24 } } ]
-        - button:
-            align: CENTER
-            y: 57
-            width: 58
-            height: 48
-            radius: 20
-            on_click: [ { homeassistant.action: { action: remote.send_command, data: { entity_id: '${tv_remote_entity}', command: Down } } } ]
-            widgets: [ { label: { align: CENTER, text: "DN", text_font: font_sc_20 } } ]
-        - button:
-            align: BOTTOM_LEFT
-            x: 44
-            y: -48
-            width: 76
-            height: 40
-            radius: 20
-            on_click: [ { homeassistant.action: { action: remote.send_command, data: { entity_id: '${tv_remote_entity}', command: Home } } } ]
-            widgets: [ { label: { align: CENTER, text: "HOME", text_font: font_sc_16 } } ]
-        - button:
-            align: BOTTOM_RIGHT
-            x: -44
-            y: -48
-            width: 76
-            height: 40
-            radius: 20
-            on_click: [ { homeassistant.action: { action: remote.send_command, data: { entity_id: '${tv_remote_entity}', command: Return } } } ]
-            widgets: [ { label: { align: CENTER, text: "BACK", text_font: font_sc_16 } } ]
-        - button:
-            align: BOTTOM_MID
-            x: -48
-            y: -4
-            width: 70
-            height: 38
-            radius: 19
-            on_click: [ { homeassistant.action: { action: remote.send_command, data: { entity_id: '${tv_remote_entity}', command: VolumeDown } } } ]
-            widgets: [ { label: { align: CENTER, text: "V-", text_font: font_sc_18 } } ]
-        - button:
-            align: BOTTOM_MID
-            x: 48
-            y: -4
-            width: 70
-            height: 38
-            radius: 19
-            on_click: [ { homeassistant.action: { action: remote.send_command, data: { entity_id: '${tv_remote_entity}', command: VolumeUp } } } ]
-            widgets: [ { label: { align: CENTER, text: "V+", text_font: font_sc_18 } } ]
-
-    - id: page_timer
-      bg_color: ${color_bg_canvas}
-      widgets:
-        - arc:
-            id: arc_timer
-            align: CENTER
-            width: 310
-            height: 310
-            min_value: 0
-            max_value: 100
-            value: 100
-            start_angle: 135
-            end_angle: 45
-            arc_width: 10
-            arc_color: ${color_line_track}
-            adjustable: false
-            indicator: { arc_color: '${color_local}', arc_width: 10 }
-        - label: { align: TOP_MID, y: 48, text: "TIMER", text_font: font_sc_24, text_color: 0xA5B4BD }
+            y: 197
+            width: 240
+            height: 28
+            text_align: CENTER
+            hidden: true
+            text: "正在同步时间"
+            text_font: font_sc_20
+            text_color: 0xFFFFFF
+            bg_opa: TRANSP
         - label:
-            id: lbl_timer_mm
-            align: CENTER
-            x: -70
-            y: -20
-            width: 105
-            text_align: RIGHT
-            text: "05"
-            text_font: font_mono_68
-            text_color: ${color_local}
-            clickable: true
-            on_click:
-              - lambda: 'id(g_timer_edit_field) = 0; id(g_last_activity) = millis();'
-              - script.execute: timer_render
-        - label:
-            align: CENTER
-            y: -20
-            text: ":"
-            text_font: font_mono_68
-            text_color: ${color_text_primary}
-            clickable: false
-        - label:
-            id: lbl_timer_ss
-            align: CENTER
-            x: 70
-            y: -20
-            width: 105
-            text_align: LEFT
-            text: "00"
-            text_font: font_mono_68
-            text_color: ${color_text_primary}
-            clickable: true
-            on_click:
-              - lambda: 'id(g_timer_edit_field) = 1; id(g_last_activity) = millis();'
-              - script.execute: timer_render
-        - button:
-            align: BOTTOM_MID
-            x: -55
-            y: -62
-            width: 82
-            height: 52
-            radius: 26
-            bg_color: 0x16675F
-            on_click: [ { script.execute: timer_toggle } ]
-            widgets:
-              - label: { id: lbl_timer_start, align: CENTER, text: "▶", text_font: font_sc_52, text_color: 0xFFFFFF }
-        - button:
-            align: BOTTOM_MID
-            x: 55
-            y: -62
-            width: 82
-            height: 52
-            radius: 26
-            bg_color: 0x263945
-            on_click: [ { script.execute: timer_reset } ]
-            widgets:
-              - label: { align: CENTER, text: "RESET", text_font: font_sc_16, text_color: 0xFFFFFF }
+            id: lbl_aod_holiday
+            align: TOP_MID
+            y: 255
+            width: 250
+            height: 26
+            text_align: CENTER
+            long_mode: CLIP
+            hidden: true
+            text: ""
+            text_font: font_sc_18
+            text_color: 0xFFFFFF
+            bg_color: 0x000000
+            bg_opa: 40%
+            radius: 8
+            pad_all: 2
