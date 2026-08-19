@@ -633,6 +633,26 @@ touchscreen:
             lv_obj_set_style_text_font(icons[i], id(font_icons_remote_24), LV_PART_MAIN);
             lv_obj_set_style_bg_color(buttons[i], lv_color_hex(0x16323F), LV_PART_MAIN);
           }
+
+          // HomePod progress uses the same TV-style key geometry; volume stays numeric.
+          id(g_homepod_button) = 0;
+          if (!id(g_sleeping) && id(g_target) == 1 && id(g_control_mode) == 0) {
+            const int sx = 359 - (int) touch.x;
+            const int sy = 359 - (int) touch.y;
+            if (sx >= 90 && sx < 146 && sy >= 134 && sy < 190) id(g_homepod_button) = 1;       // Previous
+            else if (sx >= 152 && sx < 208 && sy >= 134 && sy < 190) id(g_homepod_button) = 2; // Play/pause
+            else if (sx >= 214 && sx < 270 && sy >= 134 && sy < 190) id(g_homepod_button) = 3; // Next
+          }
+          if (id(g_homepod_button) > 0) {
+            lv_obj_t *buttons[] = {id(btn_homepod_previous), id(btn_homepod_play_pause), id(btn_homepod_next)};
+            lv_obj_t *icons[] = {id(icon_homepod_previous), id(icon_homepod_play_pause), id(icon_homepod_next)};
+            const int x[] = {90, 152, 214};
+            const int i = id(g_homepod_button) - 1;
+            lv_obj_set_pos(buttons[i], x[i] + 3, 137);
+            lv_obj_set_size(buttons[i], 50, 50);
+            lv_obj_set_style_text_font(icons[i], id(font_icons_remote_24), LV_PART_MAIN);
+            lv_obj_set_style_bg_color(buttons[i], lv_color_hex(0x16323F), LV_PART_MAIN);
+          }
       - if:
           condition:
             lambda: 'return id(g_sleeping);'
@@ -678,6 +698,18 @@ touchscreen:
             if (abs(dx) <= 50 && abs(dy) <= 50) gesture = 10 + id(g_remote_button);
             id(g_remote_button) = 0;
           }
+          if (id(g_homepod_button) > 0) {
+            lv_obj_t *buttons[] = {id(btn_homepod_previous), id(btn_homepod_play_pause), id(btn_homepod_next)};
+            lv_obj_t *icons[] = {id(icon_homepod_previous), id(icon_homepod_play_pause), id(icon_homepod_next)};
+            const int x[] = {90, 152, 214};
+            const int i = id(g_homepod_button) - 1;
+            lv_obj_set_pos(buttons[i], x[i], 134);
+            lv_obj_set_size(buttons[i], 56, 56);
+            lv_obj_set_style_text_font(icons[i], id(font_icons_remote_28), LV_PART_MAIN);
+            lv_obj_set_style_bg_color(buttons[i], lv_color_hex(0x09131B), LV_PART_MAIN);
+            if (abs(dx) <= 50 && abs(dy) <= 50) gesture = 14 + id(g_homepod_button);
+            id(g_homepod_button) = 0;
+          }
           id(g_gesture) = gesture;
           id(g_last_activity) = millis();
       - script.execute: dispatch_gesture
@@ -708,16 +740,6 @@ text_sensor:
     internal: true
     on_value:
       - script.execute: sync_from_ha
-      - if:
-          condition:
-            lambda: 'return x == "playing";'
-          then:
-            - lvgl.animation.start: aod_homepod_rotation
-          else:
-            - lvgl.animation.stop: aod_homepod_rotation
-            - lvgl.widget.update:
-                id: img_aod_bg
-                transform_rotation: 0deg
 
   - platform: homeassistant
     id: ceiling_light_state
@@ -1070,13 +1092,9 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  # HomePod taps use the same temporary hero feedback in both progress and volume.
-  - id: g_homepod_tap_feedback
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: g_homepod_tap_feedback_ms
-    type: uint32_t
+  # HomePod progress and volume share one centered previous/play/next row.
+  - id: g_homepod_button
+    type: int
     restore_value: no
     initial_value: '0'
   - id: g_gesture
@@ -1303,7 +1321,9 @@ script:
       - delay: 500ms
       - lambda: |-
           const bool tv_volume_muted = id(g_target) == 0 && id(g_control_mode) == 1 && id(tv_muted).state;
-          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex(tv_volume_muted ? 0x617681 : 0xF2F6F8), LV_PART_MAIN);
+          const bool homepod_volume_inactive = id(g_target) == 1 && id(g_control_mode) == 1 &&
+            id(homepod_state).state != "playing";
+          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex((tv_volume_muted || homepod_volume_inactive) ? 0x617681 : 0xF2F6F8), LV_PART_MAIN);
           lv_obj_set_style_arc_opa(id(arc_value), LV_OPA_70, LV_PART_INDICATOR);
 
   - id: optimistic_settle
@@ -1329,17 +1349,6 @@ script:
           if (millis() - id(g_tv_transport_changed_ms) > 2000) {
             id(g_tv_transport_optimistic) = false;
           }
-      - if:
-          condition:
-            lambda: 'return !id(g_sleeping);'
-          then:
-            - script.execute: render_main
-
-  - id: homepod_tap_settle
-    mode: restart
-    then:
-      - delay: 650ms
-      - lambda: 'id(g_homepod_tap_feedback) = false;'
       - if:
           condition:
             lambda: 'return !id(g_sleeping);'
@@ -1496,11 +1505,6 @@ script:
             // `view` keeps the rest of this renderer in the original 0=numeric /
             // 1=alternate shape so only the media mapping had to move.
             const int view = id(g_target) <= 1 ? (id(g_control_mode) == 0 ? 1 : 0) : id(g_control_mode);
-            // HomePod tap feedback is identical in progress and volume: show the
-            // same double-bar pause symbol used by the TV transport hero.
-            if (id(g_target) == 1 && id(g_homepod_tap_feedback) &&
-                millis() - id(g_homepod_tap_feedback_ms) <= 650)
-              return std::string("Ⅱ");
             if (view == 1) {
               if (id(g_target) == 0) {
                 const bool optimistic_transport = id(g_tv_transport_optimistic) &&
@@ -1605,12 +1609,13 @@ script:
             target_state == "unknown";
           id(g_target_online) = online;
           if (online) lv_obj_clear_flag(id(arc_value), LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(id(arc_value), LV_OBJ_FLAG_HIDDEN);
-          // TV volume uses a dimmed hero number as immediate mute feedback.
+          // TV mute and paused/stopped HomePod playback dim their volume number.
           const bool tv_volume_muted = id(g_target) == 0 && id(g_control_mode) == 1 && id(tv_muted).state;
-          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex(tv_volume_muted ? 0x617681 : 0xF2F6F8), LV_PART_MAIN);
+          const bool homepod_volume_inactive = id(g_target) == 1 && id(g_control_mode) == 1 &&
+            id(homepod_state).state != "playing";
+          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex((tv_volume_muted || homepod_volume_inactive) ? 0x617681 : 0xF2F6F8), LV_PART_MAIN);
 
-          // The mini-remote replaces only the TV progress hero. Its geometry is
-          // reset on every render so interrupted presses cannot leave a key small.
+          // Media transport controls replace the center hero and reset on every render.
           const bool remote_visible = online && id(g_target) == 0 && id(g_control_mode) == 0;
           lv_obj_t *remote_buttons[] = {id(btn_remote_confirm), id(btn_remote_back), id(btn_remote_up), id(btn_remote_down)};
           const int remote_x[] = {121, 183, 59, 245};
@@ -1622,13 +1627,26 @@ script:
             if (remote_visible) lv_obj_clear_flag(remote_buttons[i], LV_OBJ_FLAG_HIDDEN);
             else lv_obj_add_flag(remote_buttons[i], LV_OBJ_FLAG_HIDDEN);
           }
-          if (remote_visible) {
+          const bool homepod_controls_visible = online && id(g_target) == 1 && id(g_control_mode) == 0;
+          lv_obj_t *homepod_buttons[] = {id(btn_homepod_previous), id(btn_homepod_play_pause), id(btn_homepod_next)};
+          const int homepod_x[] = {90, 152, 214};
+          for (int i = 0; i < 3; i++) {
+            lv_obj_set_pos(homepod_buttons[i], homepod_x[i], 134);
+            lv_obj_set_size(homepod_buttons[i], 56, 56);
+            lv_obj_set_style_bg_color(homepod_buttons[i], lv_color_hex(0x09131B), LV_PART_MAIN);
+            if (homepod_controls_visible) lv_obj_clear_flag(homepod_buttons[i], LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(homepod_buttons[i], LV_OBJ_FLAG_HIDDEN);
+          }
+          lv_label_set_text(id(icon_homepod_play_pause), id(homepod_state).state == "playing" ? "󰏤" : "󰐊");
+          if (remote_visible || homepod_controls_visible) {
             lv_obj_add_flag(id(lbl_value), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(lbl_unit), LV_OBJ_FLAG_HIDDEN);
-            const bool optimistic_transport = id(g_tv_transport_optimistic) &&
-              millis() - id(g_tv_transport_changed_ms) <= 2000;
-            const bool playing = optimistic_transport ? id(g_tv_transport_playing) : id(tv_state).state == "playing";
-            lv_label_set_text(id(icon_remote_confirm), playing ? "󰏤" : "󰐊");
+            if (remote_visible) {
+              const bool optimistic_transport = id(g_tv_transport_optimistic) &&
+                millis() - id(g_tv_transport_changed_ms) <= 2000;
+              const bool playing = optimistic_transport ? id(g_tv_transport_playing) : id(tv_state).state == "playing";
+              lv_label_set_text(id(icon_remote_confirm), playing ? "󰏤" : "󰐊");
+            }
           } else {
             lv_obj_clear_flag(id(lbl_value), LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(id(lbl_unit), LV_OBJ_FLAG_HIDDEN);
@@ -1640,12 +1658,7 @@ script:
           lv_obj_set_style_text_font(id(lbl_value), id(font_mono_76), LV_PART_MAIN);
           // Media targets read 0=进度 / 1=音量, so the alternate-view test is inverted for them.
           const int font_view = id(g_target) <= 1 ? (id(g_control_mode) == 0 ? 1 : 0) : id(g_control_mode);
-          const bool homepod_tap_feedback = id(g_target) == 1 && id(g_homepod_tap_feedback) &&
-            millis() - id(g_homepod_tap_feedback_ms) <= 650;
-          if (homepod_tap_feedback) {
-            // Match the TV progress transport hero exactly.
-            lv_obj_set_style_text_font(id(lbl_value), id(font_sc_52), LV_PART_MAIN);
-          } else if (online && font_view == 1) {
+          if (online && font_view == 1) {
             if (id(g_target) == 1) {
               lv_obj_set_style_text_font(id(lbl_value), id(font_mono_68), LV_PART_MAIN);
             } else if (id(g_target) == 0 || id(g_target) == 2 || id(g_target) == 7) {
@@ -2080,13 +2093,7 @@ script:
       - if:
           condition: { lambda: 'return id(g_target) == 1;' }
           then:
-            # Progress and volume taps share the same play/pause action and visual feedback.
-            - lambda: |-
-                id(g_homepod_tap_feedback) = true;
-                id(g_homepod_tap_feedback_ms) = millis();
             - homeassistant.action: { action: media_player.media_play_pause, data: { entity_id: '${homepod_entity}' } }
-            - script.execute: render_main
-            - script.execute: homepod_tap_settle
       - if:
           condition: { lambda: 'return id(g_target) == 2;' }
           then:
@@ -2167,10 +2174,25 @@ script:
                 action: remote.send_command
                 data: { entity_id: '${tv_remote_entity}', command: Down }
             - script.execute: ring_tap_feedback
-      # 本机 mode 3 (电量) is read-only. TV progress uses only the explicit
-      # 1x4 remote buttons, so background/gap taps must not leak into play/pause.
+      # HomePod controls are shared by both progress and volume pages.
       - if:
-          condition: { lambda: 'return id(g_gesture) == 0 && !(id(g_target) == 7 && id(g_control_mode) == 3) && !(id(g_target) == 0 && id(g_control_mode) == 0);' }
+          condition: { lambda: 'return id(g_gesture) == 15;' }
+          then:
+            - homeassistant.action: { action: media_player.media_previous_track, data: { entity_id: '${homepod_entity}' } }
+            - script.execute: ring_tap_feedback
+      - if:
+          condition: { lambda: 'return id(g_gesture) == 16;' }
+          then:
+            - homeassistant.action: { action: media_player.media_play_pause, data: { entity_id: '${homepod_entity}' } }
+            - script.execute: ring_tap_feedback
+      - if:
+          condition: { lambda: 'return id(g_gesture) == 17;' }
+          then:
+            - homeassistant.action: { action: media_player.media_next_track, data: { entity_id: '${homepod_entity}' } }
+            - script.execute: ring_tap_feedback
+      # 本机 mode 3 (电量) is read-only. Media control backgrounds do not act as buttons.
+      - if:
+          condition: { lambda: 'return id(g_gesture) == 0 && !(id(g_target) == 7 && id(g_control_mode) == 3) && !(id(g_target) == 0 && id(g_control_mode) == 0) && !(id(g_target) == 1 && id(g_control_mode) == 0);' }
           then:
             - script.execute: handle_tap
       # P6 defers Voice Assistant; a recognized long press is intentionally consumed.
@@ -2201,7 +2223,9 @@ script:
           id(g_last_activity) = now;
           id(g_knob_last_rotate_ms) = now;
           const bool tv_volume_muted = id(g_target) == 0 && id(g_control_mode) == 1 && id(tv_muted).state;
-          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex(tv_volume_muted ? 0x617681 : 0xFFFFFF), LV_PART_MAIN);
+          const bool homepod_volume_inactive = id(g_target) == 1 && id(g_control_mode) == 1 &&
+            id(homepod_state).state != "playing";
+          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex((tv_volume_muted || homepod_volume_inactive) ? 0x617681 : 0xFFFFFF), LV_PART_MAIN);
           lv_obj_set_style_arc_opa(id(arc_value), LV_OPA_COVER, LV_PART_INDICATOR);
           lv_obj_set_style_opa(id(arc_value), LV_OPA_TRANSP, LV_PART_KNOB);
           lv_obj_set_style_bg_opa(id(arc_value), LV_OPA_TRANSP, LV_PART_KNOB);
@@ -2668,12 +2692,12 @@ font:
     id: font_icons_remote_28
     size: 28
     bpp: 4
-    glyphs: ["󰐊", "󰏤", "󰌑", "󰁝", "󰁅"]
+    glyphs: ["󰐊", "󰏤", "󰌑", "󰁝", "󰁅", "󰒮", "󰒭"]
   - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
     id: font_icons_remote_24
     size: 24
     bpp: 4
-    glyphs: ["󰐊", "󰏤", "󰌑", "󰁝", "󰁅"]
+    glyphs: ["󰐊", "󰏤", "󰌑", "󰁝", "󰁅", "󰒮", "󰒭"]
   # AOD lock screen: Pacifico script face, digits + colon only.
   - file: fonts/Pacifico.ttf
     id: font_pacifico_aod
@@ -2741,15 +2765,6 @@ lvgl:
     - main_display
   touchscreens:
     - main_touchscreen
-  animations:
-    - id: aod_homepod_rotation
-      duration: 15s
-      loop: true
-      widgets:
-        - id: img_aod_bg
-          transform_rotation:
-            from: 0deg
-            to: 360deg
   pages:
     # P6 Midnight Orbit: a frameless center stage inside a 316 px / 270° instrument arc.
     - id: page_main
@@ -2912,6 +2927,74 @@ lvgl:
                   text: "󰁅"
                   text_font: font_icons_remote_28
                   text_color: ${color_media}
+        # HomePod transport row: Previous / Play-Pause / Next, centered at (180,162).
+        # It reuses the TV control dimensions, border, colors and press animation.
+        - obj:
+            id: btn_homepod_previous
+            align: TOP_LEFT
+            x: 90
+            y: 134
+            width: 56
+            height: 56
+            radius: 14
+            bg_color: 0x09131B
+            bg_opa: 88%
+            border_width: 1
+            border_color: 0x31505D
+            hidden: true
+            clickable: false
+            scrollable: false
+            widgets:
+              - label:
+                  id: icon_homepod_previous
+                  align: CENTER
+                  text: "󰒮"
+                  text_font: font_icons_remote_28
+                  text_color: ${color_media}
+        - obj:
+            id: btn_homepod_play_pause
+            align: TOP_LEFT
+            x: 152
+            y: 134
+            width: 56
+            height: 56
+            radius: 14
+            bg_color: 0x09131B
+            bg_opa: 88%
+            border_width: 1
+            border_color: 0x31505D
+            hidden: true
+            clickable: false
+            scrollable: false
+            widgets:
+              - label:
+                  id: icon_homepod_play_pause
+                  align: CENTER
+                  text: "󰏤"
+                  text_font: font_icons_remote_28
+                  text_color: ${color_media}
+        - obj:
+            id: btn_homepod_next
+            align: TOP_LEFT
+            x: 214
+            y: 134
+            width: 56
+            height: 56
+            radius: 14
+            bg_color: 0x09131B
+            bg_opa: 88%
+            border_width: 1
+            border_color: 0x31505D
+            hidden: true
+            clickable: false
+            scrollable: false
+            widgets:
+              - label:
+                  id: icon_homepod_next
+                  align: CENTER
+                  text: "󰒭"
+                  text_font: font_icons_remote_28
+                  text_color: ${color_media}
         # Hero value: content-sized and CENTER-aligned, so the digits are always
         # optically centered on x=180 no matter how many of them there are.
         # y=-15 puts the baseline at 190 per the design doc.
@@ -3024,8 +3107,6 @@ lvgl:
             x: 0
             y: 0
             align: TOP_LEFT
-            transform_pivot_x: 180
-            transform_pivot_y: 180
             clickable: false
         # Four dark offset copies form the glow/outline halo that keeps the
         # white Pacifico digits legible over the photo. They are declared first
