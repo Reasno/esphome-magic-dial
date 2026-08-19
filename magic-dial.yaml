@@ -2014,11 +2014,13 @@ script:
                       # Mute belongs to 音量 (mode 1); 进度 (mode 0) taps toggle playback.
                       condition: { lambda: 'return id(g_control_mode) == 1;' }
                       then:
+                        # Sony's media_player mute service is unreliable on this model;
+                        # send the physical remote Mute key instead.
                         - homeassistant.action:
-                            action: media_player.volume_mute
+                            action: remote.send_command
                             data:
-                              entity_id: ${tv_entity}
-                              is_volume_muted: !lambda 'return id(tv_muted).state ? std::string("false") : std::string("true");'
+                              entity_id: ${tv_remote_entity}
+                              command: Mute
                       else:
                         # Flip the local icon first for instant feedback, then toggle.
                         # The Sony media_player entity does not accept transport
@@ -2132,9 +2134,10 @@ script:
                 action: remote.send_command
                 data: { entity_id: '${tv_remote_entity}', command: Down }
             - script.execute: ring_tap_feedback
-      # 本机 mode 3 (电量) is a read-only readout, so a tap there does nothing at all.
+      # 本机 mode 3 (电量) is read-only. TV progress uses only the explicit
+      # 2x2 remote buttons, so background/gap taps must not leak into play/pause.
       - if:
-          condition: { lambda: 'return id(g_gesture) == 0 && !(id(g_target) == 7 && id(g_control_mode) == 3);' }
+          condition: { lambda: 'return id(g_gesture) == 0 && !(id(g_target) == 7 && id(g_control_mode) == 3) && !(id(g_target) == 0 && id(g_control_mode) == 0);' }
           then:
             - script.execute: handle_tap
       # P6 defers Voice Assistant; a recognized long press is intentionally consumed.
