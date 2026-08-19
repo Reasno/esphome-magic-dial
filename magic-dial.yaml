@@ -608,22 +608,23 @@ touchscreen:
           id(g_wake_consume) = id(g_sleeping);
           id(g_last_activity) = millis();
 
-          // TV progress mode owns a fixed 2x2 remote matrix in screen coordinates.
+          // TV progress mode owns a centered 1x4 remote row in screen coordinates.
+          // The group center stays at (180,162), matching the former 2x2 matrix.
           // CST816 coordinates are unrotated while LVGL is rotated 180 degrees.
           id(g_remote_button) = 0;
           if (!id(g_sleeping) && id(g_target) == 0 && id(g_control_mode) == 0) {
             const int sx = 359 - (int) touch.x;
             const int sy = 359 - (int) touch.y;
-            if (sx >= 121 && sx < 177 && sy >= 103 && sy < 159) id(g_remote_button) = 1;       // Confirm
-            else if (sx >= 121 && sx < 177 && sy >= 165 && sy < 221) id(g_remote_button) = 2;  // Back
-            else if (sx >= 183 && sx < 239 && sy >= 103 && sy < 159) id(g_remote_button) = 3;  // Up
-            else if (sx >= 183 && sx < 239 && sy >= 165 && sy < 221) id(g_remote_button) = 4;  // Down
+            if (sx >= 59 && sx < 115 && sy >= 134 && sy < 190) id(g_remote_button) = 3;       // Up
+            else if (sx >= 121 && sx < 177 && sy >= 134 && sy < 190) id(g_remote_button) = 1; // Confirm
+            else if (sx >= 183 && sx < 239 && sy >= 134 && sy < 190) id(g_remote_button) = 2; // Return
+            else if (sx >= 245 && sx < 301 && sy >= 134 && sy < 190) id(g_remote_button) = 4; // Down
           }
           if (id(g_remote_button) > 0) {
             lv_obj_t *buttons[] = {id(btn_remote_confirm), id(btn_remote_back), id(btn_remote_up), id(btn_remote_down)};
             lv_obj_t *icons[] = {id(icon_remote_confirm), id(icon_remote_back), id(icon_remote_up), id(icon_remote_down)};
-            const int x[] = {121, 121, 183, 183};
-            const int y[] = {103, 165, 103, 165};
+            const int x[] = {121, 183, 59, 245};
+            const int y[] = {134, 134, 134, 134};
             const int i = id(g_remote_button) - 1;
             lv_obj_set_pos(buttons[i], x[i] + 3, y[i] + 3);
             lv_obj_set_size(buttons[i], 50, 50);
@@ -653,7 +654,9 @@ touchscreen:
           int gesture = -1;
           if (abs(dx) > 50 && abs(dx) > abs(dy)) gesture = dx < 0 ? 2 : 3;
           else if (abs(dy) > 50 && abs(dy) > abs(dx)) gesture = dy < 0 ? 4 : 5;
-          else if (abs(dx) < 16 && abs(dy) < 16) gesture = held >= 600 ? 1 : 0;
+          // Anything below the 50 px swipe threshold is a tap/hold. Using 16 px
+          // here created a 16..50 px dead zone where taps (including TV mute) vanished.
+          else if (abs(dx) <= 50 && abs(dy) <= 50) gesture = held >= 600 ? 1 : 0;
           if (id(g_wake_consume)) {
             gesture = -1;
             id(g_wake_consume) = false;
@@ -661,16 +664,16 @@ touchscreen:
           if (id(g_remote_button) > 0) {
             lv_obj_t *buttons[] = {id(btn_remote_confirm), id(btn_remote_back), id(btn_remote_up), id(btn_remote_down)};
             lv_obj_t *icons[] = {id(icon_remote_confirm), id(icon_remote_back), id(icon_remote_up), id(icon_remote_down)};
-            const int x[] = {121, 121, 183, 183};
-            const int y[] = {103, 165, 103, 165};
+            const int x[] = {121, 183, 59, 245};
+            const int y[] = {134, 134, 134, 134};
             const int i = id(g_remote_button) - 1;
             lv_obj_set_pos(buttons[i], x[i], y[i]);
             lv_obj_set_size(buttons[i], 56, 56);
             lv_obj_set_style_text_font(icons[i], id(font_icons_remote_28), LV_PART_MAIN);
             lv_obj_set_style_bg_color(buttons[i], lv_color_hex(0x09131B), LV_PART_MAIN);
-            // A remote key only claims a stationary tap. Swipes that started over
-            // the matrix must continue through the normal 2/3/4/5 gesture paths.
-            if (gesture == 0) gesture = 10 + id(g_remote_button);
+            // A remote key claims any release inside the normal 50 px touch slop.
+            // This removes the old 16..50 px dead zone while preserving real swipes.
+            if (abs(dx) <= 50 && abs(dy) <= 50) gesture = 10 + id(g_remote_button);
             id(g_remote_button) = 0;
           }
           id(g_gesture) = gesture;
@@ -1579,8 +1582,8 @@ script:
           // reset on every render so interrupted presses cannot leave a key small.
           const bool remote_visible = online && id(g_target) == 0 && id(g_control_mode) == 0;
           lv_obj_t *remote_buttons[] = {id(btn_remote_confirm), id(btn_remote_back), id(btn_remote_up), id(btn_remote_down)};
-          const int remote_x[] = {121, 121, 183, 183};
-          const int remote_y[] = {103, 165, 103, 165};
+          const int remote_x[] = {121, 183, 59, 245};
+          const int remote_y[] = {134, 134, 134, 134};
           for (int i = 0; i < 4; i++) {
             lv_obj_set_pos(remote_buttons[i], remote_x[i], remote_y[i]);
             lv_obj_set_size(remote_buttons[i], 56, 56);
@@ -2014,13 +2017,11 @@ script:
                       # Mute belongs to 音量 (mode 1); 进度 (mode 0) taps toggle playback.
                       condition: { lambda: 'return id(g_control_mode) == 1;' }
                       then:
-                        # Sony's media_player mute service is unreliable on this model;
-                        # send the physical remote Mute key instead.
                         - homeassistant.action:
-                            action: remote.send_command
+                            action: media_player.volume_mute
                             data:
-                              entity_id: ${tv_remote_entity}
-                              command: Mute
+                              entity_id: ${tv_entity}
+                              is_volume_muted: !lambda 'return id(tv_muted).state ? std::string("false") : std::string("true");'
                       else:
                         # Flip the local icon first for instant feedback, then toggle.
                         # The Sony media_player entity does not accept transport
@@ -2118,7 +2119,7 @@ script:
           then:
             - homeassistant.action:
                 action: remote.send_command
-                data: { entity_id: '${tv_remote_entity}', command: Back }
+                data: { entity_id: '${tv_remote_entity}', command: Return }
             - script.execute: ring_tap_feedback
       - if:
           condition: { lambda: 'return id(g_gesture) == 13;' }
@@ -2135,7 +2136,7 @@ script:
                 data: { entity_id: '${tv_remote_entity}', command: Down }
             - script.execute: ring_tap_feedback
       # 本机 mode 3 (电量) is read-only. TV progress uses only the explicit
-      # 2x2 remote buttons, so background/gap taps must not leak into play/pause.
+      # 1x4 remote buttons, so background/gap taps must not leak into play/pause.
       - if:
           condition: { lambda: 'return id(g_gesture) == 0 && !(id(g_target) == 7 && id(g_control_mode) == 3) && !(id(g_target) == 0 && id(g_control_mode) == 0);' }
           then:
@@ -2787,14 +2788,14 @@ lvgl:
             text: "Magic Dial"
             text_font: font_sc_24
             text_color: 0xBFD0D8
-        # TV progress mini-remote: exact 2x2 matrix in absolute screen coordinates.
-        # Each 56 px key has a 6 px gap; the 118 px group is centered on x=180.
+        # TV progress mini-remote: 1x4 row, ordered Up / Confirm / Return / Down.
+        # Each 56 px key has a 6 px gap; the 242 px group is centered at (180,162).
         # The icon is a child of its key so shrinking the key keeps the glyph centered.
         - obj:
             id: btn_remote_confirm
             align: TOP_LEFT
             x: 121
-            y: 103
+            y: 134
             width: 56
             height: 56
             radius: 14
@@ -2815,8 +2816,8 @@ lvgl:
         - obj:
             id: btn_remote_back
             align: TOP_LEFT
-            x: 121
-            y: 165
+            x: 183
+            y: 134
             width: 56
             height: 56
             radius: 14
@@ -2837,8 +2838,8 @@ lvgl:
         - obj:
             id: btn_remote_up
             align: TOP_LEFT
-            x: 183
-            y: 103
+            x: 59
+            y: 134
             width: 56
             height: 56
             radius: 14
@@ -2859,8 +2860,8 @@ lvgl:
         - obj:
             id: btn_remote_down
             align: TOP_LEFT
-            x: 183
-            y: 165
+            x: 245
+            y: 134
             width: 56
             height: 56
             radius: 14
