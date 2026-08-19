@@ -135,6 +135,8 @@ binary_sensor:
     entity_id: ${tv_entity}
     attribute: is_volume_muted
     internal: true
+    on_state:
+      - script.execute: render_main
 
   - platform: homeassistant
     id: homepod_muted
@@ -1068,6 +1070,15 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
+  # HomePod taps use the same temporary hero feedback in both progress and volume.
+  - id: g_homepod_tap_feedback
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_homepod_tap_feedback_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   - id: g_gesture
     type: int
     restore_value: no
@@ -1291,7 +1302,8 @@ script:
     then:
       - delay: 500ms
       - lambda: |-
-          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex(0xF2F6F8), LV_PART_MAIN);
+          const bool tv_volume_muted = id(g_target) == 0 && id(g_control_mode) == 1 && id(tv_muted).state;
+          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex(tv_volume_muted ? 0x617681 : 0xF2F6F8), LV_PART_MAIN);
           lv_obj_set_style_arc_opa(id(arc_value), LV_OPA_70, LV_PART_INDICATOR);
 
   - id: optimistic_settle
@@ -1317,6 +1329,17 @@ script:
           if (millis() - id(g_tv_transport_changed_ms) > 2000) {
             id(g_tv_transport_optimistic) = false;
           }
+      - if:
+          condition:
+            lambda: 'return !id(g_sleeping);'
+          then:
+            - script.execute: render_main
+
+  - id: homepod_tap_settle
+    mode: restart
+    then:
+      - delay: 650ms
+      - lambda: 'id(g_homepod_tap_feedback) = false;'
       - if:
           condition:
             lambda: 'return !id(g_sleeping);'
@@ -1473,6 +1496,11 @@ script:
             // `view` keeps the rest of this renderer in the original 0=numeric /
             // 1=alternate shape so only the media mapping had to move.
             const int view = id(g_target) <= 1 ? (id(g_control_mode) == 0 ? 1 : 0) : id(g_control_mode);
+            // HomePod tap feedback is identical in progress and volume: show the
+            // same double-bar pause symbol used by the TV transport hero.
+            if (id(g_target) == 1 && id(g_homepod_tap_feedback) &&
+                millis() - id(g_homepod_tap_feedback_ms) <= 650)
+              return std::string("Ⅱ");
             if (view == 1) {
               if (id(g_target) == 0) {
                 const bool optimistic_transport = id(g_tv_transport_optimistic) &&
@@ -1577,6 +1605,9 @@ script:
             target_state == "unknown";
           id(g_target_online) = online;
           if (online) lv_obj_clear_flag(id(arc_value), LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(id(arc_value), LV_OBJ_FLAG_HIDDEN);
+          // TV volume uses a dimmed hero number as immediate mute feedback.
+          const bool tv_volume_muted = id(g_target) == 0 && id(g_control_mode) == 1 && id(tv_muted).state;
+          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex(tv_volume_muted ? 0x617681 : 0xF2F6F8), LV_PART_MAIN);
 
           // The mini-remote replaces only the TV progress hero. Its geometry is
           // reset on every render so interrupted presses cannot leave a key small.
@@ -1609,7 +1640,12 @@ script:
           lv_obj_set_style_text_font(id(lbl_value), id(font_mono_76), LV_PART_MAIN);
           // Media targets read 0=进度 / 1=音量, so the alternate-view test is inverted for them.
           const int font_view = id(g_target) <= 1 ? (id(g_control_mode) == 0 ? 1 : 0) : id(g_control_mode);
-          if (online && font_view == 1) {
+          const bool homepod_tap_feedback = id(g_target) == 1 && id(g_homepod_tap_feedback) &&
+            millis() - id(g_homepod_tap_feedback_ms) <= 650;
+          if (homepod_tap_feedback) {
+            // Match the TV progress transport hero exactly.
+            lv_obj_set_style_text_font(id(lbl_value), id(font_sc_52), LV_PART_MAIN);
+          } else if (online && font_view == 1) {
             if (id(g_target) == 1) {
               lv_obj_set_style_text_font(id(lbl_value), id(font_mono_68), LV_PART_MAIN);
             } else if (id(g_target) == 0 || id(g_target) == 2 || id(g_target) == 7) {
@@ -2044,17 +2080,13 @@ script:
       - if:
           condition: { lambda: 'return id(g_target) == 1;' }
           then:
-            - if:
-                # Mute belongs to 音量 (mode 1); 进度 (mode 0) taps toggle playback.
-                condition: { lambda: 'return id(g_control_mode) == 1;' }
-                then:
-                  - homeassistant.action:
-                      action: media_player.volume_mute
-                      data:
-                        entity_id: ${homepod_entity}
-                        is_volume_muted: !lambda 'return id(homepod_muted).state ? std::string("false") : std::string("true");'
-                else:
-                  - homeassistant.action: { action: media_player.media_play_pause, data: { entity_id: '${homepod_entity}' } }
+            # Progress and volume taps share the same play/pause action and visual feedback.
+            - lambda: |-
+                id(g_homepod_tap_feedback) = true;
+                id(g_homepod_tap_feedback_ms) = millis();
+            - homeassistant.action: { action: media_player.media_play_pause, data: { entity_id: '${homepod_entity}' } }
+            - script.execute: render_main
+            - script.execute: homepod_tap_settle
       - if:
           condition: { lambda: 'return id(g_target) == 2;' }
           then:
@@ -2168,7 +2200,8 @@ script:
           const uint32_t previous_rotate = id(g_knob_last_rotate_ms);
           id(g_last_activity) = now;
           id(g_knob_last_rotate_ms) = now;
-          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+          const bool tv_volume_muted = id(g_target) == 0 && id(g_control_mode) == 1 && id(tv_muted).state;
+          lv_obj_set_style_text_color(id(lbl_value), lv_color_hex(tv_volume_muted ? 0x617681 : 0xFFFFFF), LV_PART_MAIN);
           lv_obj_set_style_arc_opa(id(arc_value), LV_OPA_COVER, LV_PART_INDICATOR);
           lv_obj_set_style_opa(id(arc_value), LV_OPA_TRANSP, LV_PART_KNOB);
           lv_obj_set_style_bg_opa(id(arc_value), LV_OPA_TRANSP, LV_PART_KNOB);
@@ -2991,6 +3024,8 @@ lvgl:
             x: 0
             y: 0
             align: TOP_LEFT
+            transform_pivot_x: 180
+            transform_pivot_y: 180
             clickable: false
         # Four dark offset copies form the glow/outline halo that keeps the
         # white Pacifico digits legible over the photo. They are declared first
