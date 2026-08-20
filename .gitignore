@@ -46,3 +46,10 @@ sounds/
 *.elf
 *.map
 *.uf2
+
+# Home Assistant configuration (never commit)
+ha_configuration.yaml
+ha_*.yaml
+automations.yaml
+scripts.yaml
+scenes.yaml
