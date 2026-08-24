@@ -809,6 +809,26 @@ text_sensor:
       - script.execute: render_aod
 
 sensor:
+  - platform: ble_rssi
+    mac_address: "2C:0D:CF:6D:5B:E1"
+    name: "谷溪的手环 RSSI"
+    id: gu_xi_mi_band_rssi
+    filters:
+      - exponential_moving_average:
+          alpha: 0.3
+          send_every: 1
+      - throttle: 10s
+
+  - platform: ble_rssi
+    mac_address: "2C:0D:CF:48:B6:5D"
+    name: "刘心怡的手环 RSSI"
+    id: liu_xin_yi_mi_band_rssi
+    filters:
+      - exponential_moving_average:
+          alpha: 0.3
+          send_every: 1
+      - throttle: 10s
+
   - platform: homeassistant
     id: tv_volume
     entity_id: ${tv_entity}
