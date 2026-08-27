@@ -27,6 +27,10 @@ substitutions:
   living_room_climate_entity: climate.24dfa7d09617
   floor_heating_entity: climate.suittc_cn_929054575_m302
 
+  # Local BLE presence threshold. Presence is debounced below: 10 s to enter,
+  # 2 min to leave, matching the existing HA template sensors.
+  bracelet_presence_rssi: "-95"
+
   # Point this at a calendar that aggregates every holiday you want to display.
   # The current event's `message` attribute is shown verbatim; an inactive calendar
   # leaves the holiday line blank. This is intentionally not limited to Chinese holidays.
@@ -143,6 +147,30 @@ binary_sensor:
     entity_id: ${homepod_entity}
     attribute: is_volume_muted
     internal: true
+
+  - platform: template
+    id: gu_xi_in_living_room_local
+    internal: true
+    lambda: |-
+      return !isnan(id(gu_xi_mi_band_rssi).state) &&
+        id(gu_xi_mi_band_rssi).state >= atof("${bracelet_presence_rssi}");
+    filters:
+      - delayed_on: 10s
+      - delayed_off: 2min
+    on_state:
+      - script.execute: apply_screen_brightness
+
+  - platform: template
+    id: liu_xin_yi_in_living_room_local
+    internal: true
+    lambda: |-
+      return !isnan(id(liu_xin_yi_mi_band_rssi).state) &&
+        id(liu_xin_yi_mi_band_rssi).state >= atof("${bracelet_presence_rssi}");
+    filters:
+      - delayed_on: 10s
+      - delayed_off: 2min
+    on_state:
+      - script.execute: apply_screen_brightness
 
   - platform: gpio
     name: "Knob Left"
@@ -1196,6 +1224,21 @@ globals:
     initial_value: '""'
 
 script:
+  # Backlight arbitration stays fully local. Presence only raises AOD brightness;
+  # it never wakes the display or changes pages.
+  - id: apply_screen_brightness
+    mode: restart
+    then:
+      - light.turn_on:
+          id: backlight_light
+          brightness: !lambda |-
+            const bool bracelet_present = id(gu_xi_in_living_room_local).state ||
+              id(liu_xin_yi_in_living_room_local).state;
+            const float pct = (!id(g_sleeping) || bracelet_present)
+              ? (float) id(g_backlight_pct)
+              : (float) id(g_aod_backlight_pct);
+            return fminf(1.0f, fmaxf(0.05f, pct / 100.0f));
+
   - id: ring_update_state
     mode: restart
     then:
@@ -1927,9 +1970,7 @@ script:
           id: page_aod
           animation: fade_in
           time: 300ms
-      - light.turn_on:
-          id: backlight_light
-          brightness: !lambda 'return id(g_aod_backlight_pct) / 100.0f;'
+      - script.execute: apply_screen_brightness
 
   - id: wake_display
     then:
