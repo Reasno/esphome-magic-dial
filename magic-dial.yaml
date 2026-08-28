@@ -93,8 +93,10 @@ psram:
 
 logger:
   level: INFO
+  initial_level: INFO
 
 api:
+  max_send_queue: 8
   encryption:
     key: !secret magic_dial_api_key
   actions:
@@ -1796,6 +1798,10 @@ script:
           auto color_thinking = lv_color_hex(0x8B7CFF);
           auto color_speaking = lv_color_hex(0x49A8FF);
           auto color_error = lv_color_hex(0xFF6B6B);
+          // Secondary thinking ribbons are opt-in; every non-thinking phase starts
+          // with them hidden so no colour leaks into listening/speaking/error.
+          lv_obj_add_flag(id(va_orb_b), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(va_orb_c), LV_OBJ_FLAG_HIDDEN);
 
           if (phase == 1) { // Listening
             lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
@@ -1809,16 +1815,14 @@ script:
             lv_obj_set_style_text_color(id(va_status_label), color_listening, LV_PART_MAIN);
             lv_label_set_text(id(va_status_label), "请说话");
             lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
-          } else if (phase == 2) { // Thinking
-            lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
-            // `va_icon` renders with the MDI icon font, so plain ASCII ("...",
-            // "X") has no glyph there and paints as a box. Always use a declared
-            // MDI codepoint from font_icons_28.
-            lv_label_set_text(id(va_icon), "\xF3\xB0\x87\x99"); // mdi-dots-horizontal
-            lv_obj_set_style_text_color(id(va_icon), color_thinking, LV_PART_MAIN);
+          } else if (phase == 2) { // Thinking: Siri-like layered light ribbons
+            // No static ellipsis: three differently sized, coloured arc segments
+            // counter-rotate to form a lively orbital glow at screen centre.
+            lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_arc_color(id(va_arc), color_thinking, LV_PART_INDICATOR);
+            lv_obj_clear_flag(id(va_orb_b), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(va_orb_c), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
           } else if (phase == 3) { // Speaking
             lv_obj_clear_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
@@ -3245,10 +3249,16 @@ interval:
                   frame++;
                   const char* bars[] = {"|    ", "||   ", "|||  ", "|||| ", "|||||", " ||||", "  |||", "   ||", "    |"};
                   lv_label_set_text(id(va_bars), bars[frame % 9]);
-                } else if (phase == 2) { // Thinking arc rotation
-                  static int angle = 0;
-                  angle = (angle + 20) % 360;
-                  lv_arc_set_rotation(id(va_arc), angle);
+                } else if (phase == 2) { // Thinking orbital ribbons
+                  static int angle_a = 0;
+                  static int angle_b = 120;
+                  static int angle_c = 240;
+                  angle_a = (angle_a + 7) % 360;
+                  angle_b = (angle_b + 355) % 360;  // -5°, counter-rotation
+                  angle_c = (angle_c + 11) % 360;
+                  lv_arc_set_rotation(id(va_arc), angle_a);
+                  lv_arc_set_rotation(id(va_orb_b), angle_b);
+                  lv_arc_set_rotation(id(va_orb_c), angle_c);
                 } else if (phase == 3) { // Speaking wave
                   static int frame = 0;
                   frame++;
@@ -3383,7 +3393,7 @@ font:
     glyphs: *p6_glyphs
 
 lvgl:
-  buffer_size: 24%
+  buffer_size: 10%
   # Charging port down: LVGL owns the rotation because the display component
   # rejects `rotation` when LVGL is attached.
   rotation: 180
@@ -3812,7 +3822,42 @@ lvgl:
             adjustable: false
             arc_opa: 0%
             indicator:
-              arc_color: ${color_va_thinking}
+              arc_color: 0x38DDF2
+            hidden: true
+        # Two inner ribbons complete the Siri-like thinking orb. Unequal segment
+        # lengths, diameters and speeds keep it organic rather than a loading
+        # spinner; all are screen-only and do not touch the RGB ring.
+        - arc:
+            id: va_orb_b
+            align: CENTER
+            width: 224
+            height: 224
+            arc_width: 10
+            min_value: 0
+            max_value: 100
+            value: 42
+            start_angle: 0
+            end_angle: 360
+            adjustable: false
+            arc_opa: 0%
+            indicator:
+              arc_color: 0x8B7CFF
+            hidden: true
+        - arc:
+            id: va_orb_c
+            align: CENTER
+            width: 152
+            height: 152
+            arc_width: 14
+            min_value: 0
+            max_value: 100
+            value: 63
+            start_angle: 0
+            end_angle: 360
+            adjustable: false
+            arc_opa: 0%
+            indicator:
+              arc_color: 0xFF5EC4
             hidden: true
         # [VA] Centre stack: icon on the optical centre, level bars just below.
         - obj:
