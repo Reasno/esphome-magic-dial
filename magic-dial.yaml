@@ -68,6 +68,10 @@ esphome:
       - lambda: |-
           id(g_last_activity) = millis();
           id(g_backlight_pct) = 100;
+      # Keep the speaker's software gain in sync with the number the 本机扬声器
+      # target shows from the very first frame, so the first VA turn after a
+      # reboot is already at the displayed volume.
+      - script.execute: apply_local_volume
       - script.execute: resolve_priority
       - lvgl.page.show:
           id: page_main
@@ -86,6 +90,17 @@ esp32:
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
       CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
       CONFIG_SPIRAM_RODATA: "y"
+      # PSRAM into the general malloc heap. Without this only heap_caps_malloc
+      # with MALLOC_CAP_SPIRAM reaches PSRAM, so every plain new/malloc drains
+      # the ~21 KB of internal RAM that xTaskCreate("mic_task") also needs, and
+      # the mic task fails to start on the first PTT press.
+      CONFIG_SPIRAM_USE_MALLOC: "y"
+      # Allocations at or below this size stay internal (the 16384 default is
+      # too greedy here); everything larger is pushed out to PSRAM.
+      CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL: "4096"
+      # Hard-reserve internal RAM that PSRAM can never satisfy: I2S in/out DMA
+      # descriptors and task stacks.
+      CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL: "32768"
 
 psram:
   mode: octal
@@ -95,8 +110,14 @@ logger:
   level: INFO
   initial_level: INFO
 
+# Internal / DMA RAM is the scarce resource on this build (display + LVGL +
+# BLE proxy + MQTT + I2S in/out all compete for it). `mic_task` creation has
+# already failed once because of exhaustion, so expose the heap counters and
+# quantify the headroom instead of guessing.
+debug:
+  update_interval: 10s
+
 api:
-  max_send_queue: 8
   encryption:
     key: !secret magic_dial_api_key
   actions:
@@ -360,9 +381,21 @@ voice_assistant:  # [VA]
   # pipeline VAD to ever mark speech, so the turn dies as
   # `stt-no-text-recognized`. These are the values the reference Guition VA
   # project runs with.
-  noise_suppression_level: 2
+  # [VA] 2026-08-29: the turn now closes correctly (HA microVAD collects and
+  # ends it), so the 45000081 stt timeout is gone -- but every turn still dies
+  # as `stt-no-text-recognized`, i.e. the stream reaching STT is too weak to
+  # transcribe. Reference-project values (multiplier 2.0) are not enough for
+  # this unit's PDM mic, so lift the digital gain. `noise_suppression_level` is
+  # dropped from 2 to 1 as well: on a signal this quiet the suppressor was
+  # eating the speech together with the noise floor.
+  # [VA] 2026-08-29 second pass: 6.0 overshot. With `auto_gain: 31dBFS` already
+  # running AGC, a 6x pre-multiply just hard-clips int16 on louder syllables --
+  # VAD still fires (plenty of energy) but STT gets distortion and returns "".
+  # The real cause of the flaky turns was main-loop stall (see va_render), so
+  # back the multiplier off to a sane 3.0 and let AGC do the levelling.
+  noise_suppression_level: 1
   auto_gain: 31dBFS
-  volume_multiplier: 2.0
+  volume_multiplier: 3.0
   # A pipeline can also be started from HA (assist_satellite.start_conversation
   # for a proactive question). In that case nothing ran va_prepare, so the
   # session state / VA page are set up here instead.
@@ -828,13 +861,12 @@ touchscreen:
       - lambda: |-
           id(g_touch_down) = false; // [VA]
           if (id(g_ptt_started)) {  // [VA]
-            // Held long enough to be a real push-to-talk turn -> release ends it.
-            // Released within 1.2 s of listening starting -> the user let go to
-            // speak, so stay in listening and let the pipeline VAD end the turn.
-            const bool held_to_talk = id(g_va_phase) == 1 &&
-              (millis() - id(g_va_started_ms)) >= 1200;
-            id(g_va_handsfree) = !held_to_talk;
-            if (held_to_talk) id(g_va_phase) = 2; // thinking
+            // Push-to-talk feel without stopping the stream: the screen flips to
+            // `thinking` the instant the finger comes up, but the audio keeps
+            // flowing so HA's microVAD can see the silence and close the turn
+            // itself. Calling `voice_assistant.stop` here would abort the
+            // pipeline and throw the recording away.
+            if (id(g_va_phase) == 1) id(g_va_phase) = 2; // thinking
             id(va_render).execute();
             id(va_ptt_release_feedback).execute();
             return; // [VA]
@@ -884,10 +916,6 @@ touchscreen:
           }
           id(g_gesture) = gesture;
           id(g_last_activity) = millis();
-      - if: # [VA]
-          condition: { lambda: 'return id(g_ptt_started) && !id(g_va_handsfree);' }
-          then:
-            - voice_assistant.stop:
       - if: # [VA]
           condition: { lambda: 'return !id(g_ptt_started);' }
           then:
@@ -997,6 +1025,16 @@ text_sensor:
       - script.execute: render_aod
 
 sensor:
+  # Heap telemetry for the `mic_task` allocation failure. `free_internal_heap`
+  # is the number that matters: it is the pool xTaskCreate and the I2S DMA
+  # descriptors draw from, and PSRAM cannot substitute for it.
+  - platform: debug
+    free:
+      name: "Heap Free"
+    block:
+      name: "Heap Max Block"
+    loop_time:
+      name: "Loop Time"
   - platform: ble_rssi
     mac_address: "2C:0D:CF:6D:5B:E1"
     name: "谷溪的手环 RSSI"
@@ -1218,10 +1256,16 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+  # Local speaker volume in percent (0-100). This is NOT a display-only number:
+  # `apply_local_volume` pushes it into the i2s_audio speaker's software volume
+  # stage, which is the same stage every `voice_assistant` TTS chunk goes
+  # through (I2SAudioSpeakerBase::apply_software_volume_). Defaults to 100 so
+  # boot loudness matches the pre-fix behaviour (q31 factor = INT32_MAX,
+  # i.e. volume processing bypassed entirely).
   - id: g_local_volume
     type: float
     restore_value: no
-    initial_value: '50.0'
+    initial_value: '100.0'
   - id: g_arc_pct
     type: int
     restore_value: no
@@ -1386,16 +1430,6 @@ globals:
     type: bool
     initial_value: 'false'
   - id: g_va_release_flash  # [VA]
-    type: bool
-    initial_value: 'false'
-  # [VA] Hands-free turn. Long press is push-to-talk: audio streams only while the
-  # finger is down, and `voice_assistant.stop` on release ends the turn. If the
-  # finger comes up almost immediately after listening began (the natural "poke it
-  # and then talk" gesture) that yields an empty stream, which the cloud STT ends
-  # with `stt-no-text-recognized` after its 8 s no-packet timeout. In that case the
-  # release is treated as a hands-free trigger instead: keep streaming and let the
-  # pipeline VAD close the turn.
-  - id: g_va_handsfree  # [VA]
     type: bool
     initial_value: 'false'
   # Battery state, ported from the upstream Guition VA project. There is no STAT
@@ -1602,7 +1636,6 @@ script:
       - lambda: |-
           id(g_va_phase) = 1; // [VA]
           id(g_va_active) = true;
-          id(g_va_handsfree) = false;
           id(g_va_tts_started) = false;
           id(g_va_stt_seen) = false;
           id(g_va_started_ms) = millis();
@@ -1613,11 +1646,27 @@ script:
           id(va_render).execute();
       - lvgl.page.show: page_va
       - script.execute: ring_update_state
+      # [VA] Pause BLE scanning for the duration of the turn. NOT for RAM --
+      # heap_max_block sits at 31 KB now and mic_task only needs 4 KB -- but for
+      # main-loop time: with `bluetooth_proxy: active: true` every advertisement
+      # costs a scan request plus a callback on the main loop, and the loop
+      # stalls are what overrun the mic ring buffer and starve the I2S speaker.
+      # `stop_scan` is used rather than `esp32_ble.disable` on purpose: tearing
+      # the whole BLE stack down and back up takes hundreds of ms and would
+      # stall the loop exactly at the moment the microphone opens.
+      - esp32_ble_tracker.stop_scan:
 
   - id: va_prepare # [VA]
     then:
       - script.execute: va_enter_session
       - script.wait: va_enter_session
+      # [VA] HA's microVAD closes the turn. ESPHome has no "finish and process
+      # what you have" signal: `voice_assistant.stop` is translated into
+      # `Requested pipeline abort` on the HA side, which discards the audio and
+      # never produces a transcript. So the release must NOT stop the stream --
+      # it keeps flowing, microVAD sees the silence the user just created and
+      # ends the turn normally. Turning VAD off instead leaves the stt stream
+      # unclosed and Volcengine kills it after 8 s (code 45000081).
       - voice_assistant.start:
 
   # [VA] Proactive ask. The dial takes the screen, shows the asking state and
@@ -1683,10 +1732,16 @@ script:
           id(g_va_phase) = 0;
           id(g_va_active) = false;
           id(g_ptt_started) = false;
-          id(g_va_handsfree) = false;
           id(g_last_activity) = millis();
           id(g_manual_until) = millis() + 3000;
           if (id(g_va_dac_was_unmuted)) id(dac_unmute).turn_on(); else id(dac_unmute).turn_off();
+      # [VA] Always re-arm BLE scanning, deliberately placed BEFORE the early-exit
+      # cases below and outside any condition. The lambda above can `return`
+      # early, but that only leaves the lambda -- this action still runs, so every
+      # exit path (on_end, on_error -> va_fail, on_tts_stream_end, the 12 s stuck
+      # watchdog and the 120 s ceiling) restores the proxy. A missed restore would
+      # silently leave the whole house's BLE proxy dead until the next reboot.
+      - esp32_ble_tracker.start_scan:
       - script.execute: va_restore_external_media
       - script.execute: ring_update_state
       - if:
@@ -1794,48 +1849,33 @@ script:
     then:
       - lambda: |-
           auto phase = id(g_va_phase);
-          auto color_listening = lv_color_hex(0x35D07F);
           auto color_thinking = lv_color_hex(0x8B7CFF);
-          auto color_speaking = lv_color_hex(0x49A8FF);
           auto color_error = lv_color_hex(0xFF6B6B);
-          // Secondary thinking ribbons are opt-in; every non-thinking phase starts
-          // with them hidden so no colour leaks into listening/speaking/error.
-          lv_obj_add_flag(id(va_orb_b), LV_OBJ_FLAG_HIDDEN);
-          lv_obj_add_flag(id(va_orb_c), LV_OBJ_FLAG_HIDDEN);
+          // All three pre-rendered ribbons start hidden on every render pass so
+          // exactly one can be revealed below; nothing can leak between states.
+          lv_obj_add_flag(id(va_flow_listen), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(va_flow_think), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(id(va_flow_speak), LV_OBJ_FLAG_HIDDEN);
 
           if (phase == 1) { // Listening
-            lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(id(va_icon), "󰍬"); // Mic
-            lv_obj_set_style_text_color(id(va_icon), color_listening, LV_PART_MAIN);
-            lv_obj_set_style_text_color(id(va_bars), color_listening, LV_PART_MAIN);
-            // Listening now carries a hint, so the state is readable even before
-            // the user says anything.
-            lv_obj_clear_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_color(id(va_status_label), color_listening, LV_PART_MAIN);
-            lv_label_set_text(id(va_status_label), "请说话");
-            lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
-          } else if (phase == 2) { // Thinking: Siri-like layered light ribbons
-            // No static ellipsis: three differently sized, coloured arc segments
-            // counter-rotate to form a lively orbital glow at screen centre.
+            // Ribbon only - no "请说话" label and no mic glyph. The calm green
+            // flow is enough to read the state, and dropping the icon keeps the
+            // screen clean rather than stacking two redundant indicators.
             lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(id(va_orb_b), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(id(va_orb_c), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(va_flow_listen), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
-          } else if (phase == 3) { // Speaking
-            lv_obj_clear_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_color(id(va_bars), color_speaking, LV_PART_MAIN);
+          } else if (phase == 2) { // Thinking
             lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(va_flow_think), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
+          } else if (phase == 3) { // Speaking / answering
+            lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(va_flow_speak), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
           } else if (phase == 5) { // Proactive ask
             lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(id(va_icon), "\xF3\xB0\x8D\xAC"); // Mic
             lv_obj_set_style_text_color(id(va_icon), color_thinking, LV_PART_MAIN);
-            lv_obj_add_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_style_text_color(id(va_status_label), color_thinking, LV_PART_MAIN);
             lv_label_set_text(id(va_status_label), "正在提问");
@@ -1843,12 +1883,42 @@ script:
             lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(id(va_icon), "\xF3\xB0\x85\x96"); // mdi-close
             lv_obj_set_style_text_color(id(va_icon), color_error, LV_PART_MAIN);
-            lv_obj_add_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_style_text_color(id(va_status_label), color_error, LV_PART_MAIN);
             lv_label_set_text(id(va_status_label), "出现错误");
           }
+
+      # [VA] 2026-08-29: the three ribbons used to be `auto_start: true` +
+      # `repeat_count: forever`, so all 60 frames' worth of LVGL animation
+      # timers ran permanently -- even while hidden and even on other pages.
+      #
+      # Second finding, from the heap telemetry: while a ribbon actually plays,
+      # `heap_max_block` collapses from 31 KB to 7.6 KB and repeatedly down into
+      # the 0.4-3.5 KB range, because LVGL allocates image draw/cache buffers
+      # from internal RAM for every 264x88 RGB565 frame. That is the very pool
+      # `mic_task` (4 KB contiguous) and the I2S DMA descriptors live in. So the
+      # ribbons are simultaneously a CPU/redraw cost AND a memory cost.
+      #
+      # Therefore the ribbons are rate-limited rather than frozen. Freezing
+      # listening/speaking on a still frame did fix the audio, but it looked
+      # dead. Instead `va_flow_listen` / `va_flow_speak` now play every SECOND
+      # frame (10 of the 20) over the same 900 ms cycle: the ribbon flows at
+      # exactly the original speed, but the redraw count and the per-frame LVGL
+      # image-cache allocation both drop by half during the phases where audio
+      # is actually streaming. `thinking` keeps the full 20-frame sequence --
+      # the mic is closed and TTS has not started, so it can afford the detail.
+      - if:
+          condition: { lambda: 'return id(g_va_phase) == 1;' }
+          then: [{ lvgl.animimg.start: va_flow_listen }]
+          else: [{ lvgl.animimg.stop: va_flow_listen }]
+      - if:
+          condition: { lambda: 'return id(g_va_phase) == 3;' }
+          then: [{ lvgl.animimg.start: va_flow_speak }]
+          else: [{ lvgl.animimg.stop: va_flow_speak }]
+      - if:
+          condition: { lambda: 'return id(g_va_phase) == 2;' }
+          then: [{ lvgl.animimg.start: va_flow_think }]
+          else: [{ lvgl.animimg.stop: va_flow_think }]
 
   - id: knob_visual_settle
     mode: restart
@@ -3076,6 +3146,13 @@ script:
           condition: { lambda: 'return id(g_target) == 7 && id(g_control_mode) == 0;' }
           then:
             - lambda: 'id(g_local_volume) = id(g_optimistic_value);'
+            # The knob used to only move a number on screen. `voice_assistant`
+            # writes TTS straight into `magic_dial_speaker`, and the PCM5100A has
+            # no I2C control surface (so no `audio_dac:` component), which means
+            # the ONLY volume stage in the whole output path is the i2s_audio
+            # speaker's software q31 gain. Setting it here is what makes the dial
+            # actually control VA playback loudness.
+            - script.execute: apply_local_volume
             - script.execute: render_main
       - if:
           condition: { lambda: 'return id(g_target) == 7 && id(g_control_mode) == 1;' }
@@ -3098,6 +3175,29 @@ script:
           id: publish_knob_bar
           force: false
       - script.execute: knob_bar_trailing
+
+  # Pushes `g_local_volume` (0-100 %) into the i2s_audio speaker.
+  #
+  # Why this exists: there is no `media_player:` component on this device. The
+  # "本机扬声器" knob target was purely cosmetic -- it moved `g_local_volume` and
+  # re-rendered the screen, and nothing ever reached the audio path, so VA TTS
+  # always played at the hardware full-scale level.
+  #
+  # `speaker.volume_set` on an `i2s_audio` speaker with no `audio_dac:`
+  # configured falls back to software volume: it converts the 0.0-1.0 value into
+  # a Q31 gain factor (linear over -49 dB .. 0 dB) that
+  # `I2SAudioSpeakerBase::apply_software_volume_` applies to every buffer written
+  # to the DAC. `voice_assistant` hands TTS chunks to the exact same speaker
+  # object, so this covers VA playback, `speaker.play`, and any future media.
+  #
+  # 100 % is special-cased upstream to INT32_MAX, i.e. the gain stage is skipped
+  # entirely -- so the default is bit-identical to the pre-fix behaviour.
+  - id: apply_local_volume
+    mode: restart
+    then:
+      - speaker.volume_set:
+          id: magic_dial_speaker
+          volume: !lambda 'return fminf(1.0f, fmaxf(0.0f, id(g_local_volume) / 100.0f));'
 
   # Renders the current knob value as a 52x16 full-screen bar and publishes it
   # straight to the Ulanzi's custom app (`ulanzi_aa68/custom/test`). The frame is
@@ -3219,14 +3319,15 @@ interval:
           then:
             - voice_assistant.stop:
             - script.execute: va_cleanup
-      # [VA] Hands-free watchdog. A hands-free turn is closed by the pipeline VAD,
-      # so a stuck / phantom session would otherwise hold the microphone open for
-      # the full 120 s above. If nothing was recognised within 12 s of listening,
-      # end the turn instead of quietly recording.
+      # [VA] Stuck-listening watchdog. The turn is normally closed by HA's microVAD
+      # a second or so after the finger comes up, so still sitting in `listening`
+      # with nothing recognised after 12 s means the session is phantom (VAD never
+      # fired, or the mic produced no usable audio). End it instead of quietly
+      # holding the microphone open until the 120 s ceiling above.
       - if: # [VA]
           condition:
             lambda: |-
-              return id(g_va_active) && id(g_va_handsfree) && id(g_va_phase) == 1 &&
+              return id(g_va_active) && id(g_va_phase) == 1 &&
                 !id(g_va_stt_seen) && millis() - id(g_va_started_ms) > 12000;
           then:
             - voice_assistant.stop:
@@ -3237,34 +3338,12 @@ interval:
           then:
             - script.execute: enter_sleep
 
-  - interval: 100ms # [VA]
-    then:
-      - if:
-          condition: { lambda: 'return id(g_va_active);' }
-          then:
-            - lambda: |-
-                auto phase = id(g_va_phase);
-                if (phase == 1) { // Listening bars
-                  static int frame = 0;
-                  frame++;
-                  const char* bars[] = {"|    ", "||   ", "|||  ", "|||| ", "|||||", " ||||", "  |||", "   ||", "    |"};
-                  lv_label_set_text(id(va_bars), bars[frame % 9]);
-                } else if (phase == 2) { // Thinking orbital ribbons
-                  static int angle_a = 0;
-                  static int angle_b = 120;
-                  static int angle_c = 240;
-                  angle_a = (angle_a + 7) % 360;
-                  angle_b = (angle_b + 355) % 360;  // -5°, counter-rotation
-                  angle_c = (angle_c + 11) % 360;
-                  lv_arc_set_rotation(id(va_arc), angle_a);
-                  lv_arc_set_rotation(id(va_orb_b), angle_b);
-                  lv_arc_set_rotation(id(va_orb_c), angle_c);
-                } else if (phase == 3) { // Speaking wave
-                  static int frame = 0;
-                  frame++;
-                  const char* waves[] = {"  -  ", " --- ", "-----", " --- ", "  -  "};
-                  lv_label_set_text(id(va_bars), waves[frame % 5]);
-                }
+  # [VA] The former 100 ms animation driver is gone. It hand-stepped the
+  # listening bars, the thinking arc rotations and the speaking wave from the
+  # main loop, which capped every assistant animation at 10 fps and competed
+  # with the audio path for loop time. All three states are now pre-rendered
+  # `animimg` sequences driven by LVGL's own animation timer, so there is
+  # nothing left to tick here.
 
 font:
   # P6 typography. Local TTFs are used instead of `gfonts://` so the exact
@@ -3350,14 +3429,10 @@ font:
     size: 24
     bpp: 4
     glyphs: &p6_glyphs " !%()+,-./0123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz年月日星期一二三四五六天·客餐厅电视音量箱吸顶灯带亮度色温相空调目标模式本机屏幕进设备离线正在同步时间低中高制冷热自动送风除湿关闭已打开暂停播放当前魔法旋钮元旦春节清明劳端午秋国庆圣诞复活万情人母父感恩无效连接失败听请重试上下左右暖扇扬声器圆盘地提问↔▶Ⅱ°—充锁|出现错误说话"
-  # [VA] Deliberately matches the visual weight of the main-page hero values:
-  # Medium face, 30 px, narrow glyph set. Letter spacing is applied on va_bars
-  # itself so the meter reads as five deliberate strokes rather than tiny text.
-  - file: fonts/NotoSansSC-Medium.ttf
-    id: font_va_30
-    size: 30
-    bpp: 4
-    glyphs: " |-请说话正在提问出现错误"
+  # [VA] `font_va_30` used to live here for the `va_bars` ASCII level meter
+  # ("|||||" / "-----"). Both the meter and its font are gone now that the
+  # listening and speaking states are pre-rendered ribbons; the only remaining
+  # VA text is 正在提问 / 出现错误, which render from the shared font_sc_24.
   # Hero value fonts run at bpp 4 again: the 16 MB partition table (~7.94 MB app
   # slot) leaves plenty of room, so the ~400 KB of 52 px / 44 px bitmaps that
   # forced the earlier bpp 2 downgrade are no longer a problem. Glyph sets stay
@@ -3392,8 +3467,27 @@ font:
     bpp: 4
     glyphs: *p6_glyphs
 
+# [VA] Pre-rendered interwoven-arc frames for the assistant page (listening /
+# thinking / answering). 90 frames total, generated by tools/gen_va_arcs.py;
+# the list is machine-generated so the PNGs and their ids cannot drift apart.
+# 192x56 rather than the previous 264x88: at 21.0 KB a frame fits both the
+# 31.1 KB LVGL draw buffer (one flush instead of two) and the 64 KB S3 data
+# cache, so it no longer evicts the working set that `mic_task` and the I2S DMA
+# descriptors depend on. 30 frames/state over a 2000 ms loop; see the generator
+# docstring for why slowing the arcs down had to cost frames.
+# These are rodata (CONFIG_SPIRAM_RODATA, so PSRAM-mapped) and cost no internal
+# RAM, which is the scarce resource this build fights over. 2.66 -> 1.85 MB.
+image: !include va_arc_images.yaml
+
 lvgl:
-  buffer_size: 10%
+  # 10% (~25 KB for 360x360 RGB565) was too tight; 25% left the largest free
+  # internal block at only 7.5 KB, which is what `mic_task` and the I2S DMA
+  # descriptors have to share. 20% is the compromise being trialled.
+  # 12%, down from 20%: the pre-rendered VA ribbons made LVGL's own image
+  # draw/cache allocations bite into internal RAM, dropping heap_max_block from
+  # 31 KB back to 7.68 KB and starving mic_task again. This buffer is internal
+  # DMA memory, so shrinking it is the most direct way to hand that back.
+  buffer_size: 12%
   # Charging port down: LVGL owns the rotation because the display component
   # rejects `rotation` when LVGL is attached.
   rotation: 180
@@ -3784,7 +3878,16 @@ lvgl:
             pad_all: 2
 
     - id: page_va  # [VA]
-      bg_color: ${color_bg_canvas}
+      # Pure black, not the ${color_bg_canvas} token the other pages use, and
+      # bg_opa is pinned explicitly rather than left to LVGL's default.
+      # The pre-rendered ribbons are opaque RGB565, so their own background has
+      # to match this exactly or the 264x88 frame shows up as a lighter grey
+      # rectangle. 0x03070A quantises to RGB565 (0,4,8), which is measurably
+      # brighter than the black this LCD actually displays - that mismatch is
+      # what made the frame edge visible. Both sides now sit on 0x000000.
+      # Keep this in sync with BG in tools/gen_va_flow.py.
+      bg_color: 0x000000
+      bg_opa: COVER
       widgets:
         # [VA] Static outer ring: gives the round canvas a visible frame so the
         # assistant state always reads as centred on the 360x360 display.
@@ -3806,92 +3909,99 @@ lvgl:
             arc_color: 0x0E2A33
             indicator:
               arc_opa: 0%
-        # [VA] Rotating progress arc (thinking phase). The 100ms interval calls
-        # lv_arc_set_rotation() on this widget.
-        - arc:
-            id: va_arc
+        # [VA] Pre-rendered Siri ribbons, one per assistant state. These replace
+        # the former trio of counter-rotating arcs (va_arc / va_orb_b /
+        # va_orb_c), which were driven by lv_arc_set_rotation from a 100 ms
+        # interval and therefore capped at a visibly steppy 10 fps. animimg runs
+        # off LVGL's own animation timer at ~22 fps and the per-pixel glow is
+        # baked in, so the effect is both smoother and far richer than anything
+        # arc primitives can express.
+        #
+        # `duration` is the TOTAL length of the 20-frame sequence, not per frame.
+        # 900 ms is deliberately identical for all three states so the on-device
+        # cadence matches the approved 45 ms/frame preview GIFs exactly.
+        #
+        # The frames are opaque and carry the page background themselves, so
+        # these must be declared BEFORE va_icon / va_status_label to stay
+        # underneath them in z-order.
+        - animimg:
+            id: va_flow_listen
             align: CENTER
-            width: 296
-            height: 296
-            arc_width: 6
-            min_value: 0
-            max_value: 100
-            value: 22
-            start_angle: 0
-            end_angle: 360
-            adjustable: false
-            arc_opa: 0%
-            indicator:
-              arc_color: 0x38DDF2
+            width: 192
+            height: 56
+            duration: 2000ms
+            repeat_count: forever
+            auto_start: false
+            # Full 30-frame sequence, up from every-other-frame: the smaller
+            # canvas freed the budget that had forced listening to ~11 fps
+            # while the other two states ran twice that.
+            src: [va_listen_00, va_listen_01, va_listen_02, va_listen_03,
+                  va_listen_04, va_listen_05, va_listen_06, va_listen_07,
+                  va_listen_08, va_listen_09, va_listen_10, va_listen_11,
+                  va_listen_12, va_listen_13, va_listen_14, va_listen_15,
+                  va_listen_16, va_listen_17, va_listen_18, va_listen_19,
+                  va_listen_20, va_listen_21, va_listen_22, va_listen_23,
+                  va_listen_24, va_listen_25, va_listen_26, va_listen_27,
+                  va_listen_28, va_listen_29]
             hidden: true
-        # Two inner ribbons complete the Siri-like thinking orb. Unequal segment
-        # lengths, diameters and speeds keep it organic rather than a loading
-        # spinner; all are screen-only and do not touch the RGB ring.
-        - arc:
-            id: va_orb_b
+        - animimg:
+            id: va_flow_think
             align: CENTER
-            width: 224
-            height: 224
-            arc_width: 10
-            min_value: 0
-            max_value: 100
-            value: 42
-            start_angle: 0
-            end_angle: 360
-            adjustable: false
-            arc_opa: 0%
-            indicator:
-              arc_color: 0x8B7CFF
+            width: 192
+            height: 56
+            duration: 2000ms
+            repeat_count: forever
+            auto_start: false
+            src: [va_think_00, va_think_01, va_think_02, va_think_03,
+                  va_think_04, va_think_05, va_think_06, va_think_07,
+                  va_think_08, va_think_09, va_think_10, va_think_11,
+                  va_think_12, va_think_13, va_think_14, va_think_15,
+                  va_think_16, va_think_17, va_think_18, va_think_19,
+                  va_think_20, va_think_21, va_think_22, va_think_23,
+                  va_think_24, va_think_25, va_think_26, va_think_27,
+                  va_think_28, va_think_29]
             hidden: true
-        - arc:
-            id: va_orb_c
+        - animimg:
+            id: va_flow_speak
             align: CENTER
-            width: 152
-            height: 152
-            arc_width: 14
-            min_value: 0
-            max_value: 100
-            value: 63
-            start_angle: 0
-            end_angle: 360
-            adjustable: false
-            arc_opa: 0%
-            indicator:
-              arc_color: 0xFF5EC4
+            width: 192
+            height: 56
+            duration: 2000ms
+            repeat_count: forever
+            auto_start: false
+            # Frame ids are va_answer_* (the generator's name for this state);
+            # the widget id stays va_flow_speak so the phase automations that
+            # start and stop it need no change.
+            src: [va_answer_00, va_answer_01, va_answer_02, va_answer_03,
+                  va_answer_04, va_answer_05, va_answer_06, va_answer_07,
+                  va_answer_08, va_answer_09, va_answer_10, va_answer_11,
+                  va_answer_12, va_answer_13, va_answer_14, va_answer_15,
+                  va_answer_16, va_answer_17, va_answer_18, va_answer_19,
+                  va_answer_20, va_answer_21, va_answer_22, va_answer_23,
+                  va_answer_24, va_answer_25, va_answer_26, va_answer_27,
+                  va_answer_28, va_answer_29]
             hidden: true
-        # [VA] Centre stack: icon on the optical centre, level bars just below.
-        - obj:
-            id: va_core
+        # [VA] State icon, used ONLY by the ribbon-less phases (error and
+        # proactive ask), so it keeps the original -24 offset and needs no
+        # runtime realignment. Listening/thinking/speaking deliberately show the
+        # ribbon alone - no icon - to keep those screens clean.
+        - label:
+            id: va_icon
             align: CENTER
-            width: 200
-            height: 120
-            bg_opa: TRANSP
-            border_width: 0
-            pad_all: 0
-            widgets:
-              - label:
-                  id: va_icon
-                  align: CENTER
-                  y: -24
-                  text: ""
-                  text_font: font_va_icons_44
-                  text_align: CENTER
-                  text_color: ${color_va_listening}
-              - label:
-                  id: va_bars
-                  align: CENTER
-                  y: 32
-                  width: 180
-                  text: "|||||"
-                  text_font: font_va_30
-                  text_align: CENTER
-                  text_letter_space: 8
-                  text_color: ${color_va_listening}
+            y: -24
+            text: ""
+            text_font: font_va_icons_44
+            text_align: CENTER
+            text_color: ${color_va_listening}
         - label:
             id: va_status_label
             align: CENTER
             y: 108
-            width: 260
+            # SIZE_CONTENT instead of a fixed 260 px: a fixed width lets LVGL
+            # wrap the text when the glyphs do not fit, which is what once broke
+            # the thinking ellipsis into a vertical stack of dots. Sizing to the
+            # content makes wrapping structurally impossible.
+            width: SIZE_CONTENT
             text: ""
             text_font: font_sc_24
             text_align: CENTER

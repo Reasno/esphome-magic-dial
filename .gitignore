@@ -32,6 +32,20 @@ secrets*.yaml
 *.webp
 *.heic
 
+# [VA] Exception: the pre-rendered voice assistant animation frames are build
+# inputs, not photos - the firmware will not compile without them. They are
+# reproducible via the generators in tools/, but tracking them keeps a fresh
+# clone buildable without a regeneration step.
+# va_arc_* is the live set (tools/gen_va_arcs.py, interwoven arcs).
+!images/va_arc_listen/*.png
+!images/va_arc_think/*.png
+!images/va_arc_answer/*.png
+# va_flow_* is the superseded v1 Siri ribbon set (tools/gen_va_flow.py), kept
+# tracked so the previous look stays a YAML-only revert.
+!images/va_flow_listen/*.png
+!images/va_flow_think/*.png
+!images/va_flow_speak/*.png
+
 # Other binary assets kept local
 fonts/
 icons/
@@ -53,3 +67,7 @@ ha_*.yaml
 automations.yaml
 scripts.yaml
 scenes.yaml
+
+# Generator by-products: review-only GIF/HTML previews and pyc caches.
+tools/preview/
+tools/__pycache__/
