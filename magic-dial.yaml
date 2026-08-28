@@ -1593,7 +1593,7 @@ script:
                 action: media_player.volume_set
                 data:
                   entity_id: ${tv_entity}
-                  volume_level: "0.20"
+                  volume_level: "0.05"
       - if:
           condition: { lambda: 'return id(g_va_ducked_target) == 1;' }
           then:
@@ -1601,7 +1601,7 @@ script:
                 action: media_player.volume_set
                 data:
                   entity_id: ${homepod_entity}
-                  volume_level: "0.20"
+                  volume_level: "0.05"
 
   - id: va_restore_external_media  # [VA]
     then:
@@ -1609,7 +1609,7 @@ script:
           condition: { lambda: 'return id(g_va_ducked_target) == 0;' }
           then:
             - if:
-                condition: { lambda: 'return abs(id(tv_volume).state - 0.20f) <= 0.03f;' }
+                condition: { lambda: 'return abs(id(tv_volume).state - 0.05f) <= 0.03f;' }
                 then:
                   - homeassistant.action:
                       action: media_player.volume_set
@@ -1620,7 +1620,7 @@ script:
           condition: { lambda: 'return id(g_va_ducked_target) == 1;' }
           then:
             - if:
-                condition: { lambda: 'return abs(id(homepod_volume).state - 0.20f) <= 0.03f;' }
+                condition: { lambda: 'return abs(id(homepod_volume).state - 0.05f) <= 0.03f;' }
                 then:
                   - homeassistant.action:
                       action: media_player.volume_set
