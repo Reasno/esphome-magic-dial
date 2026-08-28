@@ -818,7 +818,13 @@ touchscreen:
       - lambda: |-
           id(g_touch_down) = false; // [VA]
           if (id(g_ptt_started)) {  // [VA]
-            id(g_va_phase) = 2; // thinking
+            // Held long enough to be a real push-to-talk turn -> release ends it.
+            // Released within 1.2 s of listening starting -> the user let go to
+            // speak, so stay in listening and let the pipeline VAD end the turn.
+            const bool held_to_talk = id(g_va_phase) == 1 &&
+              (millis() - id(g_va_started_ms)) >= 1200;
+            id(g_va_handsfree) = !held_to_talk;
+            if (held_to_talk) id(g_va_phase) = 2; // thinking
             id(va_render).execute();
             id(va_ptt_release_feedback).execute();
             return; // [VA]
@@ -869,7 +875,7 @@ touchscreen:
           id(g_gesture) = gesture;
           id(g_last_activity) = millis();
       - if: # [VA]
-          condition: { lambda: 'return id(g_ptt_started);' }
+          condition: { lambda: 'return id(g_ptt_started) && !id(g_va_handsfree);' }
           then:
             - voice_assistant.stop:
       - if: # [VA]
@@ -1372,6 +1378,16 @@ globals:
   - id: g_va_release_flash  # [VA]
     type: bool
     initial_value: 'false'
+  # [VA] Hands-free turn. Long press is push-to-talk: audio streams only while the
+  # finger is down, and `voice_assistant.stop` on release ends the turn. If the
+  # finger comes up almost immediately after listening began (the natural "poke it
+  # and then talk" gesture) that yields an empty stream, which the cloud STT ends
+  # with `stt-no-text-recognized` after its 8 s no-packet timeout. In that case the
+  # release is treated as a hands-free trigger instead: keep streaming and let the
+  # pipeline VAD close the turn.
+  - id: g_va_handsfree  # [VA]
+    type: bool
+    initial_value: 'false'
   # Battery state, ported from the upstream Guition VA project. There is no STAT
   # pin wired to a GPIO on the JC3636K718C dock, so charging is inferred from the
   # rail voltage instead.
@@ -1576,6 +1592,7 @@ script:
       - lambda: |-
           id(g_va_phase) = 1; // [VA]
           id(g_va_active) = true;
+          id(g_va_handsfree) = false;
           id(g_va_tts_started) = false;
           id(g_va_stt_seen) = false;
           id(g_va_started_ms) = millis();
@@ -1656,6 +1673,7 @@ script:
           id(g_va_phase) = 0;
           id(g_va_active) = false;
           id(g_ptt_started) = false;
+          id(g_va_handsfree) = false;
           id(g_last_activity) = millis();
           id(g_manual_until) = millis() + 3000;
           if (id(g_va_dac_was_unmuted)) id(dac_unmute).turn_on(); else id(dac_unmute).turn_off();
@@ -1767,11 +1785,18 @@ script:
             lv_label_set_text(id(va_icon), "󰍬"); // Mic
             lv_obj_set_style_text_color(id(va_icon), color_listening, LV_PART_MAIN);
             lv_obj_set_style_text_color(id(va_bars), color_listening, LV_PART_MAIN);
-            lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
+            // Listening now carries a hint, so the state is readable even before
+            // the user says anything.
+            lv_obj_clear_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_color(id(va_status_label), color_listening, LV_PART_MAIN);
+            lv_label_set_text(id(va_status_label), "请说话");
             lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
           } else if (phase == 2) { // Thinking
             lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(id(va_icon), "...");
+            // `va_icon` renders with the MDI icon font, so plain ASCII ("...",
+            // "X") has no glyph there and paints as a box. Always use a declared
+            // MDI codepoint from font_icons_28.
+            lv_label_set_text(id(va_icon), "\xF3\xB0\x87\x99"); // mdi-dots-horizontal
             lv_obj_set_style_text_color(id(va_icon), color_thinking, LV_PART_MAIN);
             lv_obj_add_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
@@ -1794,7 +1819,7 @@ script:
             lv_label_set_text(id(va_status_label), "正在提问");
           } else if (phase == 4) { // Error
             lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(id(va_icon), "✕");
+            lv_label_set_text(id(va_icon), "\xF3\xB0\x85\x96"); // mdi-close
             lv_obj_set_style_text_color(id(va_icon), color_error, LV_PART_MAIN);
             lv_obj_add_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
@@ -3218,6 +3243,12 @@ font:
       - "󰂉"  # mdi-battery-charging-60
       - "󰂊"  # mdi-battery-charging-80
       - "󰂅"  # mdi-battery-charging-100
+      # [VA] Assistant states. These MUST be declared here: the VA page renders
+      # them through `font_icons_28`, and an undeclared codepoint draws as a
+      # filled box, which is exactly what the first VA build showed.
+      - "󰍬"  # mdi-microphone (listening / proactive ask)
+      - "󰇙"  # mdi-dots-horizontal (thinking)
+      - "󰅖"  # mdi-close (error)
   # Dedicated TV remote icon fonts. Both sizes are embedded so press feedback
   # shrinks the glyph without relying on an undeclared LVGL fallback font.
   - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
@@ -3250,7 +3281,7 @@ font:
     id: font_sc_24
     size: 24
     bpp: 4
-    glyphs: &p6_glyphs " !%()+,-./0123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz年月日星期一二三四五六天·客餐厅电视音量箱吸顶灯带亮度色温相空调目标模式本机屏幕进设备离线正在同步时间低中高制冷热自动送风除湿关闭已打开暂停播放当前魔法旋钮元旦春节清明劳端午秋国庆圣诞复活万情人母父感恩无效连接失败听请重试上下左右暖扇扬声器圆盘地提问↔▶Ⅱ°—充锁"
+    glyphs: &p6_glyphs " !%()+,-./0123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz年月日星期一二三四五六天·客餐厅电视音量箱吸顶灯带亮度色温相空调目标模式本机屏幕进设备离线正在同步时间低中高制冷热自动送风除湿关闭已打开暂停播放当前魔法旋钮元旦春节清明劳端午秋国庆圣诞复活万情人母父感恩无效连接失败听请重试上下左右暖扇扬声器圆盘地提问↔▶Ⅱ°—充锁|出现错误说话"
   # Hero value fonts run at bpp 4 again: the 16 MB partition table (~7.94 MB app
   # slot) leaves plenty of room, so the ~400 KB of 52 px / 44 px bitmaps that
   # forced the earlier bpp 2 downgrade are no longer a problem. Glyph sets stay
