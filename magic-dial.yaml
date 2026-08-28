@@ -353,6 +353,14 @@ voice_assistant:  # [VA]
   microphone: magic_dial_microphone
   speaker: magic_dial_speaker
   use_wake_word: false
+  # [VA] Capture gain. The PDM mic on this board is very quiet, and with the
+  # ESPHome defaults (no gain, multiplier 1.0) the stream is too weak for the
+  # pipeline VAD to ever mark speech, so the turn dies as
+  # `stt-no-text-recognized`. These are the values the reference Guition VA
+  # project runs with.
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 2.0
   # A pipeline can also be started from HA (assist_satellite.start_conversation
   # for a proactive question). In that case nothing ran va_prepare, so the
   # session state / VA page are set up here instead.
@@ -1707,7 +1715,17 @@ script:
                 abs(id(g_touch_dx)) <= 50 && abs(id(g_touch_dy)) <= 50;
           then:
             - lambda: 'id(g_ptt_started) = true;'
-            - script.execute: va_prepare
+            # Re-arm check: the touch driver can drop a release event while LVGL is
+            # redrawing, which would leave `g_touch_down` stuck and let a phantom
+            # hold open a microphone session nobody asked for. Confirm the finger
+            # is still down right before the pipeline is started.
+            - delay: 120ms
+            - if:
+                condition: { lambda: 'return id(g_touch_down);' }
+                then:
+                  - script.execute: va_prepare
+                else:
+                  - lambda: 'id(g_ptt_started) = false;'
 
   - id: va_ptt_release_feedback  # [VA]
     mode: restart
@@ -2625,8 +2643,25 @@ script:
                   lambda: 'return id(ceiling_power_state).state != "on";'
                 then:
                   - homeassistant.action: { action: switch.turn_on, data: { entity_id: '${ceiling_power_entity}' } }
-                  - delay: 1500ms
-                  - homeassistant.action: { action: light.turn_on, data: { entity_id: '${ceiling_light_entity}' } }
+                  # The lamp needs several seconds to power up and rejoin the
+                  # Xiaomi gateway. A single turn_on at +1.5 s lands while the
+                  # entity is still `unavailable` and is dropped by HA, and the
+                  # dial then keeps showing the stale "off"/0 % readings because
+                  # the miot integration only polls slowly. So retry, and force a
+                  # state refresh after each attempt so the pushed
+                  # state/brightness sensors catch up straight away.
+                  - repeat:
+                      count: 3
+                      then:
+                        - delay: 2500ms
+                        - homeassistant.action: { action: homeassistant.update_entity, data: { entity_id: '${ceiling_light_entity}' } }
+                        - if:
+                            condition:
+                              lambda: 'return id(ceiling_light_state).state != "on";'
+                            then:
+                              - homeassistant.action: { action: light.turn_on, data: { entity_id: '${ceiling_light_entity}' } }
+                  - homeassistant.action: { action: homeassistant.update_entity, data: { entity_id: '${ceiling_light_entity}' } }
+                  - script.execute: render_main
                 else:
                   - homeassistant.action: { action: light.toggle, data: { entity_id: '${ceiling_light_entity}' } }
       - if:
@@ -3180,6 +3215,18 @@ interval:
           then:
             - voice_assistant.stop:
             - script.execute: va_cleanup
+      # [VA] Hands-free watchdog. A hands-free turn is closed by the pipeline VAD,
+      # so a stuck / phantom session would otherwise hold the microphone open for
+      # the full 120 s above. If nothing was recognised within 12 s of listening,
+      # end the turn instead of quietly recording.
+      - if: # [VA]
+          condition:
+            lambda: |-
+              return id(g_va_active) && id(g_va_handsfree) && id(g_va_phase) == 1 &&
+                !id(g_va_stt_seen) && millis() - id(g_va_started_ms) > 12000;
+          then:
+            - voice_assistant.stop:
+            - script.execute: va_fail
       - if:
           condition:
             lambda: 'return !id(g_sleeping) && millis() - id(g_last_activity) >= 60000;'
