@@ -3296,6 +3296,17 @@ font:
       - "󰍬"  # mdi-microphone (listening / proactive ask)
       - "󰇙"  # mdi-dots-horizontal (thinking)
       - "󰅖"  # mdi-close (error)
+  # [VA] Larger state icon. The normal 28 px icon font is sized for the compact
+  # target cards; the assistant page is a full-screen hero surface and needs the
+  # same visual authority as the main page's 44/52 px values.
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+    id: font_va_icons_44
+    size: 44
+    bpp: 4
+    glyphs:
+      - "󰍬"  # mdi-microphone
+      - "󰇙"  # mdi-dots-horizontal
+      - "󰅖"  # mdi-close
   # Dedicated TV remote icon fonts. Both sizes are embedded so press feedback
   # shrinks the glyph without relying on an undeclared LVGL fallback font.
   - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
@@ -3329,6 +3340,14 @@ font:
     size: 24
     bpp: 4
     glyphs: &p6_glyphs " !%()+,-./0123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz年月日星期一二三四五六天·客餐厅电视音量箱吸顶灯带亮度色温相空调目标模式本机屏幕进设备离线正在同步时间低中高制冷热自动送风除湿关闭已打开暂停播放当前魔法旋钮元旦春节清明劳端午秋国庆圣诞复活万情人母父感恩无效连接失败听请重试上下左右暖扇扬声器圆盘地提问↔▶Ⅱ°—充锁|出现错误说话"
+  # [VA] Deliberately matches the visual weight of the main-page hero values:
+  # Medium face, 30 px, narrow glyph set. Letter spacing is applied on va_bars
+  # itself so the meter reads as five deliberate strokes rather than tiny text.
+  - file: fonts/NotoSansSC-Medium.ttf
+    id: font_va_30
+    size: 30
+    bpp: 4
+    glyphs: " |-请说话正在提问出现错误"
   # Hero value fonts run at bpp 4 again: the 16 MB partition table (~7.94 MB app
   # slot) leaves plenty of room, so the ~400 KB of 52 px / 44 px bitmaps that
   # forced the earlier bpp 2 downgrade are no longer a problem. Glyph sets stay
@@ -3808,27 +3827,30 @@ lvgl:
               - label:
                   id: va_icon
                   align: CENTER
-                  y: -18
+                  y: -24
                   text: ""
-                  text_font: font_icons_28
+                  text_font: font_va_icons_44
                   text_align: CENTER
                   text_color: ${color_va_listening}
               - label:
                   id: va_bars
                   align: CENTER
-                  y: 30
+                  y: 32
+                  width: 180
                   text: "|||||"
-                  text_font: font_sc_18
+                  text_font: font_va_30
                   text_align: CENTER
+                  text_letter_space: 8
                   text_color: ${color_va_listening}
         - label:
             id: va_status_label
             align: CENTER
-            y: 100
-            width: 240
+            y: 108
+            width: 260
             text: ""
-            text_font: font_sc_18
+            text_font: font_sc_24
             text_align: CENTER
+            text_letter_space: 2
             long_mode: CLIP
             text_color: ${color_va_error}
             hidden: true
