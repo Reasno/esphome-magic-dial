@@ -34,6 +34,14 @@ substitutions:
   # 2 min to leave, matching the existing HA template sensors.
   bracelet_presence_rssi: "-95"
 
+  # [VA] Proactive ask. `satellite_entity` is this device's assist_satellite
+  # entity in HA; `assist_satellite.start_conversation` is what makes the dial
+  # speak first and then listen. Adjust if the entity id differs.
+  satellite_entity: assist_satellite.magic_dial_assist_satellite
+  # Seconds the dial keeps listening after a proactive question before it gives
+  # up and returns to the previous screen.
+  proactive_listen_seconds: "10"
+
   # Point this at a calendar that aggregates every holiday you want to display.
   # The current event's `message` attribute is shown verbatim; an inactive calendar
   # leaves the holiday line blank. This is intentionally not limited to Chinese holidays.
@@ -85,6 +93,22 @@ logger:
 api:
   encryption:
     key: !secret magic_dial_api_key
+  actions:
+    # [VA] Proactive ask: HA (or any automation) hands the dial a question, the
+    # dial wakes, shows the asking screen, speaks the question through the
+    # Assist pipeline and then keeps listening for `listen_seconds`.
+    - action: proactive_ask
+      variables:
+        question: string
+        listen_seconds: int
+      then:
+        - script.execute:
+            id: proactive_ask_start
+            question: !lambda 'return question;'
+            listen_seconds: !lambda 'return listen_seconds > 0 ? listen_seconds : ${proactive_listen_seconds};'
+    - action: proactive_cancel
+      then:
+        - script.execute: proactive_abort
 
 ota:
   - platform: esphome
@@ -325,6 +349,14 @@ voice_assistant:  # [VA]
   microphone: magic_dial_microphone
   speaker: magic_dial_speaker
   use_wake_word: false
+  # A pipeline can also be started from HA (assist_satellite.start_conversation
+  # for a proactive question). In that case nothing ran va_prepare, so the
+  # session state / VA page are set up here instead.
+  on_start:
+    - if:
+        condition: { lambda: 'return !id(g_va_active);' }
+        then:
+          - script.execute: va_enter_session
   on_listening:
     - lambda: |-
         id(g_va_active) = true;
@@ -334,6 +366,7 @@ voice_assistant:  # [VA]
     - script.execute: ring_update_state
   on_stt_end:
     - lambda: |-
+        id(g_va_stt_seen) = true;
         id(g_va_phase) = 2; // thinking
         id(va_render).execute();
         id(dac_unmute).turn_off(); // Mute thinking
@@ -1280,7 +1313,7 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  - id: g_va_phase  # [VA] 0: idle, 1: listening, 2: thinking, 3: speaking, 4: error
+  - id: g_va_phase  # [VA] 0: idle, 1: listening, 2: thinking, 3: speaking, 4: error, 5: proactive ask
     type: int
     initial_value: '0'
   - id: g_va_active  # [VA]
@@ -1298,6 +1331,19 @@ globals:
   - id: g_va_return_to_aod  # [VA]
     type: bool
     initial_value: 'false'
+  # [VA] Proactive ask session state.
+  - id: g_va_proactive
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_va_stt_seen
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_proactive_deadline_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   - id: g_va_duck_volume_snapshot  # [VA]
     type: float
     initial_value: '0.0'
@@ -1509,12 +1555,16 @@ script:
       - lambda: 'id(g_ring_feedback) = 0;'
       - script.execute: ring_update_state
 
-  - id: va_prepare # [VA]
+  # [VA] Shared session entry: claims the screen/ring for the assistant without
+  # starting the pipeline. Used both by the local PTT path (va_prepare) and by
+  # pipelines started from HA (proactive ask).
+  - id: va_enter_session
     then:
       - lambda: |-
           id(g_va_phase) = 1; // [VA]
           id(g_va_active) = true;
           id(g_va_tts_started) = false;
+          id(g_va_stt_seen) = false;
           id(g_va_started_ms) = millis();
           id(g_manual_until) = millis() + 60000;
           id(g_va_dac_was_unmuted) = id(dac_unmute).state;
@@ -1522,13 +1572,73 @@ script:
           id(dac_unmute).turn_off();
           id(va_render).execute();
       - lvgl.page.show: page_va
-      - voice_assistant.start:
       - script.execute: ring_update_state
+
+  - id: va_prepare # [VA]
+    then:
+      - script.execute: va_enter_session
+      - script.wait: va_enter_session
+      - voice_assistant.start:
+
+  # [VA] Proactive ask. The dial takes the screen, shows the asking state and
+  # asks HA to run `assist_satellite.start_conversation`, which speaks the
+  # question through the normal pipeline and then listens. The listening window
+  # is re-armed locally (see va_cleanup) until `listen_seconds` elapses, so a
+  # short VAD timeout does not end the question after one beat of silence.
+  - id: proactive_ask_start
+    mode: restart
+    parameters:
+      question: string
+      listen_seconds: int
+    then:
+      - lambda: |-
+          id(g_va_proactive) = true;
+          id(g_proactive_deadline_ms) = millis() + (uint32_t) (listen_seconds * 1000);
+      - script.execute: va_enter_session
+      - script.wait: va_enter_session
+      - lambda: |-
+          id(g_va_phase) = 5; // asking
+          id(va_render).execute();
+      - homeassistant.action:
+          action: assist_satellite.start_conversation
+          data:
+            entity_id: ${satellite_entity}
+          data_template:
+            start_message: !lambda 'return question;'
+
+  - id: proactive_abort  # [VA]
+    then:
+      - lambda: |-
+          id(g_va_proactive) = false;
+          id(g_proactive_deadline_ms) = 0;
+      - voice_assistant.stop:
+      - script.execute: va_cleanup
 
   - id: va_cleanup  # [VA]
     mode: restart
     then:
+      # Proactive ask: nobody spoke yet and the listening window is still open,
+      # so re-arm listening instead of tearing the session down.
+      - if:
+          condition:
+            lambda: |-
+              return id(g_va_proactive) && !id(g_va_stt_seen) && !id(g_va_tts_started) &&
+                (int32_t)(id(g_proactive_deadline_ms) - millis()) > 0;
+          then:
+            - lambda: |-
+                id(g_va_phase) = 1; // keep listening
+                id(va_render).execute();
+            - script.execute: ring_update_state
+            - voice_assistant.start:
+          else:
+            - script.execute: va_teardown
+
+  - id: va_teardown  # [VA]
+    mode: restart
+    then:
       - lambda: |-
+          id(g_va_proactive) = false;
+          id(g_proactive_deadline_ms) = 0;
           if (!id(g_va_active) && !id(g_ptt_started)) return;
           id(g_va_phase) = 0;
           id(g_va_active) = false;
@@ -1660,6 +1770,15 @@ script:
             lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
+          } else if (phase == 5) { // Proactive ask
+            lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(id(va_icon), "\xF3\xB0\x8D\xAC"); // Mic
+            lv_obj_set_style_text_color(id(va_icon), color_thinking, LV_PART_MAIN);
+            lv_obj_add_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_color(id(va_status_label), color_thinking, LV_PART_MAIN);
+            lv_label_set_text(id(va_status_label), "正在提问");
           } else if (phase == 4) { // Error
             lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(id(va_icon), "✕");
@@ -1667,6 +1786,7 @@ script:
             lv_obj_add_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_color(id(va_status_label), color_error, LV_PART_MAIN);
             lv_label_set_text(id(va_status_label), "出现错误");
           }
 
@@ -2217,18 +2337,6 @@ script:
             snprintf(text, sizeof(text), "%02d:%02d", now.hour, now.minute);
             id(g_aod_clock) = text;
           }
-      - lvgl.label.update:
-          id: lbl_aod_time_g1
-          text: !lambda 'return id(g_aod_clock);'
-      - lvgl.label.update:
-          id: lbl_aod_time_g2
-          text: !lambda 'return id(g_aod_clock);'
-      - lvgl.label.update:
-          id: lbl_aod_time_g3
-          text: !lambda 'return id(g_aod_clock);'
-      - lvgl.label.update:
-          id: lbl_aod_time_g4
-          text: !lambda 'return id(g_aod_clock);'
       - lvgl.label.update:
           id: lbl_aod_time
           text: !lambda 'return id(g_aod_clock);'
@@ -3051,12 +3159,6 @@ interval:
                   lv_label_set_text(id(va_bars), waves[frame % 5]);
                 }
 
-image:
-  - platform: file
-    file: lockscreen_bg.jpg
-    id: img_lockscreen_bg
-    type: RGB565
-
 font:
   # P6 typography. Local TTFs are used instead of `gfonts://` so the exact
   # Roboto Mono Medium / Noto Sans SC weights are embedded deterministically and
@@ -3123,7 +3225,7 @@ font:
     id: font_sc_24
     size: 24
     bpp: 4
-    glyphs: &p6_glyphs " !%()+,-./0123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz年月日星期一二三四五六天·客餐厅电视音量箱吸顶灯带亮度色温相空调目标模式本机屏幕进设备离线正在同步时间低中高制冷热自动送风除湿关闭已打开暂停播放当前魔法旋钮元旦春节清明劳端午秋国庆圣诞复活万情人母父感恩无效连接失败听请重试上下左右暖扇扬声器圆盘地↔▶Ⅱ°—充锁"
+    glyphs: &p6_glyphs " !%()+,-./0123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz年月日星期一二三四五六天·客餐厅电视音量箱吸顶灯带亮度色温相空调目标模式本机屏幕进设备离线正在同步时间低中高制冷热自动送风除湿关闭已打开暂停播放当前魔法旋钮元旦春节清明劳端午秋国庆圣诞复活万情人母父感恩无效连接失败听请重试上下左右暖扇扬声器圆盘地提问↔▶Ⅱ°—充锁"
   # Hero value fonts run at bpp 4 again: the 16 MB partition table (~7.94 MB app
   # slot) leaves plenty of room, so the ~400 KB of 52 px / 44 px bitmaps that
   # forced the earlier bpp 2 downgrade are no longer a problem. Glyph sets stay
@@ -3504,70 +3606,10 @@ lvgl:
 
     # Low-refresh LCD AOD: exact P6 geometry, minute-only updates, no calendar placeholder.
     - id: page_aod
-      bg_color: ${color_bg_aod}
+      bg_color: 0x000000
       widgets:
-        - image:
-            id: img_aod_bg
-            src: img_lockscreen_bg
-            x: 0
-            y: 0
-            align: TOP_LEFT
-            clickable: false
-        # Four dark offset copies form the glow/outline halo that keeps the
-        # white Pacifico digits legible over the photo. They are declared first
-        # so the crisp white glyphs always render on top of them.
-        - label:
-            id: lbl_aod_time_g1
-            align: CENTER
-            x: -3
-            y: -27
-            width: 360
-            text_align: CENTER
-            text: "--:--"
-            text_font: font_pacifico_aod
-            text_color: 0x000000
-            text_opa: 70%
-            bg_opa: TRANSP
-            clickable: false
-        - label:
-            id: lbl_aod_time_g2
-            align: CENTER
-            x: 3
-            y: -27
-            width: 360
-            text_align: CENTER
-            text: "--:--"
-            text_font: font_pacifico_aod
-            text_color: 0x000000
-            text_opa: 70%
-            bg_opa: TRANSP
-            clickable: false
-        - label:
-            id: lbl_aod_time_g3
-            align: CENTER
-            x: 0
-            y: -30
-            width: 360
-            text_align: CENTER
-            text: "--:--"
-            text_font: font_pacifico_aod
-            text_color: 0x000000
-            text_opa: 70%
-            bg_opa: TRANSP
-            clickable: false
-        - label:
-            id: lbl_aod_time_g4
-            align: CENTER
-            x: 0
-            y: -24
-            width: 360
-            text_align: CENTER
-            text: "--:--"
-            text_font: font_pacifico_aod
-            text_color: 0x000000
-            text_opa: 70%
-            bg_opa: TRANSP
-            clickable: false
+        # Pure black AOD background: the lockscreen photo was removed, so no
+        # halo copies are needed behind the digits.
         - label:
             id: lbl_aod_time
             align: CENTER
