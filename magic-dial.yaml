@@ -25,6 +25,10 @@ substitutions:
   tv_remote_entity: remote.sony_k_55xr50
   homepod_entity: media_player.ke_ting_ke_ting
   ceiling_light_entity: light.opple_cn_246509731_bydceiling_s_2_light
+  # The ceiling lamp is fed through a wall relay. With the relay off the lamp has
+  # no power at all, so a bare `light.toggle` silently does nothing. Tap on the
+  # ceiling target therefore switches the relay first (see `on_tap`).
+  ceiling_power_entity: switch.lumi_cn_lumi_4cf8cdf3c7cea70_l3acn3_on_p_4_1
   strip_light_entity: light.yeelink_cn_48303523_strip1_s_2_light
   dining_room_climate_entity: climate.24dfa79bdf8f
   living_room_climate_entity: climate.24dfa7d09617
@@ -37,7 +41,7 @@ substitutions:
   # [VA] Proactive ask. `satellite_entity` is this device's assist_satellite
   # entity in HA; `assist_satellite.start_conversation` is what makes the dial
   # speak first and then listen. Adjust if the entity id differs.
-  satellite_entity: assist_satellite.magic_dial_assist_satellite
+  satellite_entity: assist_satellite.ke_ting_magic_dial_assist_satellite
   # Seconds the dial keeps listening after a proactive question before it gives
   # up and returns to the previous screen.
   proactive_listen_seconds: "10"
@@ -903,6 +907,15 @@ text_sensor:
   - platform: homeassistant
     id: ceiling_light_state
     entity_id: ${ceiling_light_entity}
+    internal: true
+    on_value:
+      - script.execute: sync_from_ha
+
+  # Wall relay feeding the ceiling lamp. Tracked so tap knows whether it must
+  # power the lamp up before talking to the light entity.
+  - platform: homeassistant
+    id: ceiling_power_state
+    entity_id: ${ceiling_power_entity}
     internal: true
     on_value:
       - script.execute: sync_from_ha
@@ -2578,7 +2591,19 @@ script:
       - if:
           condition: { lambda: 'return id(g_target) == 2;' }
           then:
-            - homeassistant.action: { action: light.toggle, data: { entity_id: '${ceiling_light_entity}' } }
+            # The lamp sits behind a wall relay. If the relay is off the light
+            # entity is dead/unavailable, so close the relay first, give the lamp
+            # a moment to join, then explicitly turn it on. Once powered, tap
+            # behaves as a plain light toggle and the relay is left closed.
+            - if:
+                condition:
+                  lambda: 'return id(ceiling_power_state).state != "on";'
+                then:
+                  - homeassistant.action: { action: switch.turn_on, data: { entity_id: '${ceiling_power_entity}' } }
+                  - delay: 1500ms
+                  - homeassistant.action: { action: light.turn_on, data: { entity_id: '${ceiling_light_entity}' } }
+                else:
+                  - homeassistant.action: { action: light.toggle, data: { entity_id: '${ceiling_light_entity}' } }
       - if:
           condition: { lambda: 'return id(g_target) == 3;' }
           then:
@@ -3654,45 +3679,78 @@ lvgl:
     - id: page_va  # [VA]
       bg_color: ${color_bg_canvas}
       widgets:
+        # [VA] Static outer ring: gives the round canvas a visible frame so the
+        # assistant state always reads as centred on the 360x360 display.
+        # NOTE: never combine `x`/`y` with `align:` here -- in LVGL x/y are
+        # offsets *from* the alignment point, so `x: 180, y: 180, align: CENTER`
+        # pushes a widget 180 px right/down and off the visible circle.
+        - arc:
+            id: va_frame
+            align: CENTER
+            width: 320
+            height: 320
+            arc_width: 2
+            min_value: 0
+            max_value: 100
+            value: 0
+            start_angle: 0
+            end_angle: 360
+            adjustable: false
+            arc_color: 0x0E2A33
+            indicator:
+              arc_opa: 0%
+        # [VA] Rotating progress arc (thinking phase). The 100ms interval calls
+        # lv_arc_set_rotation() on this widget.
+        - arc:
+            id: va_arc
+            align: CENTER
+            width: 296
+            height: 296
+            arc_width: 6
+            min_value: 0
+            max_value: 100
+            value: 22
+            start_angle: 0
+            end_angle: 360
+            adjustable: false
+            arc_opa: 0%
+            indicator:
+              arc_color: ${color_va_thinking}
+            hidden: true
+        # [VA] Centre stack: icon on the optical centre, level bars just below.
         - obj:
             id: va_core
-            x: 180
-            y: 180
-            width: 148
-            height: 148
             align: CENTER
+            width: 200
+            height: 120
             bg_opa: TRANSP
-            radius: 74
+            border_width: 0
+            pad_all: 0
             widgets:
               - label:
                   id: va_icon
                   align: CENTER
+                  y: -18
                   text: ""
                   text_font: font_icons_28
+                  text_align: CENTER
                   text_color: ${color_va_listening}
               - label:
                   id: va_bars
-                  align: BOTTOM_MID
-                  y: -20
+                  align: CENTER
+                  y: 30
                   text: "|||||"
                   text_font: font_sc_18
+                  text_align: CENTER
                   text_color: ${color_va_listening}
-        - arc:
-            id: va_arc
-            x: 180
-            y: 180
-            width: 160
-            height: 160
-            align: CENTER
-            bg_opa: TRANSP
-            arc_width: 4
-            rotation: 270
-            arc_color: ${color_va_listening}
         - label:
             id: va_status_label
-            x: 180
-            y: 280
             align: CENTER
+            y: 100
+            width: 240
             text: ""
             text_font: font_sc_18
+            text_align: CENTER
+            long_mode: CLIP
             text_color: ${color_va_error}
+            hidden: true
