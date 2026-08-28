@@ -16,6 +16,9 @@ substitutions:
   color_media: "0x49A8FF"
   color_light: "0xFFC05A"
   color_local: "0x45D6C5"
+  color_va_listening: "0x35D07F"  # [VA]
+  color_va_thinking: "0x8B7CFF"   # [VA]
+  color_va_error: "0xFF6B6B"      # [VA]
 
   # Home Assistant entities. Change only these substitutions if entity IDs differ.
   tv_entity: media_player.sony_k_55xr50
@@ -317,6 +320,43 @@ microphone:
     sample_rate: 16000
     bits_per_sample: 16bit
 
+voice_assistant:  # [VA]
+  id: magic_dial_va
+  microphone: magic_dial_microphone
+  speaker: magic_dial_speaker
+  use_wake_word: false
+  on_listening:
+    - lambda: |-
+        id(g_va_active) = true;
+        id(g_va_phase) = 1; // listening
+        id(g_va_started_ms) = millis();
+        id(va_render).execute();
+    - script.execute: ring_update_state
+  on_stt_end:
+    - lambda: |-
+        id(g_va_phase) = 2; // thinking
+        id(va_render).execute();
+        id(dac_unmute).turn_off(); // Mute thinking
+    - script.execute: ring_update_state
+  on_tts_start:
+    - lambda: 'id(g_va_tts_started) = true;'
+  on_tts_stream_start:
+    - lambda: |-
+        id(g_va_phase) = 3; // speaking
+        id(va_render).execute();
+        id(dac_unmute).turn_on();
+    - script.execute: va_duck_external_media
+    - script.execute: ring_update_state
+  on_tts_stream_end:
+    - script.execute: va_cleanup
+  on_end:
+    - if:
+        condition: { lambda: 'return !id(g_va_tts_started);' }
+        then:
+          - script.execute: va_cleanup
+  on_error:
+    - script.execute: va_fail
+
 # ST77916 QSPI display bus.
 spi:
   id: display_qspi
@@ -365,6 +405,48 @@ light:
           update_interval: 40ms
           lambda: |-
             const int n = it.size();
+            if (id(g_va_active)) {  // [VA]
+              const int phase = id(g_va_phase);
+              if (id(g_va_release_flash)) {
+                it.all() = Color(255, 255, 255);
+                return;
+              }
+              if (phase == 1) { // Listening: Green breathing
+                const float pulse = 0.6f + 0.4f * sinf(millis() * 0.01f);
+                it.all() = Color(0x35D07F) * pulse;
+              } else if (phase == 2) { // Thinking: White head + purple/blue trail
+                const float elapsed = (float)millis();
+                float head = fmodf(elapsed / 1000.0f * n, (float)n);
+                for (int i = 0; i < n; i++) {
+                  float d = head - i;
+                  while (d < 0) d += n;
+                  while (d >= n) d -= n;
+                  if (d < 1.0f) it[i] = Color(255, 255, 255);
+                  else if (d < 6.0f) {
+                    float t = (d - 1.0f) / 5.0f;
+                    it[i] = Color((uint8_t)(0x8B + (0x49 - 0x8B) * t),
+                                  (uint8_t)(0x7C + (0xA8 - 0x7C) * t),
+                                  (uint8_t)(0xFF + (0xFF - 0xFF) * t));
+                  } else it[i] = Color(0, 0, 0);
+                }
+              } else if (phase == 3) { // Speaking: Blue mirrored waveform
+                const float elapsed = (float)millis();
+                for (int i = 0; i < n; i++) {
+                  int dist = abs(i - 6);
+                  float wave = 0.5f + 0.5f * sinf(elapsed * 0.02f - dist * 0.8f);
+                  it[i] = Color(0x49A8FF) * wave;
+                }
+              } else if (phase == 4) { // Error: Coral red slow double flash
+                const float t = fmodf(millis(), 2000.0f);
+                float pulse = 0.0f;
+                if (t < 200.0f) pulse = t / 200.0f;
+                else if (t < 400.0f) pulse = 1.0f - (t - 200.0f) / 200.0f;
+                else if (t < 600.0f) pulse = (t - 400.0f) / 200.0f;
+                else if (t < 800.0f) pulse = 1.0f - (t - 600.0f) / 200.0f;
+                it.all() = Color(0xFF6B6B) * pulse;
+              }
+              return;
+            }
             if (id(g_sleeping)) {
               it.all() = Color(0, 0, 0);
               return;
@@ -635,6 +717,7 @@ touchscreen:
           id(g_touch_dx) = 0;
           id(g_touch_dy) = 0;
           id(g_touch_t0) = millis();
+          id(g_touch_down) = true;   // [VA]
           id(g_wake_consume) = id(g_sleeping);
           id(g_last_activity) = millis();
 
@@ -686,6 +769,7 @@ touchscreen:
             lambda: 'return id(g_sleeping);'
           then:
             - script.execute: wake_display
+      - script.execute: ptt_long_press  # [VA]
     on_update:
       - lambda: |-
           if (!touches.empty()) {
@@ -695,6 +779,13 @@ touchscreen:
           id(g_last_activity) = millis();
     on_release:
       - lambda: |-
+          id(g_touch_down) = false; // [VA]
+          if (id(g_ptt_started)) {  // [VA]
+            id(g_va_phase) = 2; // thinking
+            id(va_render).execute();
+            id(va_ptt_release_feedback).execute();
+            return; // [VA]
+          }
           // The panel is rotated 180 deg in hardware, but the touch controller
           // still reports raw unrotated coordinates, so both axes must be
           // negated for swipe direction to match what the user sees.
@@ -740,7 +831,14 @@ touchscreen:
           }
           id(g_gesture) = gesture;
           id(g_last_activity) = millis();
-      - script.execute: dispatch_gesture
+      - if: # [VA]
+          condition: { lambda: 'return id(g_ptt_started);' }
+          then:
+            - voice_assistant.stop:
+      - if: # [VA]
+          condition: { lambda: 'return !id(g_ptt_started);' }
+          then:
+            - script.execute: dispatch_gesture
 
 # Home Assistant time drives the sleep clock and Chinese date/weekday text.
 time:
@@ -1182,6 +1280,39 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
+  - id: g_va_phase  # [VA] 0: idle, 1: listening, 2: thinking, 3: speaking, 4: error
+    type: int
+    initial_value: '0'
+  - id: g_va_active  # [VA]
+    type: bool
+    initial_value: 'false'
+  - id: g_va_tts_started  # [VA]
+    type: bool
+    initial_value: 'false'
+  - id: g_va_started_ms  # [VA]
+    type: uint32_t
+    initial_value: '0'
+  - id: g_va_dac_was_unmuted  # [VA]
+    type: bool
+    initial_value: 'false'
+  - id: g_va_return_to_aod  # [VA]
+    type: bool
+    initial_value: 'false'
+  - id: g_va_duck_volume_snapshot  # [VA]
+    type: float
+    initial_value: '0.0'
+  - id: g_va_ducked_target  # [VA] -1: none, 0: tv, 1: homepod
+    type: int
+    initial_value: '-1'
+  - id: g_touch_down  # [VA]
+    type: bool
+    initial_value: 'false'
+  - id: g_ptt_started  # [VA]
+    type: bool
+    initial_value: 'false'
+  - id: g_va_release_flash  # [VA]
+    type: bool
+    initial_value: 'false'
   # Battery state, ported from the upstream Guition VA project. There is no STAT
   # pin wired to a GPIO on the JC3636K718C dock, so charging is inferred from the
   # rail voltage instead.
@@ -1378,6 +1509,167 @@ script:
       - lambda: 'id(g_ring_feedback) = 0;'
       - script.execute: ring_update_state
 
+  - id: va_prepare # [VA]
+    then:
+      - lambda: |-
+          id(g_va_phase) = 1; // [VA]
+          id(g_va_active) = true;
+          id(g_va_tts_started) = false;
+          id(g_va_started_ms) = millis();
+          id(g_manual_until) = millis() + 60000;
+          id(g_va_dac_was_unmuted) = id(dac_unmute).state;
+          id(g_va_return_to_aod) = id(g_sleeping);
+          id(dac_unmute).turn_off();
+          id(va_render).execute();
+      - lvgl.page.show: page_va
+      - voice_assistant.start:
+      - script.execute: ring_update_state
+
+  - id: va_cleanup  # [VA]
+    mode: restart
+    then:
+      - lambda: |-
+          if (!id(g_va_active) && !id(g_ptt_started)) return;
+          id(g_va_phase) = 0;
+          id(g_va_active) = false;
+          id(g_ptt_started) = false;
+          id(g_last_activity) = millis();
+          id(g_manual_until) = millis() + 3000;
+          if (id(g_va_dac_was_unmuted)) id(dac_unmute).turn_on(); else id(dac_unmute).turn_off();
+      - script.execute: va_restore_external_media
+      - script.execute: ring_update_state
+      - if:
+          condition: { lambda: 'return id(g_va_return_to_aod);' }
+          then:
+            - script.execute: enter_sleep
+          else:
+            - lvgl.page.show: page_main
+            - script.execute: render_main
+
+  - id: va_fail  # [VA]
+    then:
+      - lambda: |-
+          id(g_va_phase) = 4;
+          id(va_render).execute();
+      - script.execute: ring_update_state
+      - delay: 1200ms
+      - script.execute: va_cleanup
+
+  - id: ptt_long_press  # [VA]
+    mode: restart
+    then:
+      - delay: 600ms
+      - if:
+          condition:
+            lambda: |-
+              return id(g_touch_down) && !id(g_ptt_started) && !id(g_wake_consume) && !id(g_va_active) &&
+                abs(id(g_touch_dx)) <= 50 && abs(id(g_touch_dy)) <= 50;
+          then:
+            - lambda: 'id(g_ptt_started) = true;'
+            - script.execute: va_prepare
+
+  - id: va_ptt_release_feedback  # [VA]
+    mode: restart
+    then:
+      - lambda: 'id(g_va_release_flash) = true; id(va_render).execute();'
+      - delay: 100ms
+      - lambda: 'id(g_va_release_flash) = false; id(va_render).execute();'
+
+  - id: va_duck_external_media  # [VA]
+    then:
+      - lambda: |-
+          id(g_va_ducked_target) = -1;
+          if (id(g_target) == 0) {
+            id(g_va_duck_volume_snapshot) = id(tv_volume).state;
+            id(g_va_ducked_target) = 0;
+          } else if (id(g_target) == 1) {
+            id(g_va_duck_volume_snapshot) = id(homepod_volume).state;
+            id(g_va_ducked_target) = 1;
+          }
+      - if:
+          condition: { lambda: 'return id(g_va_ducked_target) == 0;' }
+          then:
+            - homeassistant.action:
+                action: media_player.volume_set
+                data:
+                  entity_id: ${tv_entity}
+                  volume_level: "0.20"
+      - if:
+          condition: { lambda: 'return id(g_va_ducked_target) == 1;' }
+          then:
+            - homeassistant.action:
+                action: media_player.volume_set
+                data:
+                  entity_id: ${homepod_entity}
+                  volume_level: "0.20"
+
+  - id: va_restore_external_media  # [VA]
+    then:
+      - if:
+          condition: { lambda: 'return id(g_va_ducked_target) == 0;' }
+          then:
+            - if:
+                condition: { lambda: 'return abs(id(tv_volume).state - 0.20f) <= 0.03f;' }
+                then:
+                  - homeassistant.action:
+                      action: media_player.volume_set
+                      data:
+                        entity_id: ${tv_entity}
+                        volume_level: !lambda 'char buf[8]; snprintf(buf, 8, "%.2f", id(g_va_duck_volume_snapshot)); return std::string(buf);'
+      - if:
+          condition: { lambda: 'return id(g_va_ducked_target) == 1;' }
+          then:
+            - if:
+                condition: { lambda: 'return abs(id(homepod_volume).state - 0.20f) <= 0.03f;' }
+                then:
+                  - homeassistant.action:
+                      action: media_player.volume_set
+                      data:
+                        entity_id: ${homepod_entity}
+                        volume_level: !lambda 'char buf[8]; snprintf(buf, 8, "%.2f", id(g_va_duck_volume_snapshot)); return std::string(buf);'
+      - lambda: 'id(g_va_ducked_target) = -1;'
+
+  - id: va_render  # [VA]
+    then:
+      - lambda: |-
+          auto phase = id(g_va_phase);
+          auto color_listening = lv_color_hex(0x35D07F);
+          auto color_thinking = lv_color_hex(0x8B7CFF);
+          auto color_speaking = lv_color_hex(0x49A8FF);
+          auto color_error = lv_color_hex(0xFF6B6B);
+
+          if (phase == 1) { // Listening
+            lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(id(va_icon), "󰍬"); // Mic
+            lv_obj_set_style_text_color(id(va_icon), color_listening, LV_PART_MAIN);
+            lv_obj_set_style_text_color(id(va_bars), color_listening, LV_PART_MAIN);
+            lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
+          } else if (phase == 2) { // Thinking
+            lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(id(va_icon), "...");
+            lv_obj_set_style_text_color(id(va_icon), color_thinking, LV_PART_MAIN);
+            lv_obj_add_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_arc_color(id(va_arc), color_thinking, LV_PART_INDICATOR);
+            lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
+          } else if (phase == 3) { // Speaking
+            lv_obj_clear_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_color(id(va_bars), color_speaking, LV_PART_MAIN);
+            lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
+          } else if (phase == 4) { // Error
+            lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(id(va_icon), "✕");
+            lv_obj_set_style_text_color(id(va_icon), color_error, LV_PART_MAIN);
+            lv_obj_add_flag(id(va_bars), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(va_arc), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(id(va_status_label), "出现错误");
+          }
+
   - id: knob_visual_settle
     mode: restart
     then:
@@ -1421,6 +1713,10 @@ script:
   - id: sync_from_ha
     mode: restart
     then:
+      - if: # [VA]
+          condition: { lambda: 'return id(g_va_active);' }
+          then:
+            - script.stop: sync_from_ha
       - delay: 50ms
       - lambda: |-
           if (id(g_optimistic_valid) && millis() - id(g_knob_last_rotate_ms) > 2000)
@@ -1439,6 +1735,10 @@ script:
 
   - id: resolve_priority
     then:
+      - if: # [VA]
+          condition: { lambda: 'return id(g_va_active);' }
+          then:
+            - script.stop: resolve_priority
       - lambda: |-
           const std::string tv = id(tv_state).state;
           const std::string homepod = id(homepod_state).state;
@@ -1992,6 +2292,10 @@ script:
     parameters:
       direction: int
     then:
+      - if: # [VA]
+          condition: { lambda: 'return id(g_va_active);' }
+          then:
+            - script.stop: cycle_target
       - lambda: |-
           // Swipes walk the FULL fixed target order and never skip anything: an
           // inactive device is still reachable so it can be turned on from the dial.
@@ -2055,6 +2359,10 @@ script:
     parameters:
       direction: int
     then:
+      - if: # [VA]
+          condition: { lambda: 'return id(g_va_active);' }
+          then:
+            - script.stop: switch_mode
       - lambda: |-
           // 本机 (target 7) has four modes: 本机音量 / 屏幕亮度 / 锁屏亮度 / 电量. Every
           // other target still has two, where cycling either way is the same toggle.
@@ -2107,6 +2415,10 @@ script:
 
   - id: handle_tap
     then:
+      - if: # [VA]
+          condition: { lambda: 'return id(g_va_active);' }
+          then:
+            - script.stop: handle_tap
       - if:
           condition: { lambda: 'return id(g_target) == 0;' }
           then:
@@ -2278,6 +2590,10 @@ script:
     parameters:
       direction: int
     then:
+      - if: # [VA]
+          condition: { lambda: 'return id(g_va_active);' }
+          then:
+            - script.stop: handle_knob
       - lambda: |-
           const uint32_t now = millis();
           const uint32_t previous_rotate = id(g_knob_last_rotate_ms);
@@ -2701,11 +3017,39 @@ interval:
           then:
             - lambda: 'id(g_chg_anim) = (id(g_chg_anim) + 1) % 5;'
             - script.execute: render_main
+      - if: # [VA]
+          condition: { lambda: 'return id(g_va_active) && millis() - id(g_va_started_ms) > 120000;' }
+          then:
+            - voice_assistant.stop:
+            - script.execute: va_cleanup
       - if:
           condition:
             lambda: 'return !id(g_sleeping) && millis() - id(g_last_activity) >= 60000;'
           then:
             - script.execute: enter_sleep
+
+  - interval: 100ms # [VA]
+    then:
+      - if:
+          condition: { lambda: 'return id(g_va_active);' }
+          then:
+            - lambda: |-
+                auto phase = id(g_va_phase);
+                if (phase == 1) { // Listening bars
+                  static int frame = 0;
+                  frame++;
+                  const char* bars[] = {"|    ", "||   ", "|||  ", "|||| ", "|||||", " ||||", "  |||", "   ||", "    |"};
+                  lv_label_set_text(id(va_bars), bars[frame % 9]);
+                } else if (phase == 2) { // Thinking arc rotation
+                  static int angle = 0;
+                  angle = (angle + 20) % 360;
+                  lv_arc_set_rotation(id(va_arc), angle);
+                } else if (phase == 3) { // Speaking wave
+                  static int frame = 0;
+                  frame++;
+                  const char* waves[] = {"  -  ", " --- ", "-----", " --- ", "  -  "};
+                  lv_label_set_text(id(va_bars), waves[frame % 5]);
+                }
 
 image:
   - platform: file
@@ -3264,3 +3608,49 @@ lvgl:
             bg_opa: 40%
             radius: 8
             pad_all: 2
+
+    - id: page_va  # [VA]
+      bg_color: ${color_bg_canvas}
+      widgets:
+        - obj:
+            id: va_core
+            x: 180
+            y: 180
+            width: 148
+            height: 148
+            align: CENTER
+            bg_opa: TRANSP
+            radius: 74
+            widgets:
+              - label:
+                  id: va_icon
+                  align: CENTER
+                  text: ""
+                  text_font: font_icons_28
+                  text_color: ${color_va_listening}
+              - label:
+                  id: va_bars
+                  align: BOTTOM_MID
+                  y: -20
+                  text: "|||||"
+                  text_font: font_sc_18
+                  text_color: ${color_va_listening}
+        - arc:
+            id: va_arc
+            x: 180
+            y: 180
+            width: 160
+            height: 160
+            align: CENTER
+            bg_opa: TRANSP
+            arc_width: 4
+            rotation: 270
+            arc_color: ${color_va_listening}
+        - label:
+            id: va_status_label
+            x: 180
+            y: 280
+            align: CENTER
+            text: ""
+            text_font: font_sc_18
+            text_color: ${color_va_error}
