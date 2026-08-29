@@ -408,18 +408,42 @@ voice_assistant:  # [VA]
     - lambda: |-
         id(g_va_active) = true;
         id(g_va_phase) = 1; // listening
+        id(g_va_error_text) = "";
         id(g_va_started_ms) = millis();
         id(va_render).execute();
     - script.execute: ring_update_state
+  # [VA] VAD edges do not change the phase -- the screen already says
+  # "listening..." and flipping it on every speech edge would flicker. They are
+  # logged only, which is enough to debug why a turn did or did not close.
+  on_stt_vad_start:
+    - logger.log:
+        level: INFO
+        format: "[VA] stt vad start (speech detected)"
+  on_stt_vad_end:
+    - logger.log:
+        level: INFO
+        format: "[VA] stt vad end (turn closing)"
   on_stt_end:
     - lambda: |-
+        // The transcript goes to the log, NOT to the screen: the embedded
+        // Chinese font only carries the ~200 hanzi of the UI itself, so an
+        // arbitrary transcript would draw as empty boxes.
+        ESP_LOGI("va", "STT text: %s", x.c_str());
         id(g_va_stt_seen) = true;
         id(g_va_phase) = 2; // thinking
         id(va_render).execute();
         id(dac_unmute).turn_off(); // Mute thinking
     - script.execute: ring_update_state
   on_tts_start:
-    - lambda: 'id(g_va_tts_started) = true;'
+    - lambda: |-
+        ESP_LOGI("va", "TTS text: %s", x.c_str());
+        id(g_va_tts_started) = true;
+  # [VA] Audio playback end. The actual teardown hangs off on_tts_stream_end
+  # (the stream, not the text), so this is log-only on purpose.
+  on_tts_end:
+    - logger.log:
+        level: INFO
+        format: "[VA] tts finished"
   on_tts_stream_start:
     - lambda: |-
         id(g_va_phase) = 3; // speaking
@@ -435,6 +459,14 @@ voice_assistant:  # [VA]
         then:
           - script.execute: va_cleanup
   on_error:
+    # `code` is short and ASCII (e.g. stt-no-text-recognized), so it is safe to
+    # put on screen; the human-readable `message` may be Chinese and is logged.
+    - lambda: |-
+        ESP_LOGE("va", "error code=%s message=%s", code.c_str(), message.c_str());
+        std::string reason = code;
+        if (reason.size() > 24) reason.resize(24);
+        id(g_va_error_text) = reason.empty() ? std::string("error")
+                                             : std::string("error: ") + reason;
     - script.execute: va_fail
 
 # ST77916 QSPI display bus.
@@ -1389,6 +1421,17 @@ globals:
   - id: g_va_phase  # [VA] 0: idle, 1: listening, 2: thinking, 3: speaking, 4: error, 5: proactive ask
     type: int
     initial_value: '0'
+  - id: g_va_pulse_step  # [VA] frame counter for the thinking '|' pulse
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # [VA] Short ASCII reason shown next to `error`. A global rather than a label
+  # write at the trigger site, so va_render stays the single place that decides
+  # what the screen says.
+  - id: g_va_error_text
+    type: std::string
+    restore_value: no
+    initial_value: '""'
   - id: g_va_active  # [VA]
     type: bool
     initial_value: 'false'
@@ -1742,6 +1785,9 @@ script:
       # watchdog and the 120 s ceiling) restores the proxy. A missed restore would
       # silently leave the whole house's BLE proxy dead until the next reboot.
       - esp32_ble_tracker.start_scan:
+      # Idle render pass: blanks va_icon / va_text and stops va_think_pulse, so
+      # nothing is left painted on the page we are navigating away from.
+      - script.execute: va_render
       - script.execute: va_restore_external_media
       - script.execute: ring_update_state
       - if:
@@ -1848,77 +1894,68 @@ script:
   - id: va_render  # [VA]
     then:
       - lambda: |-
-          auto phase = id(g_va_phase);
-          auto color_thinking = lv_color_hex(0x8B7CFF);
-          auto color_error = lv_color_hex(0xFF6B6B);
-          // All three pre-rendered ribbons start hidden on every render pass so
-          // exactly one can be revealed below; nothing can leak between states.
-          lv_obj_add_flag(id(va_flow_listen), LV_OBJ_FLAG_HIDDEN);
-          lv_obj_add_flag(id(va_flow_think), LV_OBJ_FLAG_HIDDEN);
-          lv_obj_add_flag(id(va_flow_speak), LV_OBJ_FLAG_HIDDEN);
+          // Plain LVGL rendering: one big mic glyph plus a short ASCII status
+          // line. Deliberately NO STT/TTS text on screen -- the only Chinese
+          // faces in this build (font_sc_*) carry ~200 hand-picked hanzi from
+          // the &p6_glyphs anchor, so arbitrary transcripts would render as
+          // blank boxes. A full CJK set is several MB at bpp4, which this
+          // build has just finished optimising away. The recognised text is
+          // logged instead (see voice_assistant on_stt_end / on_tts_start).
+          const auto phase = id(g_va_phase);
+          const auto color_listening = lv_color_hex(0x00FF88);
+          const auto color_thinking  = lv_color_hex(0xCC44FF);
+          const auto color_speaking  = lv_color_hex(0x00CCFF);
+          const auto color_error     = lv_color_hex(0xFF4444);
 
-          if (phase == 1) { // Listening
-            // Ribbon only - no "请说话" label and no mic glyph. The calm green
-            // flow is enough to read the state, and dropping the icon keeps the
-            // screen clean rather than stacking two redundant indicators.
-            lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(id(va_flow_listen), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
-          } else if (phase == 2) { // Thinking
-            lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(id(va_flow_think), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
-          } else if (phase == 3) { // Speaking / answering
-            lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(id(va_flow_speak), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
-          } else if (phase == 5) { // Proactive ask
-            lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(id(va_icon), "\xF3\xB0\x8D\xAC"); // Mic
-            lv_obj_set_style_text_color(id(va_icon), color_thinking, LV_PART_MAIN);
-            lv_obj_clear_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_color(id(va_status_label), color_thinking, LV_PART_MAIN);
-            lv_label_set_text(id(va_status_label), "正在提问");
-          } else if (phase == 4) { // Error
-            lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(id(va_icon), "\xF3\xB0\x85\x96"); // mdi-close
-            lv_obj_set_style_text_color(id(va_icon), color_error, LV_PART_MAIN);
-            lv_obj_clear_flag(id(va_status_label), LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_text_color(id(va_status_label), color_error, LV_PART_MAIN);
-            lv_label_set_text(id(va_status_label), "出现错误");
+          lv_color_t c = color_listening;
+          const char *text = "";
+          bool show = true;
+          switch (phase) {
+            case 1: c = color_listening; text = "listening..."; break;
+            case 2: c = color_thinking;  text = ""; break; // va_think_pulse writes it
+            case 3: c = color_speaking;  text = "speaking..."; break;
+            case 4: c = color_error;     text = id(g_va_error_text).empty() ? "error"
+                                                : id(g_va_error_text).c_str(); break;
+            case 5: c = color_thinking;  text = "asking..."; break;
+            default: show = false; break;
           }
 
-      # [VA] 2026-08-29: the three ribbons used to be `auto_start: true` +
-      # `repeat_count: forever`, so all 60 frames' worth of LVGL animation
-      # timers ran permanently -- even while hidden and even on other pages.
-      #
-      # Second finding, from the heap telemetry: while a ribbon actually plays,
-      # `heap_max_block` collapses from 31 KB to 7.6 KB and repeatedly down into
-      # the 0.4-3.5 KB range, because LVGL allocates image draw/cache buffers
-      # from internal RAM for every 264x88 RGB565 frame. That is the very pool
-      # `mic_task` (4 KB contiguous) and the I2S DMA descriptors live in. So the
-      # ribbons are simultaneously a CPU/redraw cost AND a memory cost.
-      #
-      # Therefore the ribbons are rate-limited rather than frozen. Freezing
-      # listening/speaking on a still frame did fix the audio, but it looked
-      # dead. Instead `va_flow_listen` / `va_flow_speak` now play every SECOND
-      # frame (10 of the 20) over the same 900 ms cycle: the ribbon flows at
-      # exactly the original speed, but the redraw count and the per-frame LVGL
-      # image-cache allocation both drop by half during the phases where audio
-      # is actually streaming. `thinking` keeps the full 20-frame sequence --
-      # the mic is closed and TTS has not started, so it can afford the detail.
-      - if:
-          condition: { lambda: 'return id(g_va_phase) == 1;' }
-          then: [{ lvgl.animimg.start: va_flow_listen }]
-          else: [{ lvgl.animimg.stop: va_flow_listen }]
-      - if:
-          condition: { lambda: 'return id(g_va_phase) == 3;' }
-          then: [{ lvgl.animimg.start: va_flow_speak }]
-          else: [{ lvgl.animimg.stop: va_flow_speak }]
-      - if:
+          // Both widgets always exist and stay visible while a session runs;
+          // only colour and text change, so there is no hide/show flicker.
+          lv_obj_set_style_text_color(id(va_icon), c, LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(va_text), c, LV_PART_MAIN);
+          lv_label_set_text(id(va_icon), show ? "\xF3\xB0\x8D\xAC" : "");
+          if (phase != 2) lv_label_set_text(id(va_text), text);
+
+          // Guard the pulse from the render pass itself rather than from every
+          // caller: any phase change funnels through va_render, so starting and
+          // stopping here cannot be forgotten on a new code path.
+          if (phase == 2) id(va_think_pulse).execute();
+          else id(va_think_pulse).stop();
+
+  # [VA] Thinking indicator: | -> || -> ||| -> || -> | at 200 ms.
+  # A `script` with `mode: restart` rather than a global `interval:` because an
+  # interval cannot be started and stopped on demand -- it would keep ticking
+  # (and keep writing to a label on a hidden page) for the whole uptime, which
+  # is exactly the kind of always-on timer the animimg cleanup removed.
+  # Only ASCII '|' is used, which every embedded font here already has.
+  - id: va_think_pulse
+    mode: restart
+    then:
+      - while:
           condition: { lambda: 'return id(g_va_phase) == 2;' }
-          then: [{ lvgl.animimg.start: va_flow_think }]
-          else: [{ lvgl.animimg.stop: va_flow_think }]
+          then:
+            - lambda: |-
+                static const char *frames[] = {"|", "||", "|||", "||"};
+                // Re-check inside the loop body too: the phase can flip during
+                // the 200 ms delay and we must not stamp a stale frame over
+                // the text the next phase has already written.
+                if (id(g_va_phase) == 2)
+                  lv_label_set_text(id(va_text), frames[id(g_va_pulse_step) & 3]);
+                id(g_va_pulse_step)++;
+            - delay: 200ms
+      - lambda: |-
+          if (id(g_va_phase) != 2) lv_label_set_text(id(va_text), "");
 
   - id: knob_visual_settle
     mode: restart
@@ -3341,9 +3378,10 @@ interval:
   # [VA] The former 100 ms animation driver is gone. It hand-stepped the
   # listening bars, the thinking arc rotations and the speaking wave from the
   # main loop, which capped every assistant animation at 10 fps and competed
-  # with the audio path for loop time. All three states are now pre-rendered
-  # `animimg` sequences driven by LVGL's own animation timer, so there is
-  # nothing left to tick here.
+  # with the audio path for loop time. The assistant page is now a static mic
+  # glyph plus a text line, repainted only when the phase actually changes, and
+  # the only periodic writer left is the on-demand `va_think_pulse` script, so
+  # there is nothing to tick globally here.
 
 font:
   # P6 typography. Local TTFs are used instead of `gfonts://` so the exact
@@ -3467,17 +3505,15 @@ font:
     bpp: 4
     glyphs: *p6_glyphs
 
-# [VA] Pre-rendered interwoven-arc frames for the assistant page (listening /
-# thinking / answering). 90 frames total, generated by tools/gen_va_arcs.py;
-# the list is machine-generated so the PNGs and their ids cannot drift apart.
-# 192x56 rather than the previous 264x88: at 21.0 KB a frame fits both the
-# 31.1 KB LVGL draw buffer (one flush instead of two) and the 64 KB S3 data
-# cache, so it no longer evicts the working set that `mic_task` and the I2S DMA
-# descriptors depend on. 30 frames/state over a 2000 ms loop; see the generator
-# docstring for why slowing the arcs down had to cost frames.
-# These are rodata (CONFIG_SPIRAM_RODATA, so PSRAM-mapped) and cost no internal
-# RAM, which is the scarce resource this build fights over. 2.66 -> 1.85 MB.
-image: !include va_arc_images.yaml
+# [VA] 2026-08-29: the pre-rendered interwoven-arc frames are NO LONGER built
+# into the firmware. `image: !include va_arc_images.yaml` used to pull in 90
+# 192x56 RGB565 PNGs (~1.85 MB of flash) for the animimg ribbons; on real
+# hardware the effect did not justify either the flash or the per-frame LVGL
+# image-cache churn in internal RAM, so the assistant page went back to plain
+# LVGL text: one large mic glyph plus an ASCII status line.
+# images/va_arc_*/, va_arc_images.yaml and tools/gen_va_arcs.py are kept on disk
+# (and whitelisted in .gitignore) purely as a rollback path -- re-adding the one
+# include line above brings the whole scheme back.
 
 lvgl:
   # 10% (~25 KB for 360x360 RGB565) was too tight; 25% left the largest free
@@ -3880,12 +3916,12 @@ lvgl:
     - id: page_va  # [VA]
       # Pure black, not the ${color_bg_canvas} token the other pages use, and
       # bg_opa is pinned explicitly rather than left to LVGL's default.
-      # The pre-rendered ribbons are opaque RGB565, so their own background has
-      # to match this exactly or the 264x88 frame shows up as a lighter grey
-      # rectangle. 0x03070A quantises to RGB565 (0,4,8), which is measurably
-      # brighter than the black this LCD actually displays - that mismatch is
-      # what made the frame edge visible. Both sides now sit on 0x000000.
-      # Keep this in sync with BG in tools/gen_va_flow.py.
+      # This is no longer about matching a pre-rendered frame background (the
+      # ribbons are gone); it stays 0x000000 because the assistant surface is
+      # meant to read as a single dark hero page, and on this round LCD true
+      # black merges with the unlit bezel so the 360x360 square is invisible.
+      # Any lighter token (0x03070A quantises to RGB565 (0,4,8)) is measurably
+      # brighter than the panel's own black and reveals the panel edge.
       bg_color: 0x000000
       bg_opa: COVER
       widgets:
@@ -3909,103 +3945,32 @@ lvgl:
             arc_color: 0x0E2A33
             indicator:
               arc_opa: 0%
-        # [VA] Pre-rendered Siri ribbons, one per assistant state. These replace
-        # the former trio of counter-rotating arcs (va_arc / va_orb_b /
-        # va_orb_c), which were driven by lv_arc_set_rotation from a 100 ms
-        # interval and therefore capped at a visibly steppy 10 fps. animimg runs
-        # off LVGL's own animation timer at ~22 fps and the per-pixel glow is
-        # baked in, so the effect is both smoother and far richer than anything
-        # arc primitives can express.
-        #
-        # `duration` is the TOTAL length of the 20-frame sequence, not per frame.
-        # 900 ms is deliberately identical for all three states so the on-device
-        # cadence matches the approved 45 ms/frame preview GIFs exactly.
-        #
-        # The frames are opaque and carry the page background themselves, so
-        # these must be declared BEFORE va_icon / va_status_label to stay
-        # underneath them in z-order.
-        - animimg:
-            id: va_flow_listen
-            align: CENTER
-            width: 192
-            height: 56
-            duration: 2000ms
-            repeat_count: forever
-            auto_start: false
-            # Full 30-frame sequence, up from every-other-frame: the smaller
-            # canvas freed the budget that had forced listening to ~11 fps
-            # while the other two states ran twice that.
-            src: [va_listen_00, va_listen_01, va_listen_02, va_listen_03,
-                  va_listen_04, va_listen_05, va_listen_06, va_listen_07,
-                  va_listen_08, va_listen_09, va_listen_10, va_listen_11,
-                  va_listen_12, va_listen_13, va_listen_14, va_listen_15,
-                  va_listen_16, va_listen_17, va_listen_18, va_listen_19,
-                  va_listen_20, va_listen_21, va_listen_22, va_listen_23,
-                  va_listen_24, va_listen_25, va_listen_26, va_listen_27,
-                  va_listen_28, va_listen_29]
-            hidden: true
-        - animimg:
-            id: va_flow_think
-            align: CENTER
-            width: 192
-            height: 56
-            duration: 2000ms
-            repeat_count: forever
-            auto_start: false
-            src: [va_think_00, va_think_01, va_think_02, va_think_03,
-                  va_think_04, va_think_05, va_think_06, va_think_07,
-                  va_think_08, va_think_09, va_think_10, va_think_11,
-                  va_think_12, va_think_13, va_think_14, va_think_15,
-                  va_think_16, va_think_17, va_think_18, va_think_19,
-                  va_think_20, va_think_21, va_think_22, va_think_23,
-                  va_think_24, va_think_25, va_think_26, va_think_27,
-                  va_think_28, va_think_29]
-            hidden: true
-        - animimg:
-            id: va_flow_speak
-            align: CENTER
-            width: 192
-            height: 56
-            duration: 2000ms
-            repeat_count: forever
-            auto_start: false
-            # Frame ids are va_answer_* (the generator's name for this state);
-            # the widget id stays va_flow_speak so the phase automations that
-            # start and stop it need no change.
-            src: [va_answer_00, va_answer_01, va_answer_02, va_answer_03,
-                  va_answer_04, va_answer_05, va_answer_06, va_answer_07,
-                  va_answer_08, va_answer_09, va_answer_10, va_answer_11,
-                  va_answer_12, va_answer_13, va_answer_14, va_answer_15,
-                  va_answer_16, va_answer_17, va_answer_18, va_answer_19,
-                  va_answer_20, va_answer_21, va_answer_22, va_answer_23,
-                  va_answer_24, va_answer_25, va_answer_26, va_answer_27,
-                  va_answer_28, va_answer_29]
-            hidden: true
-        # [VA] State icon, used ONLY by the ribbon-less phases (error and
-        # proactive ask), so it keeps the original -24 offset and needs no
-        # runtime realignment. Listening/thinking/speaking deliberately show the
-        # ribbon alone - no icon - to keep those screens clean.
+        # [VA] Big centred mic glyph. font_va_icons_44 is reused on purpose:
+        # it is the largest Material Design face already embedded, so the icon
+        # reaches roughly the visual weight of the main page's font_sc_52 hero
+        # numbers without adding a single new font binary to flash.
+        # The glyph is static (always the mic); only its colour changes per
+        # phase, driven from va_render.
         - label:
             id: va_icon
             align: CENTER
             y: -24
-            text: ""
+            text: "󰍬"  # mdi-microphone
             text_font: font_va_icons_44
             text_align: CENTER
             text_color: ${color_va_listening}
+        # [VA] Status line under the icon. ASCII only -- see va_render for why
+        # STT/TTS text is logged instead of drawn.
         - label:
-            id: va_status_label
+            id: va_text
             align: CENTER
-            y: 108
-            # SIZE_CONTENT instead of a fixed 260 px: a fixed width lets LVGL
-            # wrap the text when the glyphs do not fit, which is what once broke
-            # the thinking ellipsis into a vertical stack of dots. Sizing to the
-            # content makes wrapping structurally impossible.
-            width: SIZE_CONTENT
+            y: 44
+            # 280 px keeps the line inside the 360 px circle with margin for the
+            # va_frame ring, and WRAP is safe now that the content is short
+            # ASCII rather than a variable-width ellipsis glyph run.
+            width: 280
             text: ""
             text_font: font_sc_24
             text_align: CENTER
-            text_letter_space: 2
-            long_mode: CLIP
-            text_color: ${color_va_error}
-            hidden: true
+            long_mode: WRAP
+            text_color: ${color_va_listening}
