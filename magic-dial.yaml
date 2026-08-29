@@ -410,6 +410,10 @@ voice_assistant:  # [VA]
         id(g_va_phase) = 1; // listening
         id(g_va_error_text) = "";
         id(g_va_started_ms) = millis();
+        // [VA] Session generation: bumped on every new turn so a *delayed*
+        // teardown decision (va_fail's 1200 ms pause) can tell "the session I
+        // was about to kill" from "a new turn that arrived while I waited".
+        id(g_va_session_gen) += 1;
         // [VA] Continued conversation: HA re-opens the mic itself after TTS
         // (continue_conversation), and that new turn arrives with no local
         // script in between. Reset the per-turn flags here so round 2+ behaves
@@ -1450,8 +1454,14 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  - id: g_va_zoom_step  # [VA] frame index for the enter / leave zoom
-    type: int
+  # [VA] Bumped by va_enter_session and by every on_listening. Delayed teardown
+  # paths snapshot it and bail out if it moved.
+  - id: g_va_session_gen
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: g_va_fail_gen  # [VA] snapshot taken by va_fail before its 1200 ms pause
+    type: uint8_t
     restore_value: no
     initial_value: '0'
   # [VA] Short ASCII reason shown next to `error`. A global rather than a label
@@ -1711,6 +1721,7 @@ script:
           id(g_va_tts_started) = false;
           id(g_va_stt_seen) = false;
           id(g_va_started_ms) = millis();
+          id(g_va_session_gen) += 1; // [VA] see on_listening
           id(g_manual_until) = millis() + 60000;
           id(g_va_dac_was_unmuted) = id(dac_unmute).state;
           id(g_va_return_to_aod) = id(g_sleeping) || id(g_wake_consume);
@@ -1729,10 +1740,6 @@ script:
           id: backlight_light
           brightness: 100%
       - lvgl.page.show: page_va
-      # [VA] Zoom-in starts the frame AFTER the page is visible, and the first
-      # frame is already the small scale, so the avatar is never shown at full
-      # size for one refresh before shrinking.
-      - script.execute: va_zoom_in
       - script.execute: ring_update_state
       # [VA] Pause BLE scanning for the duration of the turn. NOT for RAM --
       # heap_max_block sits at 31 KB now and mic_task only needs 4 KB -- but for
@@ -1852,34 +1859,43 @@ script:
       # watchdog and the 120 s ceiling) restores the proxy. A missed restore would
       # silently leave the whole house's BLE proxy dead until the next reboot.
       - esp32_ble_tracker.start_scan:
-      # [VA] Zoom-out BEFORE va_render: the idle render pass hides the avatar, so
-      # running the shrink after it would animate an invisible widget. `script.wait`
-      # makes the page swap further down wait for the animation instead of cutting
-      # away mid-shrink -- safe here because everything audio-critical (BLE re-arm,
-      # DAC restore) has already run above.
-      - script.execute: va_zoom_out
-      - script.wait: va_zoom_out
       # Idle render pass: blanks va_icon / va_text and stops va_think_pulse, so
       # nothing is left painted on the page we are navigating away from.
       - script.execute: va_render
       - script.execute: va_restore_external_media
       - script.execute: ring_update_state
+      # [VA] Never navigate away from a LIVE session. Everything above is
+      # idempotent state restoration, but the page swap is destructive: if a new
+      # turn arrived while this teardown sat behind a delay (va_fail's 1200 ms,
+      # va_end_grace's 1500 ms), the dial is listening again and must keep
+      # page_va. This is the "screen went back to the clock while the assistant
+      # kept listening" bug.
       - if:
-          condition: { lambda: 'return id(g_va_return_to_aod);' }
+          condition: { lambda: 'return !id(g_va_active);' }
           then:
-            - script.execute: enter_sleep
-          else:
-            - lvgl.page.show: page_main
-            - script.execute: render_main
+            - if:
+                condition: { lambda: 'return id(g_va_return_to_aod);' }
+                then:
+                  - script.execute: enter_sleep
+                else:
+                  - lvgl.page.show: page_main
+                  - script.execute: render_main
 
   - id: va_fail  # [VA]
     then:
       - lambda: |-
           id(g_va_phase) = 4;
+          id(g_va_fail_gen) = id(g_va_session_gen);
           id(va_render).execute();
       - script.execute: ring_update_state
       - delay: 1200ms
-      - script.execute: va_cleanup
+      # [VA] Only tear down if no new turn appeared while the error was on
+      # screen. Otherwise this 1200 ms pause would kill a session that HA had
+      # already restarted a beat earlier.
+      - if:
+          condition: { lambda: 'return id(g_va_fail_gen) == id(g_va_session_gen);' }
+          then:
+            - script.execute: va_cleanup
 
   - id: ptt_long_press  # [VA]
     mode: restart
@@ -2064,64 +2080,16 @@ script:
                 lv_obj_set_style_arc_width(id(va_breath), 3 + (tri >> 1), LV_PART_MAIN);
             - delay: 120ms
 
-  # [VA] Enter / leave transition for the assistant page.
-  #
-  # Only the avatar is scaled, never the page or a container. LVGL 9 renders a
-  # transformed *widget tree* through an intermediate layer buffer, and a layer
-  # for this 360x360 screen would be ~260 KB -- impossible here. An image widget
-  # instead scales inside its own draw routine (lv_image_set_scale, 256 = 100%),
-  # which costs nothing but the resample of a 77x112 source. The status line and
-  # the motion rings just fade with `opa`, which is also layer-free.
-  #
-  # 8 frames x 28 ms = ~220 ms, with a small overshoot (268 -> 256) so the avatar
-  # lands with a pop instead of easing in flatly.
-  - id: va_zoom_in  # [VA]
-    mode: restart
-    then:
-      - lambda: 'id(g_va_zoom_step) = 0;'
-      - repeat:
-          count: 8
-          then:
-            - lambda: |-
-                static const uint16_t scale[] = {96, 150, 196, 232, 256, 268, 262, 256};
-                const int i = id(g_va_zoom_step)++;
-                lv_image_set_scale(id(va_icon), scale[i]);
-                // Text and rings trail the avatar slightly: they only start
-                // appearing once the face is past half size.
-                const int fade = i < 2 ? 0 : (i - 1) * 42;
-                const lv_opa_t opa = (lv_opa_t) (fade > 255 ? 255 : fade);
-                lv_obj_set_style_opa(id(va_text), opa, LV_PART_MAIN);
-                lv_obj_set_style_opa(id(va_breath), opa, LV_PART_MAIN);
-                lv_obj_set_style_opa(id(va_sweep), opa, LV_PART_MAIN);
-            - delay: 28ms
-
-  # [VA] Leave transition. Runs to completion *before* the page is swapped, so
-  # the dial never cuts straight from a full-size avatar to the clock.
-  # `mode: single` on purpose: va_teardown waits on this script, and a restart
-  # would abandon that wait and let the page switch race the animation.
-  - id: va_zoom_out  # [VA]
-    mode: single
-    then:
-      - lambda: 'id(g_va_zoom_step) = 0;'
-      - repeat:
-          count: 6
-          then:
-            - lambda: |-
-                static const uint16_t scale[] = {256, 236, 200, 156, 116, 80};
-                const int i = id(g_va_zoom_step)++;
-                lv_image_set_scale(id(va_icon), scale[i]);
-                const lv_opa_t opa = (lv_opa_t) (255 - i * 51);
-                lv_obj_set_style_opa(id(va_text), opa, LV_PART_MAIN);
-                lv_obj_set_style_opa(id(va_breath), opa, LV_PART_MAIN);
-                lv_obj_set_style_opa(id(va_sweep), opa, LV_PART_MAIN);
-            - delay: 24ms
-      # Leave the page in its neutral state: the next session's zoom-in starts
-      # from its own first frame, and nothing stays half-faded if the next entry
-      # happens to skip the animation.
-      - lambda: |-
-          lv_obj_set_style_opa(id(va_text), LV_OPA_COVER, LV_PART_MAIN);
-          lv_obj_set_style_opa(id(va_breath), LV_OPA_COVER, LV_PART_MAIN);
-          lv_obj_set_style_opa(id(va_sweep), LV_OPA_COVER, LV_PART_MAIN);
+  # [VA] The enter / leave zoom transition is gone (2026-08-29). It was a
+  # lambda-driven `repeat` at 24-28 ms per frame, i.e. right at LVGL's own
+  # ~30 ms refresh period: with the 12 % draw buffer (eight flushes per full
+  # 360x360 repaint) plus the 77x112 image rescale, most frames were dropped and
+  # the whole ~220 ms sequence read as a single blink. Fixing it properly would
+  # need a custom lv_anim exec_cb or a slower ~600 ms sequence, both of which
+  # spend more main-loop time right next to the audio path. Removing it also
+  # deleted the `script.wait: va_zoom_out` inside va_teardown, one of the
+  # windows a revived session could slip through. `va_icon` now simply stays at
+  # its native scale and the VA widgets at LV_OPA_COVER.
 
   # [VA] Thinking indicator: | -> || -> ||| -> || -> | at 200 ms.
   # A `script` with `mode: restart` rather than a global `interval:` because an
