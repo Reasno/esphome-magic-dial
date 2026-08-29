@@ -400,12 +400,14 @@ voice_assistant:  # [VA]
   # for a proactive question). In that case nothing ran va_prepare, so the
   # session state / VA page are set up here instead.
   on_start:
+    - lambda: 'id(g_va_last_evt_ms) = millis();'
     - if:
         condition: { lambda: 'return !id(g_va_active);' }
         then:
           - script.execute: va_enter_session
   on_listening:
     - lambda: |-
+        id(g_va_last_evt_ms) = millis();
         id(g_va_active) = true;
         id(g_va_phase) = 1; // listening
         id(g_va_error_text) = "";
@@ -430,10 +432,12 @@ voice_assistant:  # [VA]
   # "listening..." and flipping it on every speech edge would flicker. They are
   # logged only, which is enough to debug why a turn did or did not close.
   on_stt_vad_start:
+    - lambda: 'id(g_va_last_evt_ms) = millis();'
     - logger.log:
         level: INFO
         format: "[VA] stt vad start (speech detected)"
   on_stt_vad_end:
+    - lambda: 'id(g_va_last_evt_ms) = millis();'
     - logger.log:
         level: INFO
         format: "[VA] stt vad end (turn closing)"
@@ -442,6 +446,7 @@ voice_assistant:  # [VA]
         // The transcript goes to the log, NOT to the screen: the embedded
         // Chinese font only carries the ~200 hanzi of the UI itself, so an
         // arbitrary transcript would draw as empty boxes.
+        id(g_va_last_evt_ms) = millis();
         ESP_LOGI("va", "STT text: %s", x.c_str());
         id(g_va_stt_seen) = true;
         id(g_va_phase) = 2; // thinking
@@ -451,6 +456,7 @@ voice_assistant:  # [VA]
   on_tts_start:
     - lambda: |-
         ESP_LOGI("va", "TTS text: %s", x.c_str());
+        id(g_va_last_evt_ms) = millis();
         id(g_va_tts_started) = true;
   # [VA] Audio playback end. The actual teardown hangs off on_tts_stream_end
   # (the stream, not the text), so this is log-only on purpose.
@@ -460,6 +466,7 @@ voice_assistant:  # [VA]
         format: "[VA] tts finished"
   on_tts_stream_start:
     - lambda: |-
+        id(g_va_last_evt_ms) = millis();
         id(g_va_phase) = 3; // speaking
         id(va_render).execute();
         id(dac_unmute).turn_on();
@@ -481,6 +488,11 @@ voice_assistant:  # [VA]
   # va_teardown restores it once, when the session really ends.
   on_tts_stream_end:
     - lambda: |-
+        id(g_va_last_evt_ms) = millis();
+        // phase drops back to 1 below, so refresh the listening stamp too --
+        // otherwise the 12 s stuck-listening watchdog inherits this turn's old
+        // start time and can fire immediately.
+        id(g_va_started_ms) = millis();
         ESP_LOGI("vatrace", "tts_stream_end t=%u phase=%d run=%d",
                  (unsigned) millis(), (int) id(g_va_phase),
                  (int) id(magic_dial_va).is_running());
@@ -497,6 +509,7 @@ voice_assistant:  # [VA]
   # restores the original intent: a turn that asked something and got no answer.
   on_end:
     - lambda: |-
+        id(g_va_last_evt_ms) = millis();
         ESP_LOGI("vatrace", "run_end t=%u phase=%d tts_started=%d run=%d",
                  (unsigned) millis(), (int) id(g_va_phase),
                  (int) id(g_va_tts_started),
@@ -1500,6 +1513,14 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
+  # [VA] millis() of the last event of ANY kind from the pipeline. The only
+  # reliable "HA has nothing more for us" signal: no local flag can predict
+  # whether a continued conversation will open another turn, but a component
+  # that is IDLE *and* has heard nothing for seconds is genuinely finished.
+  - id: g_va_last_evt_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   # [VA] Short ASCII reason shown next to `error`. A global rather than a label
   # write at the trigger site, so va_render stays the single place that decides
   # what the screen says.
@@ -1759,6 +1780,7 @@ script:
           id(g_va_started_ms) = millis();
           id(g_va_session_gen) += 1; // [VA] see on_listening
           id(g_va_idle_since_ms) = 0;
+          id(g_va_last_evt_ms) = millis();
           id(g_manual_until) = millis() + 60000;
           id(g_va_dac_was_unmuted) = id(dac_unmute).state;
           id(g_va_return_to_aod) = id(g_sleeping) || id(g_wake_consume);
@@ -3549,36 +3571,28 @@ interval:
           then:
             - voice_assistant.stop:
             - script.execute: va_cleanup
+      # [VA] Normal session end: the component is IDLE *and* the pipeline has
+      # been completely silent for 8 s. The previous 3 s version watched
+      # is_running() alone and lost: in a continued conversation the gap between
+      # turns really does leave the component IDLE -- HA, not the component,
+      # opens the next turn -- and after a few rounds that gap exceeded 3 s,
+      # tearing the screen down while the conversation was still alive. Every
+      # trigger stamps g_va_last_evt_ms, so any sign of life (even a VAD edge)
+      # restarts the count. A genuine goodbye usually exits sooner through
+      # on_error (stt-no-text-recognized); this is the quiet fallback.
+      - if:
+          condition:
+            lambda: |-
+              return id(g_va_active) && !id(magic_dial_va).is_running() &&
+                millis() - id(g_va_last_evt_ms) > 8000;
+          then:
+            - logger.log: "[vatrace] idle+silent 8s -> cleanup"
+            - script.execute: va_cleanup
       # [VA] Stuck-listening watchdog. The turn is normally closed by HA's microVAD
       # a second or so after the finger comes up, so still sitting in `listening`
       # with nothing recognised after 12 s means the session is phantom (VAD never
       # fired, or the mic produced no usable audio). End it instead of quietly
       # holding the microphone open until the 120 s ceiling above.
-      # [VA] Normal session end: the component has been IDLE continuously for
-      # 3 s. Order- and latency-independent -- HA may take as long as it likes to
-      # open the next turn, and any run in progress resets the stamp, so the page
-      # is never swapped mid-conversation. The dial lingers on page_va for up to
-      # 3 s after a genuine goodbye, which is invisible next to the flash this
-      # replaces.
-      - if:
-          condition: { lambda: 'return id(g_va_active);' }
-          then:
-            - lambda: |-
-                if (id(magic_dial_va).is_running()) {
-                  id(g_va_idle_since_ms) = 0;
-                } else if (id(g_va_idle_since_ms) == 0) {
-                  id(g_va_idle_since_ms) = millis();
-                  ESP_LOGI("vatrace", "idle start t=%u phase=%d",
-                           (unsigned) millis(), (int) id(g_va_phase));
-                }
-            - if:
-                condition:
-                  lambda: |-
-                    return id(g_va_idle_since_ms) != 0 &&
-                      millis() - id(g_va_idle_since_ms) > 3000;
-                then:
-                  - logger.log: "[vatrace] idle 3s -> cleanup"
-                  - script.execute: va_cleanup
       - if: # [VA]
           condition:
             lambda: |-
