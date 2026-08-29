@@ -1977,64 +1977,54 @@ script:
           if (phase == 2) id(va_think_pulse).execute();
           else id(va_think_pulse).stop();
 
-          // Same contract for the motion layer. The two arcs are hidden here
-          // (not inside va_motion) so that an aborted turn -- where the script
-          // is stopped mid-delay -- can never leave a ring painted behind.
+          // Same contract for the motion layer: the arc is hidden here (not
+          // inside va_motion) so that an aborted turn -- where the script is
+          // stopped mid-delay -- can never leave a ring painted behind.
+          //
+          // Speaking (phase 3) deliberately has NO motion at all any more. The
+          // orbiting comet was re-drawing a 320 px anti-aliased ring every
+          // 70 ms exactly while the TTS audio path needs the main loop, and the
+          // answer audibly stuttered for it. Anchoring the angle to millis()
+          // fixed the *visual* phase error but not the underlying loop
+          // contention, so the whole sweep is dropped: during speaking the
+          // static va_frame ring stays on screen and simply does not move.
           const bool breathing = (phase == 1 || phase == 5);
-          const bool sweeping = (phase == 3);
           if (breathing) lv_obj_clear_flag(id(va_breath), LV_OBJ_FLAG_HIDDEN);
           else lv_obj_add_flag(id(va_breath), LV_OBJ_FLAG_HIDDEN);
-          if (sweeping) lv_obj_clear_flag(id(va_sweep), LV_OBJ_FLAG_HIDDEN);
-          else lv_obj_add_flag(id(va_sweep), LV_OBJ_FLAG_HIDDEN);
-          if (breathing || sweeping) id(va_motion).execute();
+          lv_obj_add_flag(id(va_sweep), LV_OBJ_FLAG_HIDDEN);
+          if (breathing) id(va_motion).execute();
           else id(va_motion).stop();
 
-  # [VA] Motion layer driver for listening (breathing ring) and speaking
-  # (orbiting comet). One script for both phases, because they are mutually
-  # exclusive and sharing the loop keeps a single timer in flight.
+  # [VA] Motion layer driver for the listening / asking phases (breathing ring).
   #
-  # Tick rate is deliberately unequal. Listening runs at 120 ms (~8 fps): the
-  # microphone is streaming then, and this build has already been bitten twice by
-  # main-loop stalls starving the mic ring buffer, so the animation is kept to
-  # style-only writes at a low rate. Speaking runs at 70 ms (~14 fps) for a
-  # smoother orbit -- the mic is closed by then and only the I2S speaker is
-  # active, which is DMA-fed.
+  # Speaking has no animation: the orbiting comet used to share this loop, but
+  # its 70 ms tick competed with the TTS audio path for the main loop and made
+  # the spoken answer stutter, so it was removed (see va_render). va_sweep is
+  # kept as a widget for a quick revert but is never shown or driven.
   #
-  # The speaking angle is derived from millis(), NOT from the tick counter. An
-  # ESPHome `while` + `delay` only guarantees "at least" the delay: it resumes on
-  # the next main-loop pass, and during TTS playback the loop is regularly held
-  # up by the audio path, so ticks arrive at ~70-200 ms. With `step * 13 deg` a
-  # late tick still advanced exactly 13 deg, so the comet crawled and then
-  # jumped -- that is the reported stutter. Anchoring the angle to wall-clock
-  # time (360 deg / 2016 ms) makes a late tick simply draw the position it should
-  # already be at, so jitter costs frames instead of accumulating a phase error.
-  # A repeated `va_render` cannot desync it either, since there is no state.
+  # The 120 ms tick (~8 fps) is deliberately slow: the microphone is streaming
+  # during listening, and this build has already been bitten twice by main-loop
+  # stalls starving the mic ring buffer, so the animation is kept to style-only
+  # writes at a low rate.
   - id: va_motion  # [VA]
     mode: restart
     then:
       - while:
           condition:
-            lambda: 'return id(g_va_phase) == 1 || id(g_va_phase) == 3 || id(g_va_phase) == 5;'
+            lambda: 'return id(g_va_phase) == 1 || id(g_va_phase) == 5;'
           then:
             - lambda: |-
                 const int step = id(g_va_motion_step)++;
-                if (id(g_va_phase) == 3) {
-                  // One full orbit every 2016 ms, taken straight off millis()
-                  // so an overdue tick lands at the right angle (see above).
-                  const uint32_t deg = (millis() % 2016u) * 360u / 2016u;
-                  lv_arc_set_rotation(id(va_sweep), (int32_t) deg);
-                } else {
-                  // Triangle wave over 16 ticks (~1.9 s per breath). Opacity and
-                  // thickness move together so the ring reads as pulsing light
-                  // rather than a resizing object -- resizing would invalidate a
-                  // growing area every tick.
-                  const int t = step % 16;
-                  const int tri = t < 8 ? t : 15 - t;          // 0..7
-                  const lv_opa_t opa = (lv_opa_t) (70 + tri * 26);  // 70..252
-                  lv_obj_set_style_arc_opa(id(va_breath), opa, LV_PART_MAIN);
-                  lv_obj_set_style_arc_width(id(va_breath), 3 + (tri >> 1), LV_PART_MAIN);
-                }
-            - delay: !lambda 'return id(g_va_phase) == 3 ? 70 : 120;'
+                // Triangle wave over 16 ticks (~1.9 s per breath). Opacity and
+                // thickness move together so the ring reads as pulsing light
+                // rather than a resizing object -- resizing would invalidate a
+                // growing area every tick.
+                const int t = step % 16;
+                const int tri = t < 8 ? t : 15 - t;          // 0..7
+                const lv_opa_t opa = (lv_opa_t) (70 + tri * 26);  // 70..252
+                lv_obj_set_style_arc_opa(id(va_breath), opa, LV_PART_MAIN);
+                lv_obj_set_style_arc_width(id(va_breath), 3 + (tri >> 1), LV_PART_MAIN);
+            - delay: 120ms
 
   # [VA] Enter / leave transition for the assistant page.
   #
@@ -4147,9 +4137,12 @@ lvgl:
             hidden: true
             indicator:
               arc_opa: 0%
-        # [VA] Motion layer, phase 3 (speaking): a 65 deg comet that orbits the
-        # avatar. Only `lv_arc_set_rotation` is called per tick, so LVGL rotates
-        # the existing indicator instead of resizing any widget.
+        # [VA] DORMANT: former speaking-phase comet. Kept defined (and referenced
+        # by the zoom transitions) purely so the orbit can be brought back with a
+        # one-line change, but va_render now hides it unconditionally and
+        # va_motion no longer drives it -- redrawing this 320 px anti-aliased ring
+        # every 70 ms starved the TTS audio path of main-loop time and made the
+        # spoken answer stutter. During speaking only the static va_frame shows.
         #
         # 320x320, NOT 340: at 340 px the 6 px stroke sits at radius 167-170 on a
         # 360 px panel, i.e. exactly on the glass edge, where the round bezel
