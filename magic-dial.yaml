@@ -1999,6 +1999,16 @@ script:
   # style-only writes at a low rate. Speaking runs at 70 ms (~14 fps) for a
   # smoother orbit -- the mic is closed by then and only the I2S speaker is
   # active, which is DMA-fed.
+  #
+  # The speaking angle is derived from millis(), NOT from the tick counter. An
+  # ESPHome `while` + `delay` only guarantees "at least" the delay: it resumes on
+  # the next main-loop pass, and during TTS playback the loop is regularly held
+  # up by the audio path, so ticks arrive at ~70-200 ms. With `step * 13 deg` a
+  # late tick still advanced exactly 13 deg, so the comet crawled and then
+  # jumped -- that is the reported stutter. Anchoring the angle to wall-clock
+  # time (360 deg / 2016 ms) makes a late tick simply draw the position it should
+  # already be at, so jitter costs frames instead of accumulating a phase error.
+  # A repeated `va_render` cannot desync it either, since there is no state.
   - id: va_motion  # [VA]
     mode: restart
     then:
@@ -2009,8 +2019,10 @@ script:
             - lambda: |-
                 const int step = id(g_va_motion_step)++;
                 if (id(g_va_phase) == 3) {
-                  // 13 deg per tick -> one full orbit in ~2 s.
-                  lv_arc_set_rotation(id(va_sweep), (step * 13) % 360);
+                  // One full orbit every 2016 ms, taken straight off millis()
+                  // so an overdue tick lands at the right angle (see above).
+                  const uint32_t deg = (millis() % 2016u) * 360u / 2016u;
+                  lv_arc_set_rotation(id(va_sweep), (int32_t) deg);
                 } else {
                   // Triangle wave over 16 ticks (~1.9 s per breath). Opacity and
                   // thickness move together so the ring reads as pulsing light
@@ -3666,8 +3678,13 @@ font:
 # drifts by one byte. The cutout is instead matted onto pure black by
 # tools/gen_doubao_avatar.py -- page_va's background is pinned to 0x000000, so
 # the result is visually identical while using the plain RGB565 path.
-# `byte_order: big_endian` matches LVGL's LV_COLOR_16_SWAP=1, exactly as the old
-# va_arc frames did; the default little_endian would silently swap every colour.
+# `byte_order: little_endian` is the CORRECT setting here, measured on real
+# hardware 2026-08-29: with `big_endian` the avatar drew with the right shape but
+# completely wrong colours (a pure per-pixel byte swap). The earlier claim that
+# big_endian "matches LV_COLOR_16_SWAP=1" was wrong and has been removed -- do
+# not reintroduce it. (The retired va_arc frames in va_arc_images.yaml still
+# carry the old big_endian setting; those files are dead rollback material and
+# are not compiled, so their byte_order is untrustworthy too.)
 image:
   - platform: file
     id: img_doubao_avatar
@@ -4133,11 +4150,18 @@ lvgl:
         # [VA] Motion layer, phase 3 (speaking): a 65 deg comet that orbits the
         # avatar. Only `lv_arc_set_rotation` is called per tick, so LVGL rotates
         # the existing indicator instead of resizing any widget.
+        #
+        # 320x320, NOT 340: at 340 px the 6 px stroke sits at radius 167-170 on a
+        # 360 px panel, i.e. exactly on the glass edge, where the round bezel
+        # clips it -- which is why "speaking" looked like it had no orbit at all
+        # while the 320 px va_frame and the 300 px va_breath were both clearly
+        # visible. Sharing va_frame's 320 px radius also means the comet now
+        # visibly rides *along* the static ring instead of floating outside it.
         - arc:
             id: va_sweep
             align: CENTER
-            width: 340
-            height: 340
+            width: 320
+            height: 320
             arc_width: 6
             min_value: 0
             max_value: 100
