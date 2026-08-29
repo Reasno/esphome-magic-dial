@@ -1434,6 +1434,10 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
+  - id: g_va_zoom_step  # [VA] frame index for the enter / leave zoom
+    type: int
+    restore_value: no
+    initial_value: '0'
   # [VA] Short ASCII reason shown next to `error`. A global rather than a label
   # write at the trigger site, so va_render stays the single place that decides
   # what the screen says.
@@ -1709,6 +1713,10 @@ script:
           id: backlight_light
           brightness: 100%
       - lvgl.page.show: page_va
+      # [VA] Zoom-in starts the frame AFTER the page is visible, and the first
+      # frame is already the small scale, so the avatar is never shown at full
+      # size for one refresh before shrinking.
+      - script.execute: va_zoom_in
       - script.execute: ring_update_state
       # [VA] Pause BLE scanning for the duration of the turn. NOT for RAM --
       # heap_max_block sits at 31 KB now and mic_task only needs 4 KB -- but for
@@ -1806,6 +1814,13 @@ script:
       # watchdog and the 120 s ceiling) restores the proxy. A missed restore would
       # silently leave the whole house's BLE proxy dead until the next reboot.
       - esp32_ble_tracker.start_scan:
+      # [VA] Zoom-out BEFORE va_render: the idle render pass hides the avatar, so
+      # running the shrink after it would animate an invisible widget. `script.wait`
+      # makes the page swap further down wait for the animation instead of cutting
+      # away mid-shrink -- safe here because everything audio-critical (BLE re-arm,
+      # DAC restore) has already run above.
+      - script.execute: va_zoom_out
+      - script.wait: va_zoom_out
       # Idle render pass: blanks va_icon / va_text and stops va_think_pulse, so
       # nothing is left painted on the page we are navigating away from.
       - script.execute: va_render
@@ -2008,6 +2023,65 @@ script:
                   lv_obj_set_style_arc_width(id(va_breath), 3 + (tri >> 1), LV_PART_MAIN);
                 }
             - delay: !lambda 'return id(g_va_phase) == 3 ? 70 : 120;'
+
+  # [VA] Enter / leave transition for the assistant page.
+  #
+  # Only the avatar is scaled, never the page or a container. LVGL 9 renders a
+  # transformed *widget tree* through an intermediate layer buffer, and a layer
+  # for this 360x360 screen would be ~260 KB -- impossible here. An image widget
+  # instead scales inside its own draw routine (lv_image_set_scale, 256 = 100%),
+  # which costs nothing but the resample of a 77x112 source. The status line and
+  # the motion rings just fade with `opa`, which is also layer-free.
+  #
+  # 8 frames x 28 ms = ~220 ms, with a small overshoot (268 -> 256) so the avatar
+  # lands with a pop instead of easing in flatly.
+  - id: va_zoom_in  # [VA]
+    mode: restart
+    then:
+      - lambda: 'id(g_va_zoom_step) = 0;'
+      - repeat:
+          count: 8
+          then:
+            - lambda: |-
+                static const uint16_t scale[] = {96, 150, 196, 232, 256, 268, 262, 256};
+                const int i = id(g_va_zoom_step)++;
+                lv_image_set_scale(id(va_icon), scale[i]);
+                // Text and rings trail the avatar slightly: they only start
+                // appearing once the face is past half size.
+                const int fade = i < 2 ? 0 : (i - 1) * 42;
+                const lv_opa_t opa = (lv_opa_t) (fade > 255 ? 255 : fade);
+                lv_obj_set_style_opa(id(va_text), opa, LV_PART_MAIN);
+                lv_obj_set_style_opa(id(va_breath), opa, LV_PART_MAIN);
+                lv_obj_set_style_opa(id(va_sweep), opa, LV_PART_MAIN);
+            - delay: 28ms
+
+  # [VA] Leave transition. Runs to completion *before* the page is swapped, so
+  # the dial never cuts straight from a full-size avatar to the clock.
+  # `mode: single` on purpose: va_teardown waits on this script, and a restart
+  # would abandon that wait and let the page switch race the animation.
+  - id: va_zoom_out  # [VA]
+    mode: single
+    then:
+      - lambda: 'id(g_va_zoom_step) = 0;'
+      - repeat:
+          count: 6
+          then:
+            - lambda: |-
+                static const uint16_t scale[] = {256, 236, 200, 156, 116, 80};
+                const int i = id(g_va_zoom_step)++;
+                lv_image_set_scale(id(va_icon), scale[i]);
+                const lv_opa_t opa = (lv_opa_t) (255 - i * 51);
+                lv_obj_set_style_opa(id(va_text), opa, LV_PART_MAIN);
+                lv_obj_set_style_opa(id(va_breath), opa, LV_PART_MAIN);
+                lv_obj_set_style_opa(id(va_sweep), opa, LV_PART_MAIN);
+            - delay: 24ms
+      # Leave the page in its neutral state: the next session's zoom-in starts
+      # from its own first frame, and nothing stays half-faded if the next entry
+      # happens to skip the animation.
+      - lambda: |-
+          lv_obj_set_style_opa(id(va_text), LV_OPA_COVER, LV_PART_MAIN);
+          lv_obj_set_style_opa(id(va_breath), LV_OPA_COVER, LV_PART_MAIN);
+          lv_obj_set_style_opa(id(va_sweep), LV_OPA_COVER, LV_PART_MAIN);
 
   # [VA] Thinking indicator: | -> || -> ||| -> || -> | at 200 ms.
   # A `script` with `mode: restart` rather than a global `interval:` because an
