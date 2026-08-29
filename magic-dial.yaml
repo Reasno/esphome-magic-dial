@@ -3673,7 +3673,7 @@ image:
     id: img_doubao_avatar
     file: images/doubao_avatar.png
     type: RGB565
-    byte_order: big_endian
+    byte_order: little_endian
 
 lvgl:
   # 10% (~25 KB for 360x360 RGB565) was too tight; 25% left the largest free
