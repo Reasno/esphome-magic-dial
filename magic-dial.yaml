@@ -16,8 +16,8 @@ substitutions:
   color_media: "0x49A8FF"
   color_light: "0xFFC05A"
   color_local: "0x45D6C5"
-  color_va_listening: "0xE8392A"  # [VA] Doubao scarf red -- one accent for all phases
-  color_va_thinking: "0xE8392A"   # [VA]
+  color_va_listening: "0xCAE4FF"  # [VA] Doubao icon light blue -- one accent for all phases
+  color_va_thinking: "0xCAE4FF"   # [VA]
   color_va_error: "0xFF6B6B"      # [VA] kept distinct: a failure must not read as a normal phase
 
   # Home Assistant entities. Change only these substitutions if entity IDs differ.
@@ -1430,6 +1430,10 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
+  - id: g_va_motion_step  # [VA] frame counter for the listening / speaking motion
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   # [VA] Short ASCII reason shown next to `error`. A global rather than a label
   # write at the trigger site, so va_render stays the single place that decides
   # what the screen says.
@@ -1923,11 +1927,13 @@ script:
           // build has just finished optimising away. The recognised text is
           // logged instead (see voice_assistant on_stt_end / on_tts_start).
           const auto phase = id(g_va_phase);
-          // One accent for every normal phase: the Doubao scarf red. The phases
+          // One accent for every normal phase: the light blue of the Doubao icon
+          // itself (#CAE4FF, the most common non-white pixel of the artwork), so
+          // the status line and the motion rings read as part of the avatar. The phases
           // are already told apart by their wording ("listening..." / the
           // thinking pulse / "speaking...") and by the avatar being on screen,
           // so per-phase hues only fought with the mascot's own palette.
-          const auto color_accent = lv_color_hex(0xE8392A);
+          const auto color_accent = lv_color_hex(0xCAE4FF);
           const auto color_error  = lv_color_hex(0xFF6B6B);
 
           lv_color_t c = color_accent;
@@ -1955,6 +1961,53 @@ script:
           // stopping here cannot be forgotten on a new code path.
           if (phase == 2) id(va_think_pulse).execute();
           else id(va_think_pulse).stop();
+
+          // Same contract for the motion layer. The two arcs are hidden here
+          // (not inside va_motion) so that an aborted turn -- where the script
+          // is stopped mid-delay -- can never leave a ring painted behind.
+          const bool breathing = (phase == 1 || phase == 5);
+          const bool sweeping = (phase == 3);
+          if (breathing) lv_obj_clear_flag(id(va_breath), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_add_flag(id(va_breath), LV_OBJ_FLAG_HIDDEN);
+          if (sweeping) lv_obj_clear_flag(id(va_sweep), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_add_flag(id(va_sweep), LV_OBJ_FLAG_HIDDEN);
+          if (breathing || sweeping) id(va_motion).execute();
+          else id(va_motion).stop();
+
+  # [VA] Motion layer driver for listening (breathing ring) and speaking
+  # (orbiting comet). One script for both phases, because they are mutually
+  # exclusive and sharing the loop keeps a single timer in flight.
+  #
+  # Tick rate is deliberately unequal. Listening runs at 120 ms (~8 fps): the
+  # microphone is streaming then, and this build has already been bitten twice by
+  # main-loop stalls starving the mic ring buffer, so the animation is kept to
+  # style-only writes at a low rate. Speaking runs at 70 ms (~14 fps) for a
+  # smoother orbit -- the mic is closed by then and only the I2S speaker is
+  # active, which is DMA-fed.
+  - id: va_motion  # [VA]
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: 'return id(g_va_phase) == 1 || id(g_va_phase) == 3 || id(g_va_phase) == 5;'
+          then:
+            - lambda: |-
+                const int step = id(g_va_motion_step)++;
+                if (id(g_va_phase) == 3) {
+                  // 13 deg per tick -> one full orbit in ~2 s.
+                  lv_arc_set_rotation(id(va_sweep), (step * 13) % 360);
+                } else {
+                  // Triangle wave over 16 ticks (~1.9 s per breath). Opacity and
+                  // thickness move together so the ring reads as pulsing light
+                  // rather than a resizing object -- resizing would invalidate a
+                  // growing area every tick.
+                  const int t = step % 16;
+                  const int tri = t < 8 ? t : 15 - t;          // 0..7
+                  const lv_opa_t opa = (lv_opa_t) (70 + tri * 26);  // 70..252
+                  lv_obj_set_style_arc_opa(id(va_breath), opa, LV_PART_MAIN);
+                  lv_obj_set_style_arc_width(id(va_breath), 3 + (tri >> 1), LV_PART_MAIN);
+                }
+            - delay: !lambda 'return id(g_va_phase) == 3 ? 70 : 120;'
 
   # [VA] Thinking indicator: | -> || -> ||| -> || -> | at 200 ms.
   # A `script` with `mode: restart` rather than a global `interval:` because an
@@ -3978,6 +4031,51 @@ lvgl:
             arc_color: 0x0E2A33
             indicator:
               arc_opa: 0%
+        # [VA] Motion layer, phase 1 (listening): an icon-blue ring whose opacity
+        # and thickness breathe. Pure vector -- zero flash, ~200 B of LVGL object
+        # state, and the redraw is one anti-aliased ring rather than a blitted
+        # frame, which is what matters while the microphone is streaming (loop
+        # stalls are what starve the mic ring buffer -- see the buffer_size
+        # comments below). It is a full 0-360 track on the MAIN part; the
+        # indicator is kept invisible so nothing has to be recomputed per tick
+        # except style properties.
+        - arc:
+            id: va_breath
+            align: CENTER
+            width: 300
+            height: 300
+            arc_width: 3
+            min_value: 0
+            max_value: 100
+            value: 0
+            start_angle: 0
+            end_angle: 360
+            adjustable: false
+            arc_color: ${color_va_listening}
+            arc_opa: 0%
+            hidden: true
+            indicator:
+              arc_opa: 0%
+        # [VA] Motion layer, phase 3 (speaking): a 65 deg comet that orbits the
+        # avatar. Only `lv_arc_set_rotation` is called per tick, so LVGL rotates
+        # the existing indicator instead of resizing any widget.
+        - arc:
+            id: va_sweep
+            align: CENTER
+            width: 340
+            height: 340
+            arc_width: 6
+            min_value: 0
+            max_value: 100
+            value: 18
+            start_angle: 0
+            end_angle: 360
+            adjustable: false
+            arc_opa: 0%
+            hidden: true
+            indicator:
+              arc_color: ${color_va_listening}
+              arc_opa: 100%
         # [VA] Doubao mascot, cut out of the official app icon (transparent PNG,
         # see tools/gen_doubao_avatar.py). It replaces the former mdi-microphone
         # glyph: the assistant now has a face instead of a hardware symbol. The
