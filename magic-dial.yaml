@@ -893,6 +893,11 @@ touchscreen:
       - lambda: |-
           id(g_touch_down) = false; // [VA]
           if (id(g_ptt_started)) {  // [VA]
+            // A PTT hold that started on the lock screen leaves `g_wake_consume`
+            // armed; clear it here because this release never reaches the
+            // gesture path that normally consumes it, and a stale flag would
+            // swallow the user's next tap/swipe.
+            id(g_wake_consume) = false;
             // Push-to-talk feel without stopping the stream: the screen flips to
             // `thinking` the instant the finger comes up, but the audio keeps
             // flowing so HA's microVAD can see the silence and close the turn
@@ -1684,7 +1689,7 @@ script:
           id(g_va_started_ms) = millis();
           id(g_manual_until) = millis() + 60000;
           id(g_va_dac_was_unmuted) = id(dac_unmute).state;
-          id(g_va_return_to_aod) = id(g_sleeping);
+          id(g_va_return_to_aod) = id(g_sleeping) || id(g_wake_consume);
           id(dac_unmute).turn_off();
           id(va_render).execute();
       - lvgl.page.show: page_va
@@ -1814,7 +1819,11 @@ script:
       - if:
           condition:
             lambda: |-
-              return id(g_touch_down) && !id(g_ptt_started) && !id(g_wake_consume) && !id(g_va_active) &&
+              // `g_wake_consume` is deliberately NOT checked here: a hold that
+              // started on the AOD lock screen must still open the assistant.
+              // It only suppresses the tap/swipe gesture (see on_release), so a
+              // wake tap never leaks into a device action.
+              return id(g_touch_down) && !id(g_ptt_started) && !id(g_va_active) &&
                 abs(id(g_touch_dx)) <= 50 && abs(id(g_touch_dy)) <= 50;
           then:
             - lambda: 'id(g_ptt_started) = true;'
