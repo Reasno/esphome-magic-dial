@@ -410,6 +410,13 @@ voice_assistant:  # [VA]
         id(g_va_phase) = 1; // listening
         id(g_va_error_text) = "";
         id(g_va_started_ms) = millis();
+        // [VA] Continued conversation: HA re-opens the mic itself after TTS
+        // (continue_conversation), and that new turn arrives with no local
+        // script in between. Reset the per-turn flags here so round 2+ behaves
+        // exactly like round 1 -- otherwise `g_va_tts_started` stays true from
+        // the previous answer and the `on_end` fallback never fires again.
+        id(g_va_tts_started) = false;
+        id(g_va_stt_seen) = false;
         id(va_render).execute();
     - script.execute: ring_update_state
   # [VA] VAD edges do not change the phase -- the screen already says
@@ -431,6 +438,7 @@ voice_assistant:  # [VA]
         ESP_LOGI("va", "STT text: %s", x.c_str());
         id(g_va_stt_seen) = true;
         id(g_va_phase) = 2; // thinking
+        id(g_va_think_ms) = millis(); // [VA] thinking watchdog stamp
         id(va_render).execute();
         id(dac_unmute).turn_off(); // Mute thinking
     - script.execute: ring_update_state
@@ -451,8 +459,17 @@ voice_assistant:  # [VA]
         id(dac_unmute).turn_on();
     - script.execute: va_duck_external_media
     - script.execute: ring_update_state
+  # [VA] Do NOT tear the session down here. With `continue_conversation` the
+  # component itself pushes straight to START_PIPELINE right after this trigger
+  # (voice_assistant.cpp: tts_stream_end_trigger_ then `if
+  # (continue_conversation_) set_state_(START_MICROPHONE, START_PIPELINE)`), and
+  # there is no callback telling us that happened. Tearing down immediately
+  # raced the new turn: `va_teardown` waits on the zoom-out animation, so its
+  # tail (blank render + page.show main / enter_sleep) landed AFTER the new
+  # session had already painted `listening` -- "listening flashes and dies".
+  # Instead arm a short grace window and let the next turn cancel it.
   on_tts_stream_end:
-    - script.execute: va_cleanup
+    - script.execute: va_end_grace
   on_end:
     - if:
         condition: { lambda: 'return !id(g_va_tts_started);' }
@@ -903,7 +920,10 @@ touchscreen:
             // flowing so HA's microVAD can see the silence and close the turn
             // itself. Calling `voice_assistant.stop` here would abort the
             // pipeline and throw the recording away.
-            if (id(g_va_phase) == 1) id(g_va_phase) = 2; // thinking
+            if (id(g_va_phase) == 1) {
+              id(g_va_phase) = 2; // thinking
+              id(g_va_think_ms) = millis(); // [VA] thinking watchdog stamp
+            }
             id(va_render).execute();
             id(va_ptt_release_feedback).execute();
             return; // [VA]
@@ -1454,6 +1474,13 @@ globals:
   - id: g_va_started_ms  # [VA]
     type: uint32_t
     initial_value: '0'
+  # [VA] Stamp of the moment the turn entered `thinking`. Separate from
+  # g_va_started_ms (which covers the whole session) so the thinking watchdog
+  # measures only the HA-side round trip.
+  - id: g_va_think_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   - id: g_va_dac_was_unmuted  # [VA]
     type: bool
     initial_value: 'false'
@@ -1775,6 +1802,21 @@ script:
       - voice_assistant.stop:
       - script.execute: va_cleanup
 
+  # [VA] Grace window between "TTS audio finished" and "session is over".
+  # `mode: restart` so a rapid second answer just re-arms it. The teardown only
+  # happens if we are STILL in `speaking` when the window expires, i.e. no new
+  # turn started. A continued conversation reaches `on_listening` (phase 1)
+  # within ~100-300 ms, which makes the check below false and keeps the screen,
+  # the ring, the DAC state and the paused BLE scan exactly as they are.
+  - id: va_end_grace
+    mode: restart
+    then:
+      - delay: 1500ms
+      - if:
+          condition: { lambda: 'return id(g_va_active) && id(g_va_phase) == 3;' }
+          then:
+            - script.execute: va_cleanup
+
   - id: va_cleanup  # [VA]
     mode: restart
     then:
@@ -1797,6 +1839,13 @@ script:
   - id: va_teardown  # [VA]
     mode: restart
     then:
+      # [VA] Clear the component's continue_conversation_ latch. Only
+      # `request_stop()` resets it (voice_assistant.cpp), so without this a
+      # session that ends through any local path (error, watchdog, grace
+      # timeout) would still have the component re-open the microphone behind
+      # our back. Harmless when already idle: request_stop() on State::IDLE
+      # just clears the flags.
+      - voice_assistant.stop:
       - lambda: |-
           id(g_va_proactive) = false;
           id(g_proactive_deadline_ms) = 0;
@@ -3518,6 +3567,19 @@ interval:
             lambda: |-
               return id(g_va_active) && id(g_va_phase) == 1 &&
                 !id(g_va_stt_seen) && millis() - id(g_va_started_ms) > 12000;
+          then:
+            - voice_assistant.stop:
+            - script.execute: va_fail
+      # [VA] Stuck-thinking watchdog. HA can drop a turn silently (an STT
+      # integration that lets CancelledError escape sends neither an error nor
+      # run-end), and then no trigger ever fires: the dial sits in `thinking`
+      # until the 120 s ceiling. 30 s is well past the slowest legitimate round
+      # trip, web search included.
+      - if: # [VA]
+          condition:
+            lambda: |-
+              return id(g_va_active) && id(g_va_phase) == 2 &&
+                !id(g_va_tts_started) && millis() - id(g_va_think_ms) > 30000;
           then:
             - voice_assistant.stop:
             - script.execute: va_fail
