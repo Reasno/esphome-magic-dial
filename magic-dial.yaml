@@ -438,7 +438,6 @@ voice_assistant:  # [VA]
         ESP_LOGI("va", "STT text: %s", x.c_str());
         id(g_va_stt_seen) = true;
         id(g_va_phase) = 2; // thinking
-        id(g_va_think_ms) = millis(); // [VA] thinking watchdog stamp
         id(va_render).execute();
         id(dac_unmute).turn_off(); // Mute thinking
     - script.execute: ring_update_state
@@ -920,10 +919,7 @@ touchscreen:
             // flowing so HA's microVAD can see the silence and close the turn
             // itself. Calling `voice_assistant.stop` here would abort the
             // pipeline and throw the recording away.
-            if (id(g_va_phase) == 1) {
-              id(g_va_phase) = 2; // thinking
-              id(g_va_think_ms) = millis(); // [VA] thinking watchdog stamp
-            }
+            if (id(g_va_phase) == 1) id(g_va_phase) = 2; // thinking
             id(va_render).execute();
             id(va_ptt_release_feedback).execute();
             return; // [VA]
@@ -1473,13 +1469,6 @@ globals:
     initial_value: 'false'
   - id: g_va_started_ms  # [VA]
     type: uint32_t
-    initial_value: '0'
-  # [VA] Stamp of the moment the turn entered `thinking`. Separate from
-  # g_va_started_ms (which covers the whole session) so the thinking watchdog
-  # measures only the HA-side round trip.
-  - id: g_va_think_ms
-    type: uint32_t
-    restore_value: no
     initial_value: '0'
   - id: g_va_dac_was_unmuted  # [VA]
     type: bool
@@ -3567,19 +3556,6 @@ interval:
             lambda: |-
               return id(g_va_active) && id(g_va_phase) == 1 &&
                 !id(g_va_stt_seen) && millis() - id(g_va_started_ms) > 12000;
-          then:
-            - voice_assistant.stop:
-            - script.execute: va_fail
-      # [VA] Stuck-thinking watchdog. HA can drop a turn silently (an STT
-      # integration that lets CancelledError escape sends neither an error nor
-      # run-end), and then no trigger ever fires: the dial sits in `thinking`
-      # until the 120 s ceiling. 30 s is well past the slowest legitimate round
-      # trip, web search included.
-      - if: # [VA]
-          condition:
-            lambda: |-
-              return id(g_va_active) && id(g_va_phase) == 2 &&
-                !id(g_va_tts_started) && millis() - id(g_va_think_ms) > 30000;
           then:
             - voice_assistant.stop:
             - script.execute: va_fail
