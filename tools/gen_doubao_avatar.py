@@ -80,17 +80,35 @@ alpha = Image.fromarray(np.where(bg, 0, 255).astype(np.uint8))
 # as a halo against the dial's pure black page.
 alpha = alpha.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.8))
 
-out = img.copy()
-out.putalpha(alpha)
-out = out.crop(out.getbbox())
-ow, oh = out.size
+rgba = img.copy()
+rgba.putalpha(alpha)
+rgba = rgba.crop(rgba.getbbox())
+ow, oh = rgba.size
 scale = SIZE / max(ow, oh)
-out = out.resize((max(1, round(ow * scale)), max(1, round(oh * scale))), Image.LANCZOS)
+rgba = rgba.resize(
+    (max(1, round(ow * scale)), max(1, round(oh * scale))), Image.LANCZOS
+)
+
+# Flatten onto pure black instead of shipping an alpha channel.
+#
+# WHY (2026-08-29 bug): with `type: RGB565` + `transparency: alpha_channel`,
+# ESPHome tells LVGL the buffer is LV_COLOR_FORMAT_RGB565A8, but it *emits*
+# 3 interleaved bytes per pixel (RGB565 + A). LVGL's RGB565A8 is planar: a
+# w*h*2 colour plane followed by a separate w*h alpha plane. So LVGL reads the
+# colour plane straight through the interleaved alpha bytes, and every pixel is
+# progressively shifted by one byte -- which is exactly the rainbow-gradient
+# face seen on the device. Nothing in the config can fix that; the format
+# itself has to go.
+#
+# page_va's background is pinned to pure 0x000000 (and on this round LCD true
+# black merges with the unlit bezel), so a black-matted opaque image is visually
+# identical to a transparent one, while using the plain RGB565 path that the old
+# va_arc frames already proved correct on this build.
+out = Image.new("RGB", rgba.size, (0, 0, 0))
+out.paste(rgba, (0, 0), rgba)
 out.save(OUT)
 print("shirt px", int(shirt.sum()), "-> size", out.size)
 
-check = Image.new("RGB", out.size, (0, 0, 0))
-check.paste(out, (0, 0), out)
-check.resize((out.size[0] * 3, out.size[1] * 3), Image.NEAREST).save(
+out.resize((out.size[0] * 3, out.size[1] * 3), Image.NEAREST).save(
     "tools/doubao_avatar_preview.png"
 )

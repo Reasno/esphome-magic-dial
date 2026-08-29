@@ -3531,10 +3531,14 @@ font:
 # include line above brings the whole scheme back.
 
 # [VA] The one image left in the build: the Doubao mascot on the assistant page.
-# `transparency: alpha_channel` is required -- the cutout has a soft alpha edge
-# and an opaque RGB565 copy would paint the former disc background as a grey box
-# around the character. 77x112 RGB565A8 is ~26 KB of flash, i.e. nothing next to
-# the 1.9 MB of pre-rendered arc frames this page used to carry.
+# OPAQUE on purpose. `transparency: alpha_channel` was tried first and rendered
+# the face as a rainbow gradient: ESPHome declares the buffer as
+# LV_COLOR_FORMAT_RGB565A8 but emits 3 interleaved bytes per pixel (RGB565 + A),
+# while LVGL's RGB565A8 is planar (w*h*2 colour plane, then a w*h alpha plane).
+# LVGL therefore reads colour straight through the alpha bytes and every pixel
+# drifts by one byte. The cutout is instead matted onto pure black by
+# tools/gen_doubao_avatar.py -- page_va's background is pinned to 0x000000, so
+# the result is visually identical while using the plain RGB565 path.
 # `byte_order: big_endian` matches LVGL's LV_COLOR_16_SWAP=1, exactly as the old
 # va_arc frames did; the default little_endian would silently swap every colour.
 image:
@@ -3542,7 +3546,6 @@ image:
     id: img_doubao_avatar
     file: images/doubao_avatar.png
     type: RGB565
-    transparency: alpha_channel
     byte_order: big_endian
 
 lvgl:
