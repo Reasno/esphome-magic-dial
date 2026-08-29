@@ -16,9 +16,9 @@ substitutions:
   color_media: "0x49A8FF"
   color_light: "0xFFC05A"
   color_local: "0x45D6C5"
-  color_va_listening: "0x35D07F"  # [VA]
-  color_va_thinking: "0x8B7CFF"   # [VA]
-  color_va_error: "0xFF6B6B"      # [VA]
+  color_va_listening: "0xE8392A"  # [VA] Doubao scarf red -- one accent for all phases
+  color_va_thinking: "0xE8392A"   # [VA]
+  color_va_error: "0xFF6B6B"      # [VA] kept distinct: a failure must not read as a normal phase
 
   # Home Assistant entities. Change only these substitutions if entity IDs differ.
   tv_entity: media_player.sony_k_55xr50
@@ -1923,29 +1923,31 @@ script:
           // build has just finished optimising away. The recognised text is
           // logged instead (see voice_assistant on_stt_end / on_tts_start).
           const auto phase = id(g_va_phase);
-          const auto color_listening = lv_color_hex(0x00FF88);
-          const auto color_thinking  = lv_color_hex(0xCC44FF);
-          const auto color_speaking  = lv_color_hex(0x00CCFF);
-          const auto color_error     = lv_color_hex(0xFF4444);
+          // One accent for every normal phase: the Doubao scarf red. The phases
+          // are already told apart by their wording ("listening..." / the
+          // thinking pulse / "speaking...") and by the avatar being on screen,
+          // so per-phase hues only fought with the mascot's own palette.
+          const auto color_accent = lv_color_hex(0xE8392A);
+          const auto color_error  = lv_color_hex(0xFF6B6B);
 
-          lv_color_t c = color_listening;
+          lv_color_t c = color_accent;
           const char *text = "";
           bool show = true;
           switch (phase) {
-            case 1: c = color_listening; text = "listening..."; break;
-            case 2: c = color_thinking;  text = ""; break; // va_think_pulse writes it
-            case 3: c = color_speaking;  text = "speaking..."; break;
+            case 1: text = "listening..."; break;
+            case 2: text = ""; break; // va_think_pulse writes it
+            case 3: text = "speaking..."; break;
             case 4: c = color_error;     text = id(g_va_error_text).empty() ? "error"
                                                 : id(g_va_error_text).c_str(); break;
-            case 5: c = color_thinking;  text = "asking..."; break;
+            case 5: text = "asking..."; break;
             default: show = false; break;
           }
 
-          // Both widgets always exist and stay visible while a session runs;
-          // only colour and text change, so there is no hide/show flicker.
-          lv_obj_set_style_text_color(id(va_icon), c, LV_PART_MAIN);
+          // The avatar is artwork, not a glyph: it is shown or hidden, never
+          // recoloured. Only the status line carries the phase colour.
+          if (show) lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
           lv_obj_set_style_text_color(id(va_text), c, LV_PART_MAIN);
-          lv_label_set_text(id(va_icon), show ? "\xF3\xB0\x8D\xAC" : "");
           if (phase != 2) lv_label_set_text(id(va_text), text);
 
           // Guard the pulse from the render pass itself rather than from every
@@ -3444,17 +3446,9 @@ font:
       - "󰍬"  # mdi-microphone (listening / proactive ask)
       - "󰇙"  # mdi-dots-horizontal (thinking)
       - "󰅖"  # mdi-close (error)
-  # [VA] Larger state icon. The normal 28 px icon font is sized for the compact
-  # target cards; the assistant page is a full-screen hero surface and needs the
-  # same visual authority as the main page's 44/52 px values.
-  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
-    id: font_va_icons_44
-    size: 44
-    bpp: 4
-    glyphs:
-      - "󰍬"  # mdi-microphone
-      - "󰇙"  # mdi-dots-horizontal
-      - "󰅖"  # mdi-close
+  # [VA] font_va_icons_44 was removed together with the mic glyph: the assistant
+  # page now shows the Doubao avatar image instead, so a dedicated 44 px icon
+  # face carrying three glyphs is dead weight in flash.
   # Dedicated TV remote icon fonts. Both sizes are embedded so press feedback
   # shrinks the glyph without relying on an undeclared LVGL fallback font.
   - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
@@ -3535,6 +3529,21 @@ font:
 # images/va_arc_*/, va_arc_images.yaml and tools/gen_va_arcs.py are kept on disk
 # (and whitelisted in .gitignore) purely as a rollback path -- re-adding the one
 # include line above brings the whole scheme back.
+
+# [VA] The one image left in the build: the Doubao mascot on the assistant page.
+# `transparency: alpha_channel` is required -- the cutout has a soft alpha edge
+# and an opaque RGB565 copy would paint the former disc background as a grey box
+# around the character. 77x112 RGB565A8 is ~26 KB of flash, i.e. nothing next to
+# the 1.9 MB of pre-rendered arc frames this page used to carry.
+# `byte_order: big_endian` matches LVGL's LV_COLOR_16_SWAP=1, exactly as the old
+# va_arc frames did; the default little_endian would silently swap every colour.
+image:
+  - platform: file
+    id: img_doubao_avatar
+    file: images/doubao_avatar.png
+    type: RGB565
+    transparency: alpha_channel
+    byte_order: big_endian
 
 lvgl:
   # 10% (~25 KB for 360x360 RGB565) was too tight; 25% left the largest free
@@ -3966,26 +3975,23 @@ lvgl:
             arc_color: 0x0E2A33
             indicator:
               arc_opa: 0%
-        # [VA] Big centred mic glyph. font_va_icons_44 is reused on purpose:
-        # it is the largest Material Design face already embedded, so the icon
-        # reaches roughly the visual weight of the main page's font_sc_52 hero
-        # numbers without adding a single new font binary to flash.
-        # The glyph is static (always the mic); only its colour changes per
-        # phase, driven from va_render.
-        - label:
+        # [VA] Doubao mascot, cut out of the official app icon (transparent PNG,
+        # see tools/gen_doubao_avatar.py). It replaces the former mdi-microphone
+        # glyph: the assistant now has a face instead of a hardware symbol. The
+        # image is shown in ALL phases (listening / thinking / speaking) and is
+        # never tinted -- recolouring the artwork per phase would wreck the skin
+        # tones, so the phase colour lives in the status line below it.
+        - image:
             id: va_icon
             align: CENTER
-            y: -24
-            text: "󰍬"  # mdi-microphone
-            text_font: font_va_icons_44
-            text_align: CENTER
-            text_color: ${color_va_listening}
-        # [VA] Status line under the icon. ASCII only -- see va_render for why
+            y: -34
+            src: img_doubao_avatar
+        # [VA] Status line under the avatar. ASCII only -- see va_render for why
         # STT/TTS text is logged instead of drawn.
         - label:
             id: va_text
             align: CENTER
-            y: 44
+            y: 58
             # 280 px keeps the line inside the 360 px circle with margin for the
             # va_frame ring, and WRAP is safe now that the content is short
             # ASCII rather than a variable-width ellipsis glyph run.
