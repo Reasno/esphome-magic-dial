@@ -462,17 +462,28 @@ voice_assistant:  # [VA]
         id(dac_unmute).turn_on();
     - script.execute: va_duck_external_media
     - script.execute: ring_update_state
-  # [VA] Do NOT tear the session down here. With `continue_conversation` the
-  # component itself pushes straight to START_PIPELINE right after this trigger
-  # (voice_assistant.cpp: tts_stream_end_trigger_ then `if
-  # (continue_conversation_) set_state_(START_MICROPHONE, START_PIPELINE)`), and
-  # there is no callback telling us that happened. Tearing down immediately
-  # raced the new turn: `va_teardown` waits on the zoom-out animation, so its
-  # tail (blank render + page.show main / enter_sleep) landed AFTER the new
-  # session had already painted `listening` -- "listening flashes and dies".
-  # Instead arm a short grace window and let the next turn cancel it.
+  # [VA] Playback finished. This trigger NEVER tears down and NEVER changes the
+  # page -- it only puts the screen back into its `listening` look and mutes the
+  # DAC, exactly like the moment before an answer starts.
+  #
+  # Whether the session continues is decided by the component one loop later
+  # (voice_assistant.cpp, State::RESPONSE_FINISHED): this trigger fires first,
+  # then `if (continue_conversation_) START_MICROPHONE else IDLE`. So the
+  # authoritative "is the session over" signal is `is_running()` on the next
+  # iteration -- a local flag, not an HA round trip. The old 1500 ms grace timer
+  # guessed at that round trip and lost whenever HA answered late, which showed
+  # up as the clock face flashing between turns.
+  #
+  # External media stays ducked for the whole session on purpose: restoring it
+  # per turn would make the TV volume jump up and down on every round.
+  # va_teardown restores it once, when the session really ends.
   on_tts_stream_end:
-    - script.execute: va_end_grace
+    - lambda: |-
+        id(g_va_phase) = 1; // back to the listening look, page stays page_va
+        id(va_render).execute();
+        id(dac_unmute).turn_off(); // same mute the mic path uses while listening
+    - script.execute: ring_update_state
+    - script.execute: va_end_watch
   on_end:
     - if:
         condition: { lambda: 'return !id(g_va_tts_started);' }
@@ -1798,18 +1809,29 @@ script:
       - voice_assistant.stop:
       - script.execute: va_cleanup
 
-  # [VA] Grace window between "TTS audio finished" and "session is over".
-  # `mode: restart` so a rapid second answer just re-arms it. The teardown only
-  # happens if we are STILL in `speaking` when the window expires, i.e. no new
-  # turn started. A continued conversation reaches `on_listening` (phase 1)
-  # within ~100-300 ms, which makes the check below false and keeps the screen,
-  # the ring, the DAC state and the paused BLE scan exactly as they are.
-  - id: va_end_grace
+  # [VA] Event-driven session exit, replacing the old timed grace window.
+  #
+  # `is_running()` is `state_ != IDLE` (voice_assistant.h:188). After the last
+  # answer the component either re-arms the microphone (continued conversation,
+  # still running) or drops to IDLE (session over). The first `delay` just lets
+  # that assignment happen -- the tts_stream_end trigger runs synchronously
+  # BEFORE it, so checking inside the trigger would always read "running".
+  #
+  # The poll costs one comparison per 100 ms and only while a session is alive;
+  # `g_va_active` in the loop condition means every other exit path (on_error ->
+  # va_fail, the watchdogs, PTT cancel) ends it immediately.
+  - id: va_end_watch
     mode: restart
     then:
-      - delay: 1500ms
+      - delay: 50ms
+      - while:
+          condition:
+            lambda: 'return id(g_va_active) && id(magic_dial_va).is_running();'
+          then:
+            - delay: 100ms
       - if:
-          condition: { lambda: 'return id(g_va_active) && id(g_va_phase) == 3;' }
+          condition:
+            lambda: 'return id(g_va_active) && !id(magic_dial_va).is_running();'
           then:
             - script.execute: va_cleanup
 
@@ -1867,7 +1889,7 @@ script:
       # [VA] Never navigate away from a LIVE session. Everything above is
       # idempotent state restoration, but the page swap is destructive: if a new
       # turn arrived while this teardown sat behind a delay (va_fail's 1200 ms,
-      # va_end_grace's 1500 ms), the dial is listening again and must keep
+      # va_end_watch's poll), the dial is listening again and must keep
       # page_va. This is the "screen went back to the clock while the assistant
       # kept listening" bug.
       - if:
