@@ -521,15 +521,17 @@ voice_assistant:  # [VA]
           - logger.log: "[vatrace] run_end -> cleanup (no answer)"
           - script.execute: va_cleanup
   on_error:
-    # `code` is short and ASCII (e.g. stt-no-text-recognized), so it is safe to
-    # put on screen; the human-readable `message` may be Chinese and is logged.
     - lambda: |-
         ESP_LOGE("va", "error code=%s message=%s", code.c_str(), message.c_str());
-        std::string reason = code;
-        if (reason.size() > 24) reason.resize(24);
-        id(g_va_error_text) = reason.empty() ? std::string("error")
-                                             : std::string("error: ") + reason;
-    - script.execute: va_fail
+        if (code == "stt-no-text-recognized") {
+          id(va_cleanup).execute();
+        } else {
+          std::string reason = code;
+          if (reason.size() > 24) reason.resize(24);
+          id(g_va_error_text) = reason.empty() ? std::string("error")
+                                               : std::string("error: ") + reason;
+          id(va_fail).execute();
+        }
 
 # ST77916 QSPI display bus.
 spi:
