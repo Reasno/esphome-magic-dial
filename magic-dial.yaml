@@ -24,11 +24,15 @@ substitutions:
   tv_entity: media_player.sony_k_55xr50
   tv_remote_entity: remote.sony_k_55xr50
   homepod_entity: media_player.ke_ting_ke_ting
-  ceiling_light_entity: light.opple_cn_246509731_bydceiling_s_2_light
-  # The ceiling lamp is fed through a wall relay. With the relay off the lamp has
-  # no power at all, so a bare `light.toggle` silently does nothing. Tap on the
-  # ceiling target therefore switches the relay first (see `on_tap`).
-  ceiling_power_entity: switch.lumi_cn_lumi_4cf8cdf3c7cea70_l3acn3_on_p_4_1
+  # Unified template light (HA `packages/ceiling_light_unified.yaml`). It hides the
+  # split between the wall relay (on/off) and the Opple lamp (brightness/colour
+  # temperature): on/off goes to the relay, brightness/CT are proxied to the lamp
+  # and the template powers the relay up first when needed. The dial therefore
+  # only ever talks to this one entity - no relay handling here any more.
+  ceiling_light_entity: light.xi_ding_deng
+  # Real range of the Opple lamp, as reported by the template light.
+  ceiling_ct_min: "3000"
+  ceiling_ct_max: "5700"
   strip_light_entity: light.yeelink_cn_48303523_strip1_s_2_light
   dining_room_climate_entity: climate.24dfa79bdf8f
   living_room_climate_entity: climate.24dfa7d09617
@@ -1104,15 +1108,6 @@ text_sensor:
     on_value:
       - script.execute: sync_from_ha
 
-  # Wall relay feeding the ceiling lamp. Tracked so tap knows whether it must
-  # power the lamp up before talking to the light entity.
-  - platform: homeassistant
-    id: ceiling_power_state
-    entity_id: ${ceiling_power_entity}
-    internal: true
-    on_value:
-      - script.execute: sync_from_ha
-
   - platform: homeassistant
     id: strip_light_state
     entity_id: ${strip_light_entity}
@@ -1693,9 +1688,9 @@ script:
               millis() - id(g_knob_last_rotate_ms) <= 2000;
             float kelvin = optimistic && id(g_optimistic_mode) == 1 ? id(g_optimistic_value) :
               (isnan(id(ceiling_light_color_temp).state) ? 4000.0f : id(ceiling_light_color_temp).state);
-            if (kelvin < 2000.0f) kelvin = 2000.0f;
-            if (kelvin > 6500.0f) kelvin = 6500.0f;
-            const float t = (kelvin - 2000.0f) / 4500.0f;
+            if (kelvin < ${ceiling_ct_min}.0f) kelvin = ${ceiling_ct_min}.0f;
+            if (kelvin > ${ceiling_ct_max}.0f) kelvin = ${ceiling_ct_max}.0f;
+            const float t = (kelvin - ${ceiling_ct_min}.0f) / (${ceiling_ct_max}.0f - ${ceiling_ct_min}.0f);
             // Interpolate from warm white to cool white.
             id(g_ring_r) = (int) roundf(255.0f + (221.0f - 255.0f) * t);
             id(g_ring_g) = (int) roundf(210.0f + (235.0f - 210.0f) * t);
@@ -2675,7 +2670,7 @@ script:
             else if (id(g_target) == 2)
               value = id(g_control_mode) == 0
                 ? (optimistic ? id(g_optimistic_value) : (isnan(id(ceiling_light_brightness).state) ? 0 : id(ceiling_light_brightness).state / 255.0f * 100.0f))
-                : ((optimistic ? id(g_optimistic_value) : (isnan(id(ceiling_light_color_temp).state) ? 4000.0f : id(ceiling_light_color_temp).state)) - 2000.0f) / 45.0f;
+                : ((optimistic ? id(g_optimistic_value) : (isnan(id(ceiling_light_color_temp).state) ? 4000.0f : id(ceiling_light_color_temp).state)) - ${ceiling_ct_min}.0f) / ((${ceiling_ct_max}.0f - ${ceiling_ct_min}.0f) / 100.0f);
             else if (id(g_target) == 3)
               value = id(g_control_mode) == 0
                 ? (optimistic ? id(g_optimistic_value) : (isnan(id(strip_light_brightness).state) ? 0 : id(strip_light_brightness).state / 255.0f * 100.0f))
@@ -2959,36 +2954,9 @@ script:
       - if:
           condition: { lambda: 'return id(g_target) == 2;' }
           then:
-            # The lamp sits behind a wall relay. If the relay is off the light
-            # entity is dead/unavailable, so close the relay first, give the lamp
-            # a moment to join, then explicitly turn it on. Once powered, tap
-            # behaves as a plain light toggle and the relay is left closed.
-            - if:
-                condition:
-                  lambda: 'return id(ceiling_power_state).state != "on";'
-                then:
-                  - homeassistant.action: { action: switch.turn_on, data: { entity_id: '${ceiling_power_entity}' } }
-                  # The lamp needs several seconds to power up and rejoin the
-                  # Xiaomi gateway. A single turn_on at +1.5 s lands while the
-                  # entity is still `unavailable` and is dropped by HA, and the
-                  # dial then keeps showing the stale "off"/0 % readings because
-                  # the miot integration only polls slowly. So retry, and force a
-                  # state refresh after each attempt so the pushed
-                  # state/brightness sensors catch up straight away.
-                  - repeat:
-                      count: 3
-                      then:
-                        - delay: 2500ms
-                        - homeassistant.action: { action: homeassistant.update_entity, data: { entity_id: '${ceiling_light_entity}' } }
-                        - if:
-                            condition:
-                              lambda: 'return id(ceiling_light_state).state != "on";'
-                            then:
-                              - homeassistant.action: { action: light.turn_on, data: { entity_id: '${ceiling_light_entity}' } }
-                  - homeassistant.action: { action: homeassistant.update_entity, data: { entity_id: '${ceiling_light_entity}' } }
-                  - script.execute: render_main
-                else:
-                  - homeassistant.action: { action: light.toggle, data: { entity_id: '${ceiling_light_entity}' } }
+            # The template light owns the relay/lamp power-up dance, so tap is a
+            # plain toggle again.
+            - homeassistant.action: { action: light.toggle, data: { entity_id: '${ceiling_light_entity}' } }
       - if:
           condition: { lambda: 'return id(g_target) == 3;' }
           then:
@@ -3160,10 +3128,10 @@ script:
             value = fminf(100.0f, fmaxf(0.0f, value + direction * step));
           } else if (target == 2 && mode == 1) {
             if (!reuse) value = isnan(id(ceiling_light_color_temp).state) ? 4000.0f : id(ceiling_light_color_temp).state;
-            const float normalized = (value - 2000.0f) / 45.0f;
+            const float ct_span = ${ceiling_ct_max}.0f - ${ceiling_ct_min}.0f;
             const float pct = speed_pct;
-            const float kelvin_step = fmaxf(100.0f, roundf((4500.0f * pct / 100.0f) / 100.0f) * 100.0f);
-            value = roundf(fminf(6500.0f, fmaxf(2000.0f, value + direction * kelvin_step)) / 100.0f) * 100.0f;
+            const float kelvin_step = fmaxf(100.0f, roundf((ct_span * pct / 100.0f) / 100.0f) * 100.0f);
+            value = roundf(fminf(${ceiling_ct_max}.0f, fmaxf(${ceiling_ct_min}.0f, value + direction * kelvin_step)) / 100.0f) * 100.0f;
           } else if (target == 3 && mode == 0) {
             if (!reuse) value = isnan(id(strip_light_brightness).state) ? 0.0f : id(strip_light_brightness).state / 2.55f;
             const float step = speed_pct;
@@ -3492,8 +3460,8 @@ script:
             pct = v / duration * 100.0f; rgb = 0xFFFFFF;
           } else if (target == 2 && mode == 0) {               // ceiling brightness
             pct = v; rgb = 0xFFD580;
-          } else if (target == 2 && mode == 1) {               // ceiling 2000-6500 K
-            pct = (v - 2000.0f) / 45.0f; rgb = 0x87CEEB;
+          } else if (target == 2 && mode == 1) {               // ceiling colour temperature
+            pct = (v - ${ceiling_ct_min}.0f) / ((${ceiling_ct_max}.0f - ${ceiling_ct_min}.0f) / 100.0f); rgb = 0x87CEEB;
           } else if (target == 3 && mode == 0) {               // strip brightness
             pct = v; rgb = 0xFFD580;
           } else if (target == 3 && mode == 1) {               // strip hue 0-360
