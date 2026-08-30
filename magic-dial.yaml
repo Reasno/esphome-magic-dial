@@ -503,16 +503,18 @@ voice_assistant:  # [VA]
         id(dac_unmute).turn_on();
     - script.execute: va_duck_external_media
     - script.execute: ring_update_state
-  # [VA] Playback finished. This trigger NEVER tears down and NEVER changes the
-  # page -- it only puts the screen back into its `listening` look and mutes the
-  # DAC, exactly like the moment before an answer starts.
+  # [VA] Playback finished. HA runs with `always_continue_conversation = false`,
+  # so a normal turn is OVER the moment the answer stopped playing -- there is no
+  # round 2 to wait for. Showing the `listening` look here was the "optimistic
+  # second listening" bug: the dial looked like it was recording for the whole
+  # 8 s the idle watchdog needed to notice that nobody was coming.
   #
-  # NOTHING here decides whether the session is over -- not a timer, not
-  # is_running(). Two attempts failed: a 1500 ms grace timer (lost whenever HA
-  # answered late) and an is_running() poll (the dial can sit IDLE between turns
-  # when HA, not the component, re-opens the pipeline). The session end is now
-  # decided solely by "the component stayed IDLE for 3 s" in the 1 s interval
-  # below, plus the error / watchdog / PTT paths.
+  # The only case that still keeps the mic look is a proactive ask
+  # (assist_satellite.start_conversation): there HA really does listen after the
+  # question, until g_proactive_deadline_ms.
+  #
+  # The 8 s idle+silent poll, the 12 s stuck-listening watchdog and the 120 s
+  # ceiling in the 1 s interval below all stay as fallbacks.
   #
   # External media stays ducked for the whole session on purpose: restoring it
   # per turn would make the TV volume jump up and down on every round.
@@ -520,17 +522,30 @@ voice_assistant:  # [VA]
   on_tts_stream_end:
     - lambda: |-
         id(g_va_last_evt_ms) = millis();
-        // phase drops back to 1 below, so refresh the listening stamp too --
-        // otherwise the 12 s stuck-listening watchdog inherits this turn's old
-        // start time and can fire immediately.
+        // Refresh the phase stamp so the 12 s stuck-listening watchdog cannot
+        // inherit this turn's old start time in the proactive branch below.
         id(g_va_started_ms) = millis();
         ESP_LOGI("vatrace", "tts_stream_end t=%u phase=%d run=%d",
                  (unsigned) millis(), (int) id(g_va_phase),
                  (int) id(magic_dial_va).is_running());
-        id(g_va_phase) = 1; // back to the listening look, page stays page_va
-        id(va_render).execute();
         id(dac_unmute).turn_off(); // same mute the mic path uses while listening
-    - script.execute: ring_update_state
+    - if:
+        # Proactive ask still inside its listening window -> keep the mic look.
+        condition:
+          lambda: |-
+            return id(g_va_proactive) &&
+              (int32_t)(id(g_proactive_deadline_ms) - millis()) > 0;
+        then:
+          - lambda: |-
+              id(g_va_phase) = 1; // genuinely listening for the answer
+              id(va_render).execute();
+          - script.execute: ring_update_state
+        else:
+          # One-shot turn finished: close the session right away instead of
+          # faking `listening` until the 8 s idle watchdog fires. va_cleanup ->
+          # va_teardown re-arms micro_wake_word and returns to page_main / AOD.
+          - logger.log: "[vatrace] tts_stream_end -> cleanup (no continue)"
+          - script.execute: va_cleanup
   # [VA] RUN_END is a network message from HA and its arrival is NOT ordered
   # against the local `on_tts_stream_end`: in a continued conversation round N's
   # run-end regularly lands AFTER round N+1's on_listening, which already reset
