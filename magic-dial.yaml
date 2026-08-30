@@ -508,7 +508,6 @@ voice_assistant:  # [VA]
         id(g_va_phase) = 3; // speaking
         id(va_render).execute();
         id(dac_unmute).turn_on();
-    - script.execute: va_duck_external_media
     - script.execute: ring_update_state
   # [VA] Playback finished. HA runs with `always_continue_conversation = false`,
   # so a normal turn is OVER the moment the answer stopped playing -- there is no
@@ -522,10 +521,6 @@ voice_assistant:  # [VA]
   #
   # The 8 s idle+silent poll, the 12 s stuck-listening watchdog and the 120 s
   # ceiling in the 1 s interval below all stay as fallbacks.
-  #
-  # External media stays ducked for the whole session on purpose: restoring it
-  # per turn would make the TV volume jump up and down on every round.
-  # va_teardown restores it once, when the session really ends.
   on_tts_stream_end:
     - lambda: |-
         id(g_va_last_evt_ms) = millis();
@@ -1611,12 +1606,6 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
-  - id: g_va_duck_volume_snapshot  # [VA]
-    type: float
-    initial_value: '0.0'
-  - id: g_va_ducked_target  # [VA] -1: none, 0: tv, 1: homepod
-    type: int
-    initial_value: '-1'
   - id: g_touch_down  # [VA]
     type: bool
     initial_value: 'false'
@@ -1977,7 +1966,6 @@ script:
       # Idle render pass: blanks va_icon / va_text and stops va_think_pulse, so
       # nothing is left painted on the page we are navigating away from.
       - script.execute: va_render
-      - script.execute: va_restore_external_media
       - script.execute: ring_update_state
       # [VA] Never navigate away from a LIVE session. Everything above is
       # idempotent state restoration, but the page swap is destructive: if a new
@@ -2052,60 +2040,6 @@ script:
       - lambda: 'id(g_va_release_flash) = true; id(va_render).execute();'
       - delay: 100ms
       - lambda: 'id(g_va_release_flash) = false; id(va_render).execute();'
-
-  - id: va_duck_external_media  # [VA]
-    then:
-      - lambda: |-
-          id(g_va_ducked_target) = -1;
-          if (id(g_target) == 0) {
-            id(g_va_duck_volume_snapshot) = id(tv_volume).state;
-            id(g_va_ducked_target) = 0;
-          } else if (id(g_target) == 1) {
-            id(g_va_duck_volume_snapshot) = id(homepod_volume).state;
-            id(g_va_ducked_target) = 1;
-          }
-      - if:
-          condition: { lambda: 'return id(g_va_ducked_target) == 0;' }
-          then:
-            - homeassistant.action:
-                action: media_player.volume_set
-                data:
-                  entity_id: ${tv_entity}
-                  volume_level: "0.05"
-      - if:
-          condition: { lambda: 'return id(g_va_ducked_target) == 1;' }
-          then:
-            - homeassistant.action:
-                action: media_player.volume_set
-                data:
-                  entity_id: ${homepod_entity}
-                  volume_level: "0.05"
-
-  - id: va_restore_external_media  # [VA]
-    then:
-      - if:
-          condition: { lambda: 'return id(g_va_ducked_target) == 0;' }
-          then:
-            - if:
-                condition: { lambda: 'return abs(id(tv_volume).state - 0.05f) <= 0.03f;' }
-                then:
-                  - homeassistant.action:
-                      action: media_player.volume_set
-                      data:
-                        entity_id: ${tv_entity}
-                        volume_level: !lambda 'char buf[8]; snprintf(buf, 8, "%.2f", id(g_va_duck_volume_snapshot)); return std::string(buf);'
-      - if:
-          condition: { lambda: 'return id(g_va_ducked_target) == 1;' }
-          then:
-            - if:
-                condition: { lambda: 'return abs(id(homepod_volume).state - 0.05f) <= 0.03f;' }
-                then:
-                  - homeassistant.action:
-                      action: media_player.volume_set
-                      data:
-                        entity_id: ${homepod_entity}
-                        volume_level: !lambda 'char buf[8]; snprintf(buf, 8, "%.2f", id(g_va_duck_volume_snapshot)); return std::string(buf);'
-      - lambda: 'id(g_va_ducked_target) = -1;'
 
   - id: va_render  # [VA]
     then:
