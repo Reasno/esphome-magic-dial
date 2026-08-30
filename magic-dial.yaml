@@ -77,6 +77,11 @@ esphome:
           id: page_main
           animation: fade_in
           time: 250ms
+      # [WW] microWakeWord never self-starts: MicroWakeWord::setup() only builds
+      # the frontend/queues and leaves the component in State::STOPPED, so
+      # without this the model is flashed but deaf. va_teardown re-arms it after
+      # every assistant turn; this is the initial arm.
+      - micro_wake_word.start:
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -370,6 +375,32 @@ microphone:
     pdm: true
     sample_rate: 16000
     bits_per_sample: 16bit
+
+# [WW] On-device wake word "豆包豆包" (microWakeWord, trained 2026-08-30:
+# recall 98.46 %, 0 false accepts/h over 9.67 h of ambient audio).
+# The model is local (models/wakeword_ecc0de7c.json + .tflite) -- no download
+# at build time. It shares `magic_dial_microphone` with `voice_assistant`
+# through the microphone-source layer, but never runs at the same time: the
+# component stops itself on detection (`stop_after_detection`), va_enter_session
+# stops it for PTT/proactive turns and va_teardown re-arms it.
+micro_wake_word:
+  id: magic_dial_mww
+  microphone:
+    microphone: magic_dial_microphone
+    # [WW] mWW taps the raw mic source and never sees voice_assistant's
+    # volume_multiplier: 3.0. This PDM mic is quiet enough that the features
+    # land below the model's training level, so lift it here (integer gain).
+    gain_factor: 4
+  stop_after_detection: true
+  models:
+    - model: models/wakeword_ecc0de7c.json
+      probability_cutoff: 0.96
+      sliding_window_size: 5
+  on_wake_word_detected:
+    - logger.log:
+        level: INFO
+        format: "[WW] wake word detected -> starting assistant"
+    - script.execute: va_prepare
 
 voice_assistant:  # [VA]
   id: magic_dial_va
@@ -1811,6 +1842,10 @@ script:
       # the whole BLE stack down and back up takes hundreds of ms and would
       # stall the loop exactly at the moment the microphone opens.
       - esp32_ble_tracker.stop_scan:
+      # [WW] The wake word engine must not keep chewing the mic stream while the
+      # assistant owns it: it costs main-loop time and could re-trigger on the
+      # TTS answer coming out of the speaker. va_teardown re-arms it.
+      - micro_wake_word.stop:
 
   - id: va_prepare # [VA]
     then:
@@ -1932,6 +1967,12 @@ script:
           condition: { lambda: 'return !id(g_va_active);' }
           then:
             - logger.log: "[vatrace] teardown -> leaving page_va"
+            # [WW] Re-arm the wake word only once the session is really over.
+            # Deliberately inside this `!g_va_active` branch: the delayed
+            # teardown paths (va_fail, watchdog) can run while a new turn is
+            # already live, and starting mWW then would fight the assistant for
+            # the microphone.
+            - micro_wake_word.start:
             - if:
                 condition: { lambda: 'return id(g_va_return_to_aod);' }
                 then:
