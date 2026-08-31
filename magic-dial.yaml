@@ -1839,15 +1839,10 @@ script:
           brightness: 100%
       - lvgl.page.show: page_va
       - script.execute: ring_update_state
-      # [VA] Pause BLE scanning for the duration of the turn. NOT for RAM --
-      # heap_max_block sits at 31 KB now and mic_task only needs 4 KB -- but for
-      # main-loop time: with `bluetooth_proxy: active: true` every advertisement
-      # costs a scan request plus a callback on the main loop, and the loop
-      # stalls are what overrun the mic ring buffer and starve the I2S speaker.
-      # `stop_scan` is used rather than `esp32_ble.disable` on purpose: tearing
-      # the whole BLE stack down and back up takes hundreds of ms and would
-      # stall the loop exactly at the moment the microphone opens.
-      - esp32_ble_tracker.stop_scan:
+      # [VA] Keep BLE scanning active during voice sessions. A previous version
+      # stopped scanning here to reduce main-loop pressure, but missed restore
+      # paths could leave the Bluetooth proxy online while advertising reports
+      # stayed empty until reboot.
       # [WW] The wake word engine must not keep chewing the mic stream while the
       # assistant owns it: it costs main-loop time and could re-trigger on the
       # TTS answer coming out of the speaker. va_teardown re-arms it.
@@ -1951,13 +1946,9 @@ script:
           id(g_last_activity) = millis();
           id(g_manual_until) = millis() + 3000;
           if (id(g_va_dac_was_unmuted)) id(dac_unmute).turn_on(); else id(dac_unmute).turn_off();
-      # [VA] Always re-arm BLE scanning, deliberately placed BEFORE the early-exit
-      # cases below and outside any condition. The lambda above can `return`
-      # early, but that only leaves the lambda -- this action still runs, so every
-      # exit path (on_end, on_error -> va_fail, on_tts_stream_end, the 12 s stuck
-      # watchdog and the 120 s ceiling) restores the proxy. A missed restore would
-      # silently leave the whole house's BLE proxy dead until the next reboot.
-      - esp32_ble_tracker.start_scan:
+      # [VA] BLE scanning is no longer paused during VA, so there is nothing to
+      # restore here. Keeping scan continuous avoids a stale Bluetooth proxy when
+      # an unusual teardown path skips cleanup.
       # Idle render pass: blanks va_icon / va_text and stops va_think_pulse, so
       # nothing is left painted on the page we are navigating away from.
       - script.execute: va_render
