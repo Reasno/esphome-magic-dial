@@ -435,7 +435,7 @@ voice_assistant:  # [VA]
   # 31dBFS -> 24dBFS, so the pre-multiplied signal keeps int16 headroom instead
   # of being pushed into the rails by AGC on top of it. If turns start coming
   # back as `stt-no-text-recognized` again, this is the first pair to back off.
-  noise_suppression_level: 1
+  noise_suppression_level: 0
   auto_gain: 24dBFS
   volume_multiplier: 4.5
   # A pipeline can also be started from HA (assist_satellite.start_conversation
