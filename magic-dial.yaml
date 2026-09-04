@@ -40,7 +40,7 @@ substitutions:
 
   # Local BLE presence threshold. Presence is debounced below: 10 s to enter,
   # 2 min to leave, matching the existing HA template sensors.
-  bracelet_presence_rssi: "-95"
+  bracelet_presence_rssi: "-90"
 
   # [VA] Proactive ask. `satellite_entity` is this device's assist_satellite
   # entity in HA; `assist_satellite.start_conversation` is what makes the dial
