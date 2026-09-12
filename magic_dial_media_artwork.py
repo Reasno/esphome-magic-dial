@@ -26,7 +26,8 @@ from PIL import Image, ImageDraw
 
 ART_SIZE = 360
 RGB565_BYTES = ART_SIZE * ART_SIZE * 2
-ART_CACHE_VERSION = "cover-v3"
+ART_CACHE_VERSION = "cover-v4"
+DEFAULT_COVER_FILENAME = "default_album_cover.jpg"
 
 
 def stable_color(seed: str) -> tuple[int, int, int]:
@@ -182,7 +183,13 @@ def search_related_music_artwork(media: ActiveMedia) -> str:
     return best.source_url if best.score >= 0.34 else ''
 
 
-def placeholder_cover_art(media: ActiveMedia) -> Image.Image:
+def placeholder_cover_art(media: ActiveMedia, output_dir: Path) -> Image.Image:
+    default_cover = output_dir / DEFAULT_COVER_FILENAME
+    if default_cover.is_file():
+        with Image.open(default_cover) as image:
+            return square_cover(image)
+
+    # Emergency fallback if the deployed default cover is missing.
     base = stable_color(media.art_signature or f'{media.kind}:{media.title}:{media.subtitle}')
     accent = brighten(base, 36)
     shadow = tuple(max(12, channel // 3) for channel in base)
@@ -519,7 +526,7 @@ def materialize_art(media: ActiveMedia, client: HAClient, output_dir: Path, prev
         image = generate_ai_music_art(media, client, output_dir)
 
     if image is None:
-        image = square_cover(placeholder_cover_art(media))
+        image = square_cover(placeholder_cover_art(media, output_dir))
 
     write_rgb565_atomic(image, cache_path)
     return build_public_url(output_dir, cache_path)
