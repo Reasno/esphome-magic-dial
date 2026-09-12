@@ -59,32 +59,56 @@ esphome:
   includes:
     - ulanzi_bar.h
     - media_artwork_loader.h
+    - lvgl_screenshot.h
+  build_flags:
+    - -DLV_USE_SNAPSHOT=1
   on_boot:
-    priority: -100
-    then:
-      - lambda: |-
-          magic_dial::media_artwork::loader.setup();
-      - delay: 1s
-      - light.turn_on:
-          id: backlight_light
-          brightness: 100%
-      - lambda: |-
-          id(g_last_activity) = millis();
-          id(g_backlight_pct) = 100;
-      # Keep the speaker's software gain in sync with the number the 本机扬声器
-      # target shows from the very first frame, so the first VA turn after a
-      # reboot is already at the displayed volume.
-      - script.execute: apply_local_volume
-      - script.execute: resolve_priority
-      - lvgl.page.show:
-          id: page_main
-          animation: fade_in
-          time: 250ms
-      # [WW] microWakeWord never self-starts: MicroWakeWord::setup() only builds
-      # the frontend/queues and leaves the component in State::STOPPED, so
-      # without this the model is flashed but deaf. va_teardown re-arms it after
-      # every assistant turn; this is the initial arm.
-      - micro_wake_word.start:
+    # The LCD remains powered from the battery while the ESP32 reboots. A long
+    # pre-init reset is required to clear a latched ST77916/QSPI error state.
+    - priority: 1000
+      then:
+        - lambda: |-
+            gpio_reset_pin(GPIO_NUM_17);
+            gpio_set_direction(GPIO_NUM_17, GPIO_MODE_OUTPUT);
+            gpio_set_level(GPIO_NUM_17, 0);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            gpio_set_level(GPIO_NUM_17, 1);
+            vTaskDelay(pdMS_TO_TICKS(120));
+    - priority: -100
+      then:
+        - lambda: |-
+            magic_dial::media_artwork::loader.setup();
+            auto *artwork_parent = lv_obj_get_parent(id(aod_media_image));
+            lv_obj_delete(id(aod_media_image));
+            id(aod_media_image) = lv_canvas_create(artwork_parent);
+            lv_obj_set_size(id(aod_media_image), magic_dial::media_artwork::WIDTH,
+                            magic_dial::media_artwork::HEIGHT);
+            lv_obj_align(id(aod_media_image), LV_ALIGN_CENTER, 0, 0);
+            lv_obj_add_flag(id(aod_media_image), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(id(aod_media_image),
+                               static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+            ESP_LOGI("aod_media", "Replaced AOD image widget with RGB565 canvas");
+        - delay: 1s
+        - light.turn_on:
+            id: backlight_light
+            brightness: 100%
+        - lambda: |-
+            id(g_last_activity) = millis();
+            id(g_backlight_pct) = 100;
+        # Keep the speaker's software gain in sync with the number the 本机扬声器
+        # target shows from the very first frame, so the first VA turn after a
+        # reboot is already at the displayed volume.
+        - script.execute: apply_local_volume
+        - script.execute: resolve_priority
+        - lvgl.page.show:
+            id: page_main
+            animation: fade_in
+            time: 250ms
+        # [WW] microWakeWord never self-starts: MicroWakeWord::setup() only builds
+        # the frontend/queues and leaves the component in State::STOPPED, so
+        # without this the model is flashed but deaf. va_teardown re-arms it after
+        # every assistant turn; this is the initial arm.
+        - micro_wake_word.start:
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -191,6 +215,22 @@ mqtt:
   birth_message:
   will_message:
   reboot_timeout: 0s
+  on_message:
+    - topic: magic_dial/debug/artwork_url
+      then:
+        - lambda: |-
+            id(aod_media_artwork_url).publish_state(x);
+    - topic: magic_dial/debug/force_aod
+      then:
+        - script.execute: enter_sleep
+    - topic: magic_dial/debug/screenshot/request
+      then:
+        - lambda: |-
+            magic_dial::screenshot::publisher.capture(lv_screen_active());
+    - topic: magic_dial/debug/reboot
+      then:
+        - lambda: |-
+            App.safe_reboot();
 
 # The physical knob is not a quadrature encoder. Each direction has its own
 # active-low pulse input: left on GPIO2 and right on GPIO1.
@@ -2751,6 +2791,10 @@ script:
           const std::string art_url = id(aod_media_artwork_url).state;
           const bool media_ready = id(g_aod_media_ready) && !art_url.empty() &&
             art_url != "unknown" && art_url != "unavailable";
+          ESP_LOGI("aod_media", "Render AOD: sleeping=%s ready=%s url_len=%u hidden_before=%s",
+                   id(g_sleeping) ? "yes" : "no", id(g_aod_media_ready) ? "yes" : "no",
+                   static_cast<unsigned>(art_url.size()),
+                   lv_obj_has_flag(id(aod_media_image), LV_OBJ_FLAG_HIDDEN) ? "yes" : "no");
           if (media_ready) {
             lv_obj_clear_flag(id(aod_media_image), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(lbl_aod_time), LV_OBJ_FLAG_HIDDEN);
@@ -3565,15 +3609,31 @@ interval:
   - interval: 100ms
     then:
       - lambda: |-
-          esphome::image::Image *image = nullptr;
-          const auto result = magic_dial::media_artwork::loader.poll(&image);
+          uint8_t *buffer = nullptr;
+          const auto result = magic_dial::media_artwork::loader.poll(&buffer);
           id(g_aod_media_download_result) = static_cast<int>(result);
           if (result == magic_dial::media_artwork::PollResult::READY) {
             id(g_aod_media_ready) = true;
-            lv_image_set_src(id(aod_media_image), image);
+            static lv_draw_buf_t artwork_draw_buf;
+            lv_draw_buf_init(&artwork_draw_buf,
+                             magic_dial::media_artwork::WIDTH,
+                             magic_dial::media_artwork::HEIGHT,
+                             LV_COLOR_FORMAT_RGB565, 0, buffer,
+                             magic_dial::media_artwork::BUFFER_BYTES);
+            lv_draw_buf_set_flag(&artwork_draw_buf, LV_IMAGE_FLAGS_MODIFIABLE);
+            lv_canvas_set_draw_buf(id(aod_media_image), &artwork_draw_buf);
             lv_obj_invalidate(id(aod_media_image));
+            ESP_LOGI("aod_media", "Published canvas buffer: sleeping=%s data=%p size=%u %ux%u",
+                     id(g_sleeping) ? "yes" : "no", buffer,
+                     static_cast<unsigned>(magic_dial::media_artwork::BUFFER_BYTES),
+                     static_cast<unsigned>(magic_dial::media_artwork::WIDTH),
+                     static_cast<unsigned>(magic_dial::media_artwork::HEIGHT));
+            id(mqtt_client)->publish("magic_dial/debug/artwork/ready",
+                                     id(aod_media_artwork_url).state, 0, false);
           } else if (result == magic_dial::media_artwork::PollResult::ERROR) {
             id(g_aod_media_ready) = false;
+            id(mqtt_client)->publish("magic_dial/debug/artwork/error",
+                                     id(aod_media_artwork_url).state, 0, false);
           }
       - if:
           condition:
@@ -3585,6 +3645,13 @@ interval:
                   lambda: "return id(g_sleeping);"
                 then:
                   - script.execute: render_aod
+                  - lambda: |-
+                      lv_obj_move_foreground(id(aod_media_image));
+                      lv_obj_move_foreground(id(arc_aod_media_progress));
+                      lv_obj_invalidate(lv_screen_active());
+                      lv_refr_now(lv_display_get_default());
+      - lambda: |-
+          magic_dial::screenshot::publisher.publish_next(id(mqtt_client));
 
   - interval: 1s
     then:
@@ -4148,6 +4215,14 @@ lvgl:
     - id: page_aod
       bg_color: 0x000000
       widgets:
+        # Keep a one-pixel generated canvas so ESPHome enables LVGL's canvas
+        # module. The real 360x360 canvas below binds the loader's two PSRAM
+        # buffers directly and allocates no third framebuffer.
+        - canvas:
+            id: aod_canvas_feature_anchor
+            width: 1
+            height: 1
+            hidden: true
         - image:
             id: aod_media_image
             align: CENTER

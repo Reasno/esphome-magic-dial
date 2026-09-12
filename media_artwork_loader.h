@@ -1,12 +1,11 @@
 #pragma once
 
 #include <cstdio>
-#include <new>
 #include <string>
 
 #include "esp_heap_caps.h"
+#include "driver/gpio.h"
 #include "esp_http_client.h"
-#include "esphome/components/image/image.h"
 #include "esphome/core/defines.h"
 #include "esphome/core/log.h"
 #ifdef USE_ESP32_BLE
@@ -49,13 +48,6 @@ class Loader {
       this->buffers_[i] = static_cast<uint8_t *>(heap_caps_malloc(BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
       if (this->buffers_[i] == nullptr) {
         ESP_LOGE(TAG, "Failed to allocate PSRAM artwork buffer %u", static_cast<unsigned>(i));
-        return false;
-      }
-      this->images_[i] = new (std::nothrow)
-          esphome::image::Image(this->buffers_[i], WIDTH, HEIGHT, esphome::image::IMAGE_TYPE_RGB565,
-                                esphome::image::TRANSPARENCY_OPAQUE);
-      if (this->images_[i] == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate artwork descriptor %u", static_cast<unsigned>(i));
         return false;
       }
     }
@@ -109,7 +101,7 @@ class Loader {
     this->resume_ble_scan_();
   }
 
-  PollResult poll(esphome::image::Image **image) {
+  PollResult poll(uint8_t **buffer) {
     if (this->mutex_ == nullptr)
       return PollResult::NONE;
 
@@ -118,7 +110,7 @@ class Loader {
     if (result == PollResult::READY) {
       this->active_slot_ = this->ready_slot_;
       this->active_url_ = this->requested_url_;
-      *image = this->images_[this->active_slot_];
+      *buffer = this->buffers_[this->active_slot_];
     }
     this->result_ = PollResult::NONE;
     xSemaphoreGive(this->mutex_);
@@ -319,7 +311,6 @@ class Loader {
   }
 
   uint8_t *buffers_[2]{nullptr, nullptr};
-  esphome::image::Image *images_[2]{nullptr, nullptr};
   SemaphoreHandle_t mutex_{nullptr};
   TaskHandle_t task_{nullptr};
   std::string requested_url_;
