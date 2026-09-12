@@ -1,0 +1,144 @@
+substitutions:
+  device_name: kids-nfc-reader
+  friendly_name: 儿童积分 NFC 签到器
+  i2c_sda_pin: GPIO8
+  i2c_scl_pin: GPIO9
+  indicator_pin: GPIO10
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: ESP32-C3 SuperMini + PN532 儿童积分签到读卡器与客厅 BLE Proxy
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: ESP32C3
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret kids_nfc_reader_api_key
+  # ESP32-C3 是单核芯片。仅在 HA 订阅实体状态时启动扫描，避免设备启动和
+  # Wi-Fi 重连阶段同时争用 CPU 与 2.4 GHz 射频。
+  on_client_connected:
+    - esp32_ble_tracker.start_scan:
+        continuous: true
+  on_client_disconnected:
+    - if:
+        condition:
+          not:
+            api.connected:
+              state_subscription_only: true
+        then:
+          - esp32_ble_tracker.stop_scan:
+
+ota:
+  - platform: esphome
+    password: !secret kids_nfc_reader_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: "Kids NFC Reader Fallback"
+    password: !secret kids_nfc_reader_fallback_password
+
+captive_portal:
+
+# ESP32-C3 同时承担客厅 BLE 接收。主动 GATT 连接保留完整代理能力，但限制
+# 为一个连接槽；手环 RSSI 和普通广播传感器不占用连接槽。
+esp32_ble_tracker:
+  scan_parameters:
+    continuous: false
+
+bluetooth_proxy:
+  active: true
+  connection_slots: 1
+
+# 接线：GPIO8->SDA，GPIO9->SCL，3V3->VCC，GND->GND。
+# PN532 切到 I²C 模式（常见 SEL0=1、SEL1=0），切换后彻底断电重启。
+i2c:
+  id: pn532_i2c_bus
+  sda: ${i2c_sda_pin}
+  scl: ${i2c_scl_pin}
+  scan: true
+  frequency: 100kHz
+
+globals:
+  - id: last_tag_id
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: last_tag_timestamp
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+# GPIO10 -> 220Ω~1kΩ 电阻 -> LED 正极；LED 负极 -> GND。
+output:
+  - platform: gpio
+    id: checkin_led
+    pin:
+      number: ${indicator_pin}
+      inverted: false
+
+sensor:
+  - platform: ble_rssi
+    mac_address: "2C:0D:CF:6D:5B:E1"
+    name: "谷溪的手环 RSSI"
+    id: gu_xi_mi_band_rssi
+    filters:
+      - exponential_moving_average:
+          alpha: 0.3
+          send_every: 1
+      - throttle: 10s
+
+  - platform: ble_rssi
+    mac_address: "2C:0D:CF:48:B6:5D"
+    name: "刘心怡的手环 RSSI"
+    id: liu_xin_yi_mi_band_rssi
+    filters:
+      - exponential_moving_average:
+          alpha: 0.3
+          send_every: 1
+      - throttle: 10s
+
+pn532_i2c:
+  id: kids_pn532
+  i2c_id: pn532_i2c_bus
+  update_interval: 500ms
+  on_tag:
+    then:
+      - if:
+          condition:
+            lambda: |-
+              const uint32_t now = millis();
+              if (id(last_tag_id) == x &&
+                  static_cast<uint32_t>(now - id(last_tag_timestamp)) < 3000) {
+                ESP_LOGD("nfc", "忽略 cooldown 内重复刷卡：%s", x.c_str());
+                return false;
+              }
+              id(last_tag_id) = x;
+              id(last_tag_timestamp) = now;
+              return true;
+          then:
+            - logger.log:
+                level: INFO
+                format: "检测到 NFC 卡，UID：%s"
+                args:
+                  - "x.c_str()"
+            - homeassistant.tag_scanned: !lambda |-
+                return x;
+            - homeassistant.event:
+                event: esphome.kid_checkin
+                data:
+                  tag_id: !lambda |-
+                    return x;
+            - output.turn_on: checkin_led
+            - delay: 150ms
+            - output.turn_off: checkin_led

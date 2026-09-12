@@ -38,10 +38,6 @@ substitutions:
   living_room_climate_entity: climate.24dfa7d09617
   floor_heating_entity: climate.suittc_cn_929054575_m302
 
-  # Local BLE presence threshold. Presence is debounced below: 10 s to enter,
-  # 2 min to leave, matching the existing HA template sensors.
-  bracelet_presence_rssi: "-90"
-
   # [VA] Proactive ask. `satellite_entity` is this device's assist_satellite
   # entity in HA; `assist_satellite.start_conversation` is what makes the dial
   # speak first and then listen. Adjust if the entity id differs.
@@ -172,13 +168,6 @@ http_request:
   buffer_size_rx: 1024
   watchdog_timeout: 15s
 
-# BLE scanning runs alongside Wi-Fi on the ESP32-S3. Active scanning lets the
-# Home Assistant Bluetooth proxy request scan responses from nearby devices.
-esp32_ble_tracker:
-
-bluetooth_proxy:
-  active: true
-
 # MQTT is used for exactly one thing: driving the Ulanzi pixel clock's knob bar.
 # The dial publishes a ready-made AWTRIX payload straight to
 # `ulanzi_aa68/custom/test` on the shared EMQX broker - no Home Assistant round
@@ -220,27 +209,19 @@ binary_sensor:
     attribute: is_volume_muted
     internal: true
 
-  - platform: template
+  # BLE 扫描与房间判定由儿童积分 NFC 签到器承担。Magic Dial 只订阅 HA
+  # 中保持稳定的 presence 实体，避免 BLE 栈继续与 LVGL、音频和 Wi-Fi 争用内存。
+  - platform: homeassistant
     id: gu_xi_in_living_room_local
+    entity_id: binary_sensor.gu_xi_zai_ke_ting
     internal: true
-    lambda: |-
-      return !isnan(id(gu_xi_mi_band_rssi).state) &&
-        id(gu_xi_mi_band_rssi).state >= atof("${bracelet_presence_rssi}");
-    filters:
-      - delayed_on: 10s
-      - delayed_off: 2min
     on_state:
       - script.execute: apply_screen_brightness
 
-  - platform: template
+  - platform: homeassistant
     id: liu_xin_yi_in_living_room_local
+    entity_id: binary_sensor.liu_xin_yi_zai_ke_ting
     internal: true
-    lambda: |-
-      return !isnan(id(liu_xin_yi_mi_band_rssi).state) &&
-        id(liu_xin_yi_mi_band_rssi).state >= atof("${bracelet_presence_rssi}");
-    filters:
-      - delayed_on: 10s
-      - delayed_off: 2min
     on_state:
       - script.execute: apply_screen_brightness
 
@@ -1207,26 +1188,6 @@ sensor:
       name: "Heap Max Block"
     loop_time:
       name: "Loop Time"
-  - platform: ble_rssi
-    mac_address: "2C:0D:CF:6D:5B:E1"
-    name: "谷溪的手环 RSSI"
-    id: gu_xi_mi_band_rssi
-    filters:
-      - exponential_moving_average:
-          alpha: 0.3
-          send_every: 1
-      - throttle: 10s
-
-  - platform: ble_rssi
-    mac_address: "2C:0D:CF:48:B6:5D"
-    name: "刘心怡的手环 RSSI"
-    id: liu_xin_yi_mi_band_rssi
-    filters:
-      - exponential_moving_average:
-          alpha: 0.3
-          send_every: 1
-      - throttle: 10s
-
   - platform: homeassistant
     id: tv_volume
     entity_id: ${tv_entity}
