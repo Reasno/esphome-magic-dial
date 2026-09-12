@@ -21,12 +21,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 ART_SIZE = 360
 RGB565_BYTES = ART_SIZE * ART_SIZE * 2
-ART_CACHE_VERSION = "cover-v2"
+ART_CACHE_VERSION = "cover-v3"
 
 
 def stable_color(seed: str) -> tuple[int, int, int]:
@@ -38,46 +38,174 @@ def brighten(color: tuple[int, int, int], amount: int) -> tuple[int, int, int]:
     return tuple(min(255, c + amount) for c in color)
 
 
-def music_search_terms(title: str) -> list[str]:
-    """Build search terms without app names or rolling lyric metadata."""
-    terms = []
+def normalize_text(text: str) -> str:
+    return re.sub(r"[\W_]+", " ", text.lower(), flags=re.UNICODE).strip()
+
+
+def text_tokens(text: str) -> set[str]:
+    return {token for token in normalize_text(text).split() if token}
+
+
+def text_similarity(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    normalized_left = normalize_text(left)
+    normalized_right = normalize_text(right)
+    if not normalized_left or not normalized_right:
+        return 0.0
+    if normalized_left == normalized_right:
+        return 1.0
+    if normalized_left in normalized_right or normalized_right in normalized_left:
+        return 0.88
+    left_tokens = text_tokens(left)
+    right_tokens = text_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = len(left_tokens & right_tokens)
+    if overlap == 0:
+        return 0.0
+    return overlap / max(len(left_tokens), len(right_tokens))
+
+
+def likely_artist_hint(value: str) -> bool:
+    normalized = normalize_text(value)
+    if not normalized:
+        return False
+    if len(normalized) > 48:
+        return False
+    return len(normalized.split()) <= 6
+
+
+def extract_track_artist_hints(media: ActiveMedia) -> tuple[str, str]:
+    title = media.title.strip()
+    artist_hint = ""
     parts = [part.strip() for part in re.split(r"\s+[·•]\s+", title) if part.strip()]
     if len(parts) >= 2:
-        # AirPlay sometimes combines "track · artist" in media_title.
-        terms.append(f"{parts[0]} {parts[1]}")
-        terms.append(parts[0])
-    terms.append(title.strip())
+        title = parts[0]
+        if likely_artist_hint(parts[1]):
+            artist_hint = parts[1]
+    if not artist_hint and likely_artist_hint(media.lyric_hint):
+        artist_hint = media.lyric_hint.strip()
+    return title or media.title.strip(), artist_hint
+
+
+def music_search_terms(media: ActiveMedia) -> list[str]:
+    """构造搜图查询，避免把 app 名或滚动歌词带进去。"""
+    title_hint, artist_hint = extract_track_artist_hints(media)
+    terms = []
+    if title_hint and artist_hint:
+        terms.append(f"{title_hint} {artist_hint}")
+    if title_hint:
+        terms.append(title_hint)
+    if media.title.strip():
+        terms.append(media.title.strip())
     return list(dict.fromkeys(term for term in terms if term))
 
 
-def search_itunes_artwork(title: str) -> str:
-    for term in music_search_terms(title):
+@dataclass
+class ArtworkCandidate:
+    source_url: str
+    source_name: str
+    title: str
+    artist: str
+    album: str
+    score: float
+
+
+def score_music_candidate(media: ActiveMedia, title: str, artist: str, album: str) -> float:
+    title_hint, artist_hint = extract_track_artist_hints(media)
+    title_score = max(text_similarity(title_hint, title), text_similarity(title_hint, album))
+    artist_score = text_similarity(artist_hint, artist) if artist_hint else 0.0
+    combined_bonus = text_similarity(media.title, f"{title} {artist} {album}")
+    return title_score * 0.65 + artist_score * 0.25 + combined_bonus * 0.10
+
+
+def search_itunes_candidates(media: ActiveMedia) -> list[ArtworkCandidate]:
+    candidates: list[ArtworkCandidate] = []
+    for term in music_search_terms(media):
         query = urllib.parse.urlencode({'term': term, 'media': 'music', 'entity': 'song', 'limit': 5})
         url = f'https://itunes.apple.com/search?{query}'
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:
                 payload = json.loads(resp.read().decode('utf-8'))
-            for item in payload.get('results', []):
-                artwork = item.get('artworkUrl100') or item.get('artworkUrl60')
-                if isinstance(artwork, str) and artwork:
-                    return artwork.replace('100x100bb', '600x600bb').replace('60x60bb', '600x600bb')
         except Exception:
             continue
-    return ''
+        for item in payload.get('results', []):
+            artwork = item.get('artworkUrl100') or item.get('artworkUrl60')
+            if not isinstance(artwork, str) or not artwork:
+                continue
+            candidates.append(ArtworkCandidate(
+                source_url=artwork.replace('100x100bb', '600x600bb').replace('60x60bb', '600x600bb'),
+                source_name='itunes',
+                title=str(item.get('trackName') or ''),
+                artist=str(item.get('artistName') or ''),
+                album=str(item.get('collectionName') or ''),
+                score=score_music_candidate(media, str(item.get('trackName') or ''),
+                                           str(item.get('artistName') or ''), str(item.get('collectionName') or '')),
+            ))
+    return candidates
 
 
-def generated_fallback_art(media: ActiveMedia) -> Image.Image:
+def search_deezer_candidates(media: ActiveMedia) -> list[ArtworkCandidate]:
+    candidates: list[ArtworkCandidate] = []
+    for term in music_search_terms(media):
+        query = urllib.parse.urlencode({'q': term, 'limit': 5})
+        url = f'https://api.deezer.com/search?{query}'
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                payload = json.loads(resp.read().decode('utf-8'))
+        except Exception:
+            continue
+        for item in payload.get('data', []):
+            album = item.get('album') or {}
+            artwork = album.get('cover_xl') or album.get('cover_big') or album.get('cover_medium')
+            if not isinstance(artwork, str) or not artwork:
+                continue
+            candidates.append(ArtworkCandidate(
+                source_url=artwork,
+                source_name='deezer',
+                title=str(item.get('title') or ''),
+                artist=str((item.get('artist') or {}).get('name') or ''),
+                album=str(album.get('title') or ''),
+                score=score_music_candidate(media, str(item.get('title') or ''),
+                                           str((item.get('artist') or {}).get('name') or ''),
+                                           str(album.get('title') or '')),
+            ))
+    return candidates
+
+
+def search_related_music_artwork(media: ActiveMedia) -> str:
+    candidates = search_itunes_candidates(media) + search_deezer_candidates(media)
+    if not candidates:
+        return ''
+    best = max(candidates, key=lambda candidate: candidate.score)
+    return best.source_url if best.score >= 0.34 else ''
+
+
+def placeholder_cover_art(media: ActiveMedia) -> Image.Image:
     base = stable_color(media.art_signature or f'{media.kind}:{media.title}:{media.subtitle}')
-    accent = brighten(base, 60)
-    img = Image.new('RGB', (ART_SIZE, ART_SIZE), base)
-    px = img.load()
-    for y in range(ART_SIZE):
-        ratio = y / float(max(1, ART_SIZE - 1))
-        row = tuple(int(base[i] * (1 - ratio) + accent[i] * ratio) for i in range(3))
-        for x in range(ART_SIZE):
-            px[x, y] = row
+    accent = brighten(base, 36)
+    shadow = tuple(max(12, channel // 3) for channel in base)
+    ivory = tuple(min(235, channel + 92) for channel in accent)
+    img = Image.new('RGB', (ART_SIZE, ART_SIZE), shadow)
+    draw = ImageDraw.Draw(img)
+    inset = 18
+    draw.rounded_rectangle((inset, inset, ART_SIZE - inset, ART_SIZE - inset), radius=28, fill=base)
+    center = ART_SIZE // 2
+    disc_outer = ART_SIZE // 2 - 34
+    draw.ellipse((center - disc_outer, center - disc_outer, center + disc_outer, center + disc_outer), fill=(24, 24, 28))
+    for radius, color in [
+        (disc_outer - 18, shadow),
+        (disc_outer - 42, (42, 42, 46)),
+        (disc_outer - 72, shadow),
+    ]:
+        draw.ellipse((center - radius, center - radius, center + radius, center + radius), outline=color, width=3)
+    label_radius = 54
+    draw.ellipse((center - label_radius, center - label_radius, center + label_radius, center + label_radius), fill=accent)
+    draw.ellipse((center - 10, center - 10, center + 10, center + 10), fill=ivory)
+    draw.arc((56, 86, ART_SIZE - 56, ART_SIZE - 46), start=204, end=330, fill=ivory, width=5)
+    draw.arc((78, 108, ART_SIZE - 78, ART_SIZE - 68), start=210, end=320, fill=accent, width=3)
     return img
-
 
 def is_non_empty(value: Any) -> bool:
     return isinstance(value, str) and value.strip() not in {"", "unknown", "unavailable", "None"}
@@ -367,9 +495,9 @@ def materialize_art(media: ActiveMedia, client: HAClient, output_dir: Path, prev
     if is_non_empty(media.art_source):
         sources_to_try.append(media.art_source)
     if media.kind == 'music':
-        itunes_art = search_itunes_artwork(media.title)
-        if is_non_empty(itunes_art) and itunes_art not in sources_to_try:
-            sources_to_try.append(itunes_art)
+        related_art = search_related_music_artwork(media)
+        if is_non_empty(related_art) and related_art not in sources_to_try:
+            sources_to_try.append(related_art)
 
     for source in sources_to_try:
         try:
@@ -391,7 +519,7 @@ def materialize_art(media: ActiveMedia, client: HAClient, output_dir: Path, prev
         image = generate_ai_music_art(media, client, output_dir)
 
     if image is None:
-        image = square_cover(generated_fallback_art(media))
+        image = square_cover(placeholder_cover_art(media))
 
     write_rgb565_atomic(image, cache_path)
     return build_public_url(output_dir, cache_path)
