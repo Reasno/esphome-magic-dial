@@ -22,19 +22,6 @@ logger:
 api:
   encryption:
     key: !secret kids_nfc_reader_api_key
-  # ESP32-C3 是单核芯片。仅在 HA 订阅实体状态时启动扫描，避免设备启动和
-  # Wi-Fi 重连阶段同时争用 CPU 与 2.4 GHz 射频。
-  on_client_connected:
-    - esp32_ble_tracker.start_scan:
-        continuous: true
-  on_client_disconnected:
-    - if:
-        condition:
-          not:
-            api.connected:
-              state_subscription_only: true
-        then:
-          - esp32_ble_tracker.stop_scan:
 
 ota:
   - platform: esphome
@@ -54,7 +41,11 @@ captive_portal:
 # 为一个连接槽；手环 RSSI 和普通广播传感器不占用连接槽。
 esp32_ble_tracker:
   scan_parameters:
-    continuous: false
+    # 手环广播间隔较疏，C3 默认的 30ms/320ms 窗口会漏掉大部分广播并让
+    # ble_rssi 周期性回到 unknown，因此显式保持高占空比扫描。
+    interval: 320ms
+    window: 300ms
+    continuous: true
 
 bluetooth_proxy:
   active: true
@@ -86,6 +77,25 @@ output:
     pin:
       number: ${indicator_pin}
       inverted: false
+
+binary_sensor:
+  - platform: ble_presence
+    mac_address: "2C:0D:CF:6D:5B:E1"
+    name: "谷溪手环 Presence"
+    id: gu_xi_mi_band_presence
+    min_rssi: -90dB
+    timeout: 2min
+    filters:
+      - delayed_on: 10s
+
+  - platform: ble_presence
+    mac_address: "2C:0D:CF:48:B6:5D"
+    name: "刘心怡手环 Presence"
+    id: liu_xin_yi_mi_band_presence
+    min_rssi: -90dB
+    timeout: 2min
+    filters:
+      - delayed_on: 10s
 
 sensor:
   - platform: ble_rssi
