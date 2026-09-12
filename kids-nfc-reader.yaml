@@ -37,8 +37,8 @@ wifi:
 
 captive_portal:
 
-# ESP32-C3 同时承担客厅 BLE 接收。主动 GATT 连接保留完整代理能力，但限制
-# 为一个连接槽；手环 RSSI 和普通广播传感器不占用连接槽。
+# ESP32-C3 同时承担客厅 BLE 接收。当前只转发广播，不代理 GATT 连接；
+# 手环 presence、RSSI 和普通广播传感器均不需要连接槽。
 esp32_ble_tracker:
   scan_parameters:
     # 手环广播间隔较疏，C3 默认的 30ms/320ms 窗口会漏掉大部分广播并让
@@ -48,8 +48,7 @@ esp32_ble_tracker:
     continuous: true
 
 bluetooth_proxy:
-  active: true
-  connection_slots: 1
+  active: false
 
 # 接线：GPIO8->SDA，GPIO9->SCL，3V3->VCC，GND->GND。
 # PN532 切到 I²C 模式（常见 SEL0=1、SEL1=0），切换后彻底断电重启。
