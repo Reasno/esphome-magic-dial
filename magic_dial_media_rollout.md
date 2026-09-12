@@ -25,11 +25,11 @@
 ## 当前图片链路
 - HA 将封面裁切为 360×360，并编码为 little-endian RGB565 原始像素文件。
 - ESP32 常驻两块 259200 字节 PSRAM buffer，FreeRTOS worker 只下载到非活动 buffer。
-- worker 使用 4 KiB 分段 HTTP 读取，每累计 4 KiB 主动 yield；响应必须为 HTTP 200 且
-  `Content-Length` 必须等于 259200。
-- LVGL API 只在 ESPHome 主线程调用；下载完成且 generation 仍是最新请求时，才切换
-  image source。
-- Wi-Fi 使用 `power_save_mode: none`，避免大文件下载期间 modem-sleep 造成 socket 断流。
+- worker 使用 16 KiB HTTP Range 分块下载；单块失败只重试该块，全部 259200 字节
+  完成且 generation 仍是最新请求时才发布结果。
+- LVGL API 只在 ESPHome 主线程调用，主线程通过双 buffer 切换 image source。
+- Wi-Fi 使用 `power_save_mode: none`；封面传输期间暂停 BLE 扫描，完成、失败或取消后
+  由主线程恢复扫描，避免 Wi-Fi/BLE 共存导致长传输断流。
 
 ## ESPHome 侧部署
 1. 先用当前仓库重新检查 `magic-dial.yaml`。

@@ -1,11 +1,12 @@
 #pragma once
 
-#include <cstring>
+#include <cstdio>
 #include <new>
 #include <string>
 
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
 #include "esphome/components/image/image.h"
 #include "esphome/core/log.h"
 #include "freertos/FreeRTOS.h"
@@ -87,6 +88,7 @@ class Loader {
     this->last_failed_ = false;
     this->result_ = PollResult::NONE;
     xSemaphoreGive(this->mutex_);
+    this->pause_ble_scan_();
     xTaskNotifyGive(this->task_);
     return false;
   }
@@ -101,6 +103,7 @@ class Loader {
     this->result_ = PollResult::NONE;
     this->last_failed_ = false;
     xSemaphoreGive(this->mutex_);
+    this->resume_ble_scan_();
   }
 
   PollResult poll(esphome::image::Image **image) {
@@ -116,91 +119,163 @@ class Loader {
     }
     this->result_ = PollResult::NONE;
     xSemaphoreGive(this->mutex_);
+    if (result != PollResult::NONE)
+      this->resume_ble_scan_();
     return result;
   }
 
  private:
-  bool download_(const std::string &url, uint8_t *buffer) {
-    esp_http_client_config_t config{};
-    config.url = url.c_str();
-    config.method = HTTP_METHOD_GET;
-    config.timeout_ms = 3000;
-    config.buffer_size = 4096;
-    config.disable_auto_redirect = false;
-    config.max_redirection_count = 3;
+  void pause_ble_scan_() {
+    if (this->ble_scan_paused_)
+      return;
+    auto *tracker = esphome::esp32_ble_tracker::global_esp32_ble_tracker;
+    if (tracker == nullptr)
+      return;
+    tracker->set_scan_continuous(false);
+    tracker->stop_scan();
+    this->ble_scan_paused_ = true;
+    ESP_LOGI(TAG, "Paused BLE scanning for artwork transfer");
+  }
+
+  void resume_ble_scan_() {
+    if (!this->ble_scan_paused_)
+      return;
+    auto *tracker = esphome::esp32_ble_tracker::global_esp32_ble_tracker;
+    if (tracker != nullptr) {
+      tracker->set_scan_continuous(true);
+      tracker->start_scan();
+      ESP_LOGI(TAG, "Resumed BLE scanning after artwork transfer");
+    }
+    this->ble_scan_paused_ = false;
+  }
+
+  bool is_current_(const std::string &url, uint32_t generation) {
+    xSemaphoreTake(this->mutex_, portMAX_DELAY);
+    const bool current = generation == this->generation_ && url == this->requested_url_;
+    xSemaphoreGive(this->mutex_);
+    return current;
+  }
+
+  bool wait_before_retry_(const std::string &url, uint32_t generation) {
+    for (uint8_t step = 0; step < 20; step++) {
+      if (!this->is_current_(url, generation))
+        return false;
+      vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    return true;
+  }
+
+  bool download_(const std::string &url, uint8_t *buffer, uint32_t generation) {
+    static constexpr size_t RANGE_BYTES = 16 * 1024;
+    static constexpr uint8_t MAX_CONSECUTIVE_FAILURES = 12;
+    static constexpr uint32_t TOTAL_TIMEOUT_MS = 180000;
+    const TickType_t started_at = xTaskGetTickCount();
+    size_t written = 0;
+    uint8_t consecutive_failures = 0;
+    uint16_t requests = 0;
+
+    while (written < BUFFER_BYTES) {
+      if (!this->is_current_(url, generation)) {
+        ESP_LOGI(TAG, "Cancelled stale artwork download at %u/%u bytes", static_cast<unsigned>(written),
+                 static_cast<unsigned>(BUFFER_BYTES));
+        return false;
+      }
+
+      const uint32_t elapsed_ms = pdTICKS_TO_MS(xTaskGetTickCount() - started_at);
+      if (elapsed_ms >= TOTAL_TIMEOUT_MS || consecutive_failures >= MAX_CONSECUTIVE_FAILURES)
+        break;
+
+      const size_t range_start = written;
+      const size_t range_end =
+          (range_start + RANGE_BYTES < BUFFER_BYTES ? range_start + RANGE_BYTES : BUFFER_BYTES) - 1;
+      const size_t range_length = range_end - range_start + 1;
+
+      esp_http_client_config_t config{};
+      config.url = url.c_str();
+      config.method = HTTP_METHOD_GET;
+      config.timeout_ms = 3000;
+      config.buffer_size = RANGE_BYTES;
+      config.disable_auto_redirect = false;
+      config.max_redirection_count = 3;
 #if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
-    config.crt_bundle_attach = esp_crt_bundle_attach;
+      config.crt_bundle_attach = esp_crt_bundle_attach;
 #endif
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == nullptr)
-      return false;
+      esp_http_client_handle_t client = esp_http_client_init(&config);
+      bool chunk_complete = false;
+      esp_err_t error = client == nullptr ? ESP_ERR_NO_MEM : ESP_OK;
+      if (client != nullptr) {
+        char range_header[40]{};
+        std::snprintf(range_header, sizeof(range_header), "bytes=%u-%u", static_cast<unsigned>(range_start),
+                      static_cast<unsigned>(range_end));
+        esp_http_client_set_header(client, "Range", range_header);
+        requests++;
+        error = esp_http_client_open(client, 0);
 
-    const TickType_t started_at = xTaskGetTickCount();
-    esp_err_t error = esp_http_client_open(client, 0);
-    if (error != ESP_OK) {
-      ESP_LOGW(TAG, "Artwork connection failed: %s", esp_err_to_name(error));
-      esp_http_client_cleanup(client);
-      return false;
-    }
+        if (error == ESP_OK) {
+          const int64_t content_length = esp_http_client_fetch_headers(client);
+          const int status = esp_http_client_get_status_code(client);
+          if (status == 206 && content_length == static_cast<int64_t>(range_length)) {
+            size_t chunk_written = 0;
+            while (chunk_written < range_length) {
+              if (!this->is_current_(url, generation)) {
+                ESP_LOGI(TAG, "Cancelled stale artwork download at %u/%u bytes",
+                         static_cast<unsigned>(written), static_cast<unsigned>(BUFFER_BYTES));
+                esp_http_client_close(client);
+                esp_http_client_cleanup(client);
+                return false;
+              }
+              const size_t remaining = range_length - chunk_written;
+              const int read = esp_http_client_read(
+                  client, reinterpret_cast<char *>(buffer + range_start + chunk_written), remaining);
+              if (read <= 0) {
+                error = read < 0 ? ESP_FAIL : ESP_ERR_INVALID_SIZE;
+                break;
+              }
+              chunk_written += static_cast<size_t>(read);
+            }
+            chunk_complete =
+                error == ESP_OK && chunk_written == range_length && esp_http_client_is_complete_data_received(client);
+          } else {
+            ESP_LOGW(TAG, "Unexpected range response: status=%d length=%lld expected=%u-%u", status,
+                     static_cast<long long>(content_length), static_cast<unsigned>(range_start),
+                     static_cast<unsigned>(range_end));
+            error = ESP_ERR_INVALID_RESPONSE;
+          }
+        }
 
-    const int64_t content_length = esp_http_client_fetch_headers(client);
-    const int status = esp_http_client_get_status_code(client);
-    if (status != 200 || content_length != static_cast<int64_t>(BUFFER_BYTES)) {
-      ESP_LOGW(TAG, "Unexpected artwork response: status=%d content_length=%lld expected=%u", status,
-               static_cast<long long>(content_length), static_cast<unsigned>(BUFFER_BYTES));
-      esp_http_client_close(client);
-      esp_http_client_cleanup(client);
-      return false;
-    }
-
-    size_t written = 0;
-    size_t next_yield = 4096;
-    while (written < BUFFER_BYTES) {
-      const uint32_t elapsed_ms = pdTICKS_TO_MS(xTaskGetTickCount() - started_at);
-      if (elapsed_ms >= 20000) {
-        ESP_LOGW(TAG, "Artwork download timed out after %u ms at %u/%u bytes",
-                 static_cast<unsigned>(elapsed_ms), static_cast<unsigned>(written),
-                 static_cast<unsigned>(BUFFER_BYTES));
-        error = ESP_ERR_TIMEOUT;
-        break;
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
       }
 
-      const size_t remaining = BUFFER_BYTES - written;
-      const int read = esp_http_client_read(
-          client, reinterpret_cast<char *>(buffer + written), remaining < 4096 ? remaining : 4096);
-      if (read < 0) {
-        ESP_LOGW(TAG, "Artwork read failed at %u/%u bytes", static_cast<unsigned>(written),
-                 static_cast<unsigned>(BUFFER_BYTES));
-        error = ESP_FAIL;
-        break;
-      }
-      if (read == 0) {
-        ESP_LOGW(TAG, "Artwork response ended early at %u/%u bytes", static_cast<unsigned>(written),
-                 static_cast<unsigned>(BUFFER_BYTES));
-        error = ESP_ERR_INVALID_SIZE;
-        break;
-      }
-      written += static_cast<size_t>(read);
-      if (written >= next_yield) {
-        next_yield = ((written / 4096) + 1) * 4096;
+      if (chunk_complete) {
+        written += range_length;
+        consecutive_failures = 0;
+        if (written == BUFFER_BYTES || written % (64 * 1024) == 0) {
+          ESP_LOGI(TAG, "Artwork download progress: %u/%u bytes", static_cast<unsigned>(written),
+                   static_cast<unsigned>(BUFFER_BYTES));
+        }
         vTaskDelay(pdMS_TO_TICKS(1));
+        continue;
       }
+
+      consecutive_failures++;
+      ESP_LOGW(TAG, "Range %u-%u failed (%s), retry %u/%u", static_cast<unsigned>(range_start),
+               static_cast<unsigned>(range_end), esp_err_to_name(error),
+               static_cast<unsigned>(consecutive_failures), static_cast<unsigned>(MAX_CONSECUTIVE_FAILURES));
+      if (!this->wait_before_retry_(url, generation))
+        return false;
     }
 
-    const bool complete = written == BUFFER_BYTES && esp_http_client_is_complete_data_received(client);
     const uint32_t elapsed_ms = pdTICKS_TO_MS(xTaskGetTickCount() - started_at);
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-
-    if (error != ESP_OK || !complete) {
-      ESP_LOGW(TAG, "Artwork download failed: err=%s bytes=%u/%u complete=%s elapsed=%u ms",
-               esp_err_to_name(error), static_cast<unsigned>(written), static_cast<unsigned>(BUFFER_BYTES),
-               complete ? "yes" : "no", static_cast<unsigned>(elapsed_ms));
+    if (written != BUFFER_BYTES) {
+      ESP_LOGW(TAG, "Artwork download incomplete at %u/%u bytes after %u ms and %u requests",
+               static_cast<unsigned>(written), static_cast<unsigned>(BUFFER_BYTES),
+               static_cast<unsigned>(elapsed_ms), static_cast<unsigned>(requests));
       return false;
     }
-    ESP_LOGI(TAG, "Downloaded %u-byte RGB565 artwork in %u ms", static_cast<unsigned>(written),
-             static_cast<unsigned>(elapsed_ms));
+    ESP_LOGI(TAG, "Downloaded %u-byte RGB565 artwork in %u ms using %u ranged requests",
+             static_cast<unsigned>(written), static_cast<unsigned>(elapsed_ms), static_cast<unsigned>(requests));
     return true;
   }
 
@@ -224,7 +299,7 @@ class Loader {
         continue;
 
       ESP_LOGI(TAG, "Downloading RGB565 artwork into PSRAM buffer %u", target_slot);
-      const bool ok = this->download_(url, this->buffers_[target_slot]);
+      const bool ok = this->download_(url, this->buffers_[target_slot], generation);
 
       xSemaphoreTake(this->mutex_, portMAX_DELAY);
       if (generation == this->generation_ && url == this->requested_url_) {
@@ -247,6 +322,7 @@ class Loader {
   uint8_t ready_slot_{0};
   PollResult result_{PollResult::NONE};
   bool last_failed_{false};
+  bool ble_scan_paused_{false};
 };
 
 static Loader loader;

@@ -171,8 +171,10 @@ def homepod_candidate(payload: dict[str, Any]) -> ActiveMedia | None:
     subtitle = stable_secondary or "HomePod"
     lyric_hint = first_non_empty(payload.get("media_artist"), payload.get("media_series_title"))
     has_progress, progress_pct = extract_progress(payload)
-    sig = f"music::{title}::{subtitle}::{art_source}"
-    cache_key = build_cache_key("music", title or "HomePod", subtitle, lyric_hint, art_source)
+    # AirPlay may expose rolling lyrics as media_artist and rotates proxy
+    # token/cache query parameters. Neither belongs in the immutable track key.
+    sig = f"music::{title}::{subtitle}"
+    cache_key = build_cache_key("music", title or "HomePod", subtitle)
     return ActiveMedia("homepod", "music", title or "HomePod", subtitle, lyric_hint, art_source, has_progress, progress_pct, sig, cache_key)
 
 
