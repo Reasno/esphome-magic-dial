@@ -26,6 +26,7 @@ from PIL import Image
 
 ART_SIZE = 360
 RGB565_BYTES = ART_SIZE * ART_SIZE * 2
+ART_CACHE_VERSION = "cover-v2"
 
 
 def stable_color(seed: str) -> tuple[int, int, int]:
@@ -37,21 +38,31 @@ def brighten(color: tuple[int, int, int], amount: int) -> tuple[int, int, int]:
     return tuple(min(255, c + amount) for c in color)
 
 
-def search_itunes_artwork(title: str, subtitle: str) -> str:
-    term = ' '.join([x for x in [title, subtitle] if is_non_empty(x)])
-    if not term:
-        return ''
-    query = urllib.parse.urlencode({'term': term, 'media': 'music', 'entity': 'song', 'limit': 3})
-    url = f'https://itunes.apple.com/search?{query}'
-    try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            payload = json.loads(resp.read().decode('utf-8'))
-        for item in payload.get('results', []):
-            artwork = item.get('artworkUrl100') or item.get('artworkUrl60')
-            if isinstance(artwork, str) and artwork:
-                return artwork.replace('100x100bb', '600x600bb').replace('60x60bb', '600x600bb')
-    except Exception:
-        return ''
+def music_search_terms(title: str) -> list[str]:
+    """Build search terms without app names or rolling lyric metadata."""
+    terms = []
+    parts = [part.strip() for part in re.split(r"\s+[·•]\s+", title) if part.strip()]
+    if len(parts) >= 2:
+        # AirPlay sometimes combines "track · artist" in media_title.
+        terms.append(f"{parts[0]} {parts[1]}")
+        terms.append(parts[0])
+    terms.append(title.strip())
+    return list(dict.fromkeys(term for term in terms if term))
+
+
+def search_itunes_artwork(title: str) -> str:
+    for term in music_search_terms(title):
+        query = urllib.parse.urlencode({'term': term, 'media': 'music', 'entity': 'song', 'limit': 5})
+        url = f'https://itunes.apple.com/search?{query}'
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                payload = json.loads(resp.read().decode('utf-8'))
+            for item in payload.get('results', []):
+                artwork = item.get('artworkUrl100') or item.get('artworkUrl60')
+                if isinstance(artwork, str) and artwork:
+                    return artwork.replace('100x100bb', '600x600bb').replace('60x60bb', '600x600bb')
+        except Exception:
+            continue
     return ''
 
 
@@ -102,7 +113,7 @@ def slugify(text: str) -> str:
 
 
 def build_cache_key(kind: str, title: str, subtitle: str, *identity: str) -> str:
-    base = "::".join((kind, title, subtitle, *identity))
+    base = "::".join((ART_CACHE_VERSION, kind, title, subtitle, *identity))
     digest = hashlib.sha1(base.encode('utf-8')).hexdigest()[:12]
     stem = slugify(f"{kind}_{title}_{subtitle}")[:48]
     return f"{stem}_{digest}"
@@ -356,7 +367,7 @@ def materialize_art(media: ActiveMedia, client: HAClient, output_dir: Path, prev
     if is_non_empty(media.art_source):
         sources_to_try.append(media.art_source)
     if media.kind == 'music':
-        itunes_art = search_itunes_artwork(media.title, media.subtitle)
+        itunes_art = search_itunes_artwork(media.title)
         if is_non_empty(itunes_art) and itunes_art not in sources_to_try:
             sources_to_try.append(itunes_art)
 
