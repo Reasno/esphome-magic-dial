@@ -163,6 +163,11 @@ wifi:
 
 captive_portal:
 
+http_request:
+  timeout: 10s
+  buffer_size_rx: 1024
+  watchdog_timeout: 15s
+
 # BLE scanning runs alongside Wi-Fi on the ESP32-S3. Active scanning lets the
 # Home Assistant Bluetooth proxy request scan responses from nearby devices.
 esp32_ble_tracker:
@@ -1168,6 +1173,36 @@ text_sensor:
     on_value:
       - script.execute: render_aod
 
+  - platform: homeassistant
+    id: aod_media_artwork_url
+    entity_id: sensor.magic_dial_media_artwork_url
+    internal: true
+    on_value:
+      - lambda: "id(g_aod_media_ready) = false;"
+      - script.execute: apply_screen_brightness
+      - if:
+          condition:
+            lambda: |-
+              return !x.empty() && x != "unknown" && x != "unavailable";
+          then:
+            - online_image.set_url:
+                id: img_aod_media
+                url: !lambda "return x;"
+            - if:
+                condition:
+                  lambda: "return id(g_sleeping);"
+                then:
+                  - script.execute: render_aod
+                  - script.execute: apply_screen_brightness
+          else:
+            - online_image.release: img_aod_media
+            - if:
+                condition:
+                  lambda: "return id(g_sleeping);"
+                then:
+                  - script.execute: render_aod
+                  - script.execute: apply_screen_brightness
+
 sensor:
   # Heap telemetry for the `mic_task` allocation failure. `free_internal_heap`
   # is the number that matters: it is the pool xTaskCreate and the I2S DMA
@@ -1238,6 +1273,17 @@ sensor:
     entity_id: ${homepod_entity}
     attribute: media_duration
     internal: true
+
+  - platform: homeassistant
+    id: aod_media_progress_pct
+    entity_id: sensor.magic_dial_media_progress_pct
+    internal: true
+    on_value:
+      - if:
+          condition:
+            lambda: "return id(g_sleeping);"
+          then:
+            - script.execute: render_aod
 
   - platform: homeassistant
     id: ceiling_light_color_temp
@@ -1392,6 +1438,10 @@ globals:
     type: int
     restore_value: yes
     initial_value: '18'
+  - id: g_aod_media_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   - id: g_target
     type: int
     restore_value: no
@@ -1662,7 +1712,14 @@ script:
           brightness: !lambda |-
             const bool bracelet_present = id(gu_xi_in_living_room_local).state ||
               id(liu_xin_yi_in_living_room_local).state;
-            const float pct = (!id(g_sleeping) || bracelet_present)
+            const std::string art_url = id(aod_media_artwork_url).state;
+            const bool aod_media_showing =
+              id(g_sleeping) &&
+              id(g_aod_media_ready) &&
+              !art_url.empty() &&
+              art_url != "unknown" &&
+              art_url != "unavailable";
+            const float pct = (!id(g_sleeping) || bracelet_present || aod_media_showing)
               ? (float) id(g_backlight_pct)
               : (float) id(g_aod_backlight_pct);
             return fminf(1.0f, fmaxf(0.05f, pct / 100.0f));
@@ -2246,7 +2303,7 @@ script:
                    id(floor_heating_state).state != "unknown" &&
                    id(floor_heating_state).state != "unavailable") id(g_target) = 6;
           else id(g_target) = 7;
-          id(g_control_mode) = 0;
+          id(g_control_mode) = id(g_target) <= 1 ? 1 : 0;
       - script.execute: render_main
 
   - id: render_main
@@ -2729,16 +2786,54 @@ script:
             }
             return std::string("");
       - lambda: |-
-          const bool show = id(holiday_calendar_state).state == "on" &&
+          const bool show_holiday = id(holiday_calendar_state).state == "on" &&
             !id(holiday_calendar_name).state.empty() &&
             id(holiday_calendar_name).state != "unknown" &&
             id(holiday_calendar_name).state != "unavailable";
-          if (show) lv_obj_clear_flag(id(lbl_aod_holiday), LV_OBJ_FLAG_HIDDEN);
-          else lv_obj_add_flag(id(lbl_aod_holiday), LV_OBJ_FLAG_HIDDEN);
+          const std::string art_url = id(aod_media_artwork_url).state;
+          const bool media_ready = id(g_aod_media_ready) && !art_url.empty() &&
+            art_url != "unknown" && art_url != "unavailable";
+          if (media_ready) {
+            lv_image_set_src(id(aod_media_image), id(img_aod_media));
+            lv_obj_invalidate(id(aod_media_image));
+            lv_obj_clear_flag(id(aod_media_image), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(lbl_aod_time), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(lbl_aod_date), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(lbl_aod_holiday), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(aod_media_image), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(lbl_aod_time), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(lbl_aod_date), LV_OBJ_FLAG_HIDDEN);
+            if (show_holiday) lv_obj_clear_flag(id(lbl_aod_holiday), LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(id(lbl_aod_holiday), LV_OBJ_FLAG_HIDDEN);
+          }
+
+          const float progress = id(aod_media_progress_pct).state;
+          const bool show_progress = media_ready && !isnan(progress) && progress >= 0.0f;
+          if (show_progress) {
+            lv_arc_set_value(id(arc_aod_media_progress), (int) roundf(fminf(100.0f, fmaxf(0.0f, progress))));
+            lv_obj_clear_flag(id(arc_aod_media_progress), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(arc_aod_media_progress), LV_OBJ_FLAG_HIDDEN);
+          }
 
   - id: enter_sleep
     then:
-      - lambda: 'id(g_sleeping) = true;'
+      - lambda: |-
+          id(g_sleeping) = true;
+          const std::string art_url = id(aod_media_artwork_url).state;
+          if (!art_url.empty() && art_url != "unknown" && art_url != "unavailable") {
+            id(g_aod_media_ready) = false;
+          }
+      - if:
+          condition:
+            lambda: |-
+              const std::string art_url = id(aod_media_artwork_url).state;
+              return !art_url.empty() && art_url != "unknown" && art_url != "unavailable";
+          then:
+            - online_image.set_url:
+                id: img_aod_media
+                url: !lambda "return id(aod_media_artwork_url).state;"
       - script.execute: ring_update_state
       - script.execute: render_aod
       - lvgl.page.show:
@@ -2749,8 +2844,10 @@ script:
 
   - id: wake_display
     then:
+      - online_image.release: img_aod_media
       - lambda: |-
           id(g_sleeping) = false;
+          id(g_aod_media_ready) = false;
           id(g_last_activity) = millis();
           id(g_manual_until) = 0;
           id(g_backlight_pct) = 100;
@@ -2776,7 +2873,7 @@ script:
           // inactive device is still reachable so it can be turned on from the dial.
           // (Auto-selection on wake still jumps to the highest-priority active one.)
           id(g_target) = (id(g_target) + (direction > 0 ? 1 : 7)) % 8;
-          id(g_control_mode) = 0;
+          id(g_control_mode) = id(g_target) <= 1 ? 1 : 0;
           id(g_optimistic_valid) = false;
           id(g_manual_until) = millis() + 60000;
       - script.execute: render_main
@@ -3719,6 +3816,34 @@ image:
     file: images/doubao_avatar.png
     type: RGB565
     byte_order: little_endian
+  - platform: online_image
+    id: img_aod_media
+    url: "http://127.0.0.1/blank.jpg"
+    format: JPEG
+    type: RGB565
+    byte_order: little_endian
+    resize: 360x360
+    update_interval: never
+    buffer_size: 8192
+    on_download_finished:
+      - lambda: |-
+          id(g_aod_media_ready) = true;
+          lv_image_set_src(id(aod_media_image), id(img_aod_media));
+          lv_obj_invalidate(id(aod_media_image));
+      - script.execute: apply_screen_brightness
+      - if:
+          condition:
+            lambda: "return id(g_sleeping);"
+          then:
+            - script.execute: render_aod
+    on_error:
+      - lambda: "id(g_aod_media_ready) = false;"
+      - script.execute: apply_screen_brightness
+      - if:
+          condition:
+            lambda: "return id(g_sleeping);"
+          then:
+            - script.execute: render_aod
 
 lvgl:
   # 10% (~25 KB for 360x360 RGB565) was too tight; 25% left the largest free
@@ -3732,6 +3857,7 @@ lvgl:
   # Charging port down: LVGL owns the rotation because the display component
   # rejects `rotation` when LVGL is attached.
   rotation: 180
+  update_when_display_idle: true
   # Every label sets `text_font` explicitly; this default only guards widgets
   # that have no text of their own.
   default_font: font_sc_16
@@ -4075,6 +4201,33 @@ lvgl:
     - id: page_aod
       bg_color: 0x000000
       widgets:
+        - image:
+            id: aod_media_image
+            align: CENTER
+            width: 360
+            height: 360
+            src: img_aod_media
+            hidden: true
+            clickable: false
+        - arc:
+            id: arc_aod_media_progress
+            align: CENTER
+            width: 350
+            height: 350
+            arc_width: 4
+            min_value: 0
+            max_value: 100
+            value: 0
+            start_angle: 0
+            end_angle: 360
+            rotation: 120
+            adjustable: false
+            hidden: true
+            arc_color: 0x18303C
+            arc_opa: 40%
+            indicator:
+              arc_color: 0xCAE4FF
+              arc_width: 4
         # Pure black AOD background: the lockscreen photo was removed, so no
         # halo copies are needed behind the digits.
         - label:

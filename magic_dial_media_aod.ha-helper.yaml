@@ -1,0 +1,101 @@
+# Home Assistant helper package for the Magic Dial media lock screen.
+#
+# What it does:
+# 1. Triggers a Python resolver whenever HomePod / PS4 / Sony TV changes, plus
+#    every 10 seconds while a playing session may need progress refresh.
+# 2. The resolver writes `/config/www/magic_dial_artwork/current.json` and
+#    `/config/www/magic_dial_artwork/current.png`.
+# 3. A command_line sensor reads `current.json`, and template entities expose the
+#    exact fields ESPHome needs: artwork URL and progress percentage.
+#
+# Deployment notes:
+# - Copy `magic_dial_media_artwork.py` to a Python-capable host path first.
+# - Edit the shell command below so `python3`, `--token-file` and the script path
+#   match your environment.
+# - The resolver expects Pillow to be installed on that Python runtime.
+# - The output directory is intentionally under `/config/www/` so ESPHome can
+#   fetch the processed artwork as a normal HA static file.
+#
+# Rollback:
+# - Remove this package from `packages:` (or comment it out) and reload /
+#   restart Home Assistant.
+# - Delete `/config/www/magic_dial_artwork/current.json` and `current.png` if
+#   you want to fully clean up generated artifacts.
+
+shell_command:
+  magic_dial_media_refresh: >-
+    /bin/sh -c 'python3 /config/scripts/magic_dial_media_artwork.py
+    --ha-url http://127.0.0.1:8123
+    --external-base-url http://192.168.31.111:8123
+    --token-file /config/.tokens/magic_dial_ha_token
+    --output-dir /config/www/magic_dial_artwork
+    --overrides /config/www/magic_dial_artwork/overrides.json'
+
+command_line:
+  - sensor:
+      name: "Magic Dial Media State"
+      unique_id: magic_dial_media_state
+      command: >-
+        sh -c 'if [ -f /config/www/magic_dial_artwork/current.json ]; then
+          cat /config/www/magic_dial_artwork/current.json;
+        else
+          printf "%s" "{\"updated_at\":0,\"active_kind\":\"\",\"has_art\":false,\"artwork_url\":\"\",\"title\":\"\",\"subtitle\":\"\",\"has_progress\":false,\"progress_pct\":-1,\"debug_source\":\"\",\"art_signature\":\"\"}";
+        fi'
+      scan_interval: 15
+      value_template: "{{ value_json.updated_at | default('') }}"
+      json_attributes:
+        - active_kind
+        - has_art
+        - artwork_url
+        - title
+        - subtitle
+        - has_progress
+        - progress_pct
+        - debug_source
+        - art_signature
+
+template:
+  - sensor:
+      - name: "Magic Dial Media Artwork URL"
+        unique_id: magic_dial_media_artwork_url
+        state: >-
+          {% if state_attr('sensor.magic_dial_media_state', 'has_art') %}
+            {{ state_attr('sensor.magic_dial_media_state', 'artwork_url') | default('', true) }}
+          {% else %}
+            {{ '' }}
+          {% endif %}
+      - name: "Magic Dial Media Progress Pct"
+        unique_id: magic_dial_media_progress_pct
+        unit_of_measurement: "%"
+        state: >-
+          {% if state_attr('sensor.magic_dial_media_state', 'has_progress') %}
+            {{ state_attr('sensor.magic_dial_media_state', 'progress_pct') | float(0) }}
+          {% else %}
+            {{ -1 }}
+          {% endif %}
+    binary_sensor:
+      - name: "Magic Dial Media Has Art"
+        unique_id: magic_dial_media_has_art
+        state: "{{ state_attr('sensor.magic_dial_media_state', 'has_art') | default(false) }}"
+
+automation:
+  - id: magic_dial_media_refresh_on_change
+    alias: "Magic Dial: refresh media lockscreen on change"
+    mode: restart
+    trigger:
+      - platform: homeassistant
+        event: start
+      - platform: state
+        entity_id:
+          - media_player.ke_ting_ke_ting
+          - media_player.ps4_183_playstation_4
+          - media_player.sony_k_55xr50
+          - sensor.sony_tv_source
+      - platform: time_pattern
+        seconds: "/10"
+    action:
+      - delay: 1
+      - action: shell_command.magic_dial_media_refresh
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.magic_dial_media_state
