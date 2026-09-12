@@ -6,9 +6,12 @@
 
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
-#include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
 #include "esphome/components/image/image.h"
+#include "esphome/core/defines.h"
 #include "esphome/core/log.h"
+#ifdef USE_ESP32_BLE
+#include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -126,6 +129,7 @@ class Loader {
 
  private:
   void pause_ble_scan_() {
+#ifdef USE_ESP32_BLE
     if (this->ble_scan_paused_)
       return;
     auto *tracker = esphome::esp32_ble_tracker::global_esp32_ble_tracker;
@@ -135,9 +139,11 @@ class Loader {
     tracker->stop_scan();
     this->ble_scan_paused_ = true;
     ESP_LOGI(TAG, "Paused BLE scanning for artwork transfer");
+#endif
   }
 
   void resume_ble_scan_() {
+#ifdef USE_ESP32_BLE
     if (!this->ble_scan_paused_)
       return;
     auto *tracker = esphome::esp32_ble_tracker::global_esp32_ble_tracker;
@@ -147,6 +153,7 @@ class Loader {
       ESP_LOGI(TAG, "Resumed BLE scanning after artwork transfer");
     }
     this->ble_scan_paused_ = false;
+#endif
   }
 
   bool is_current_(const std::string &url, uint32_t generation) {
