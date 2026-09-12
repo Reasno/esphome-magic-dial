@@ -62,9 +62,12 @@ esphome:
   # Hand-rolled PNG encoder for the Ulanzi knob bar. See publish_knob_bar.
   includes:
     - ulanzi_bar.h
+    - media_artwork_loader.h
   on_boot:
     priority: -100
     then:
+      - lambda: |-
+          magic_dial::media_artwork::loader.setup();
       - delay: 1s
       - light.turn_on:
           id: backlight_light
@@ -151,6 +154,7 @@ ota:
     password: !secret magic_dial_ota_password
 
 wifi:
+  power_save_mode: none
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   manual_ip:
@@ -1178,30 +1182,19 @@ text_sensor:
     entity_id: sensor.magic_dial_media_artwork_url
     internal: true
     on_value:
-      - lambda: "id(g_aod_media_ready) = false;"
+      - lambda: |-
+          if (!x.empty() && x != "unknown" && x != "unavailable") {
+            id(g_aod_media_ready) = magic_dial::media_artwork::loader.request(x);
+          } else {
+            id(g_aod_media_ready) = false;
+            magic_dial::media_artwork::loader.clear();
+          }
       - script.execute: apply_screen_brightness
       - if:
           condition:
-            lambda: |-
-              return !x.empty() && x != "unknown" && x != "unavailable";
+            lambda: "return id(g_sleeping);"
           then:
-            - online_image.set_url:
-                id: img_aod_media
-                url: !lambda "return x;"
-            - if:
-                condition:
-                  lambda: "return id(g_sleeping);"
-                then:
-                  - script.execute: render_aod
-                  - script.execute: apply_screen_brightness
-          else:
-            - online_image.release: img_aod_media
-            - if:
-                condition:
-                  lambda: "return id(g_sleeping);"
-                then:
-                  - script.execute: render_aod
-                  - script.execute: apply_screen_brightness
+            - script.execute: render_aod
 
 sensor:
   # Heap telemetry for the `mic_task` allocation failure. `free_internal_heap`
@@ -1442,6 +1435,10 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  - id: g_aod_media_download_result
+    type: int
+    restore_value: no
+    initial_value: '0'
   - id: g_target
     type: int
     restore_value: no
@@ -2794,8 +2791,6 @@ script:
           const bool media_ready = id(g_aod_media_ready) && !art_url.empty() &&
             art_url != "unknown" && art_url != "unavailable";
           if (media_ready) {
-            lv_image_set_src(id(aod_media_image), id(img_aod_media));
-            lv_obj_invalidate(id(aod_media_image));
             lv_obj_clear_flag(id(aod_media_image), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(lbl_aod_time), LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(id(lbl_aod_date), LV_OBJ_FLAG_HIDDEN);
@@ -2821,19 +2816,14 @@ script:
     then:
       - lambda: |-
           id(g_sleeping) = true;
-          const std::string art_url = id(aod_media_artwork_url).state;
-          if (!art_url.empty() && art_url != "unknown" && art_url != "unavailable") {
-            id(g_aod_media_ready) = false;
-          }
       - if:
           condition:
             lambda: |-
               const std::string art_url = id(aod_media_artwork_url).state;
               return !art_url.empty() && art_url != "unknown" && art_url != "unavailable";
           then:
-            - online_image.set_url:
-                id: img_aod_media
-                url: !lambda "return id(aod_media_artwork_url).state;"
+            - lambda: |-
+                magic_dial::media_artwork::loader.request(id(aod_media_artwork_url).state);
       - script.execute: ring_update_state
       - script.execute: render_aod
       - lvgl.page.show:
@@ -2844,10 +2834,8 @@ script:
 
   - id: wake_display
     then:
-      - online_image.release: img_aod_media
       - lambda: |-
           id(g_sleeping) = false;
-          id(g_aod_media_ready) = false;
           id(g_last_activity) = millis();
           id(g_manual_until) = 0;
           id(g_backlight_pct) = 100;
@@ -3611,6 +3599,32 @@ script:
           force: true
 
 interval:
+  # The FreeRTOS worker only downloads into the inactive PSRAM buffer. This
+  # short main-loop callback is the sole owner of LVGL source changes.
+  - interval: 100ms
+    then:
+      - lambda: |-
+          esphome::image::Image *image = nullptr;
+          const auto result = magic_dial::media_artwork::loader.poll(&image);
+          id(g_aod_media_download_result) = static_cast<int>(result);
+          if (result == magic_dial::media_artwork::PollResult::READY) {
+            id(g_aod_media_ready) = true;
+            lv_image_set_src(id(aod_media_image), image);
+            lv_obj_invalidate(id(aod_media_image));
+          } else if (result == magic_dial::media_artwork::PollResult::ERROR) {
+            id(g_aod_media_ready) = false;
+          }
+      - if:
+          condition:
+            lambda: "return id(g_aod_media_download_result) != 0;"
+          then:
+            - script.execute: apply_screen_brightness
+            - if:
+                condition:
+                  lambda: "return id(g_sleeping);"
+                then:
+                  - script.execute: render_aod
+
   - interval: 1s
     then:
       # Charging "filling" animation, ported from upstream. Only advanced while 本机
@@ -3816,34 +3830,6 @@ image:
     file: images/doubao_avatar.png
     type: RGB565
     byte_order: little_endian
-  - platform: online_image
-    id: img_aod_media
-    url: "http://127.0.0.1/blank.jpg"
-    format: JPEG
-    type: RGB565
-    byte_order: little_endian
-    resize: 360x360
-    update_interval: never
-    buffer_size: 8192
-    on_download_finished:
-      - lambda: |-
-          id(g_aod_media_ready) = true;
-          lv_image_set_src(id(aod_media_image), id(img_aod_media));
-          lv_obj_invalidate(id(aod_media_image));
-      - script.execute: apply_screen_brightness
-      - if:
-          condition:
-            lambda: "return id(g_sleeping);"
-          then:
-            - script.execute: render_aod
-    on_error:
-      - lambda: "id(g_aod_media_ready) = false;"
-      - script.execute: apply_screen_brightness
-      - if:
-          condition:
-            lambda: "return id(g_sleeping);"
-          then:
-            - script.execute: render_aod
 
 lvgl:
   # 10% (~25 KB for 360x360 RGB565) was too tight; 25% left the largest free
@@ -4206,7 +4192,9 @@ lvgl:
             align: CENTER
             width: 360
             height: 360
-            src: img_aod_media
+            # Hidden boot-time placeholder; the main-loop callback replaces it
+            # with one of the loader's two PSRAM-backed RGB565 descriptors.
+            src: img_doubao_avatar
             hidden: true
             clickable: false
         - arc:

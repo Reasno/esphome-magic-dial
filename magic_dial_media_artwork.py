@@ -12,13 +12,12 @@ import json
 import math
 import os
 import re
+import struct
 import tempfile
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from urllib.parse import urlencode
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +25,7 @@ from PIL import Image
 
 
 ART_SIZE = 360
+RGB565_BYTES = ART_SIZE * ART_SIZE * 2
 
 
 def stable_color(seed: str) -> tuple[int, int, int]:
@@ -101,29 +101,15 @@ def slugify(text: str) -> str:
     return cleaned or "unknown"
 
 
-def build_cache_key(kind: str, title: str, subtitle: str) -> str:
-    base = f"{kind}::{title}::{subtitle}"
+def build_cache_key(kind: str, title: str, subtitle: str, *identity: str) -> str:
+    base = "::".join((kind, title, subtitle, *identity))
     digest = hashlib.sha1(base.encode('utf-8')).hexdigest()[:12]
     stem = slugify(f"{kind}_{title}_{subtitle}")[:48]
     return f"{stem}_{digest}"
 
 
 def cache_file_path(output_dir: Path, cache_key: str) -> Path:
-    return output_dir / 'cache' / f"{cache_key}.jpg"
-
-
-def update_current_pointer(cache_path: Path, current_png: Path) -> None:
-    current_png.parent.mkdir(parents=True, exist_ok=True)
-    tmp_fd, tmp_name = tempfile.mkstemp(prefix='magic_dial_current_', suffix='.jpg', dir=str(current_png.parent))
-    os.close(tmp_fd)
-    tmp_path = Path(tmp_name)
-    try:
-        with cache_path.open('rb') as src, tmp_path.open('wb') as dst:
-            dst.write(src.read())
-        tmp_path.replace(current_png)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
+    return output_dir / 'cache' / f"{cache_key}.rgb565"
 
 
 @dataclass
@@ -186,7 +172,7 @@ def homepod_candidate(payload: dict[str, Any]) -> ActiveMedia | None:
     lyric_hint = first_non_empty(payload.get("media_artist"), payload.get("media_series_title"))
     has_progress, progress_pct = extract_progress(payload)
     sig = f"music::{title}::{subtitle}::{art_source}"
-    cache_key = build_cache_key("music", title or "HomePod", subtitle)
+    cache_key = build_cache_key("music", title or "HomePod", subtitle, lyric_hint, art_source)
     return ActiveMedia("homepod", "music", title or "HomePod", subtitle, lyric_hint, art_source, has_progress, progress_pct, sig, cache_key)
 
 
@@ -200,7 +186,7 @@ def ps4_candidate(payload: dict[str, Any], overrides: dict[str, str]) -> ActiveM
     if not title and not art_source:
         return None
     sig = f"game::{title}::PlayStation 4::{art_source}"
-    cache_key = build_cache_key("game", title or "PlayStation 4", "PlayStation 4")
+    cache_key = build_cache_key("game", title or "PlayStation 4", "PlayStation 4", art_source)
     return ActiveMedia("ps4", "game", title or "PlayStation 4", "PlayStation 4", "", art_source, False, 0.0, sig, cache_key)
 
 
@@ -219,7 +205,7 @@ def sony_tv_candidate(payload: dict[str, Any], source_sensor: str, overrides: di
         art_source = overrides.get(f"tv_app:{app_name}", "") or overrides.get(f"tv_source:{source}", "")
     has_progress, progress_pct = extract_progress(payload)
     sig = f"tv::{title}::{subtitle}::{art_source}"
-    cache_key = build_cache_key("tv", title or "Sony TV", subtitle)
+    cache_key = build_cache_key("tv", title or "Sony TV", subtitle, art_source)
     return ActiveMedia("tv", "tv", title or "Sony TV", subtitle, "", art_source, has_progress and bool(art_source), progress_pct, sig, cache_key)
 
 
@@ -258,14 +244,33 @@ def square_cover(img: Image.Image) -> Image.Image:
     return img
 
 
+def encode_rgb565_le(image: Image.Image) -> bytes:
+    """Encode an exact 360x360 RGB image as little-endian RGB565 pixels."""
+    rgb = square_cover(image).tobytes()
+    encoded = bytearray(RGB565_BYTES)
+    for source, target in zip(range(0, len(rgb), 3), range(0, RGB565_BYTES, 2)):
+        red, green, blue = rgb[source:source + 3]
+        pixel = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | (blue >> 3)
+        struct.pack_into("<H", encoded, target, pixel)
+    return bytes(encoded)
+
+
 def is_valid_cached_art(path: Path) -> bool:
-    if not path.exists():
-        return False
+    return path.is_file() and path.stat().st_size == RGB565_BYTES
+
+
+def write_rgb565_atomic(image: Image.Image, path: Path) -> None:
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix="magic_dial_cache_", suffix=".rgb565", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
     try:
-        with Image.open(path) as img:
-            return img.size == (ART_SIZE, ART_SIZE)
-    except Exception:
-        return False
+        with os.fdopen(tmp_fd, "wb") as output:
+            output.write(encode_rgb565_le(image))
+            output.flush()
+            os.fsync(output.fileno())
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def discover_openai_config_entry(output_dir: Path) -> str:
@@ -335,17 +340,14 @@ def materialize_art(media: ActiveMedia, client: HAClient, output_dir: Path, prev
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = output_dir / 'cache'
     cache_dir.mkdir(parents=True, exist_ok=True)
-    current_png = output_dir / "current.jpg"
     cache_path = cache_file_path(output_dir, media.cache_key)
     previous_sig = str(previous.get("art_signature") or "")
-    previous_cache_key = str(previous.get("cache_key") or "")
 
-    if media.art_signature == previous_sig and is_valid_cached_art(current_png):
-        return build_public_url(output_dir, int(current_png.stat().st_mtime))
+    if media.art_signature == previous_sig and is_valid_cached_art(cache_path):
+        return build_public_url(output_dir, cache_path)
 
     if is_valid_cached_art(cache_path):
-        update_current_pointer(cache_path, current_png)
-        return build_public_url(output_dir, int(current_png.stat().st_mtime))
+        return build_public_url(output_dir, cache_path)
 
     image = None
     sources_to_try = []
@@ -378,21 +380,13 @@ def materialize_art(media: ActiveMedia, client: HAClient, output_dir: Path, prev
     if image is None:
         image = square_cover(generated_fallback_art(media))
 
-    tmp_fd, tmp_name = tempfile.mkstemp(prefix="magic_dial_cache_", suffix=".jpg", dir=str(cache_dir))
-    os.close(tmp_fd)
-    tmp_path = Path(tmp_name)
-    try:
-        image.save(tmp_path, format="JPEG", quality=72, optimize=True, progressive=False)
-        tmp_path.replace(cache_path)
-        update_current_pointer(cache_path, current_png)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
-    return build_public_url(output_dir, int(current_png.stat().st_mtime))
+    write_rgb565_atomic(image, cache_path)
+    return build_public_url(output_dir, cache_path)
 
 
-def build_public_url(output_dir: Path, mtime: int) -> str:
-    return f"__EXTERNAL_BASE__/local/{output_dir.name}/current.jpg?v={mtime}"
+def build_public_url(output_dir: Path, cache_path: Path) -> str:
+    filename = urllib.parse.quote(cache_path.name)
+    return f"__EXTERNAL_BASE__/local/{output_dir.name}/cache/{filename}"
 
 
 def empty_result() -> dict[str, Any]:

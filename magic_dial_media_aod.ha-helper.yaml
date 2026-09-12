@@ -3,8 +3,9 @@
 # What it does:
 # 1. Triggers a Python resolver whenever HomePod / PS4 / Sony TV changes, plus
 #    every 10 seconds while a playing session may need progress refresh.
-# 2. The resolver writes `/config/www/magic_dial_artwork/current.json` and
-#    `/config/www/magic_dial_artwork/current.png`.
+# 2. The resolver writes `/config/www/magic_dial_artwork/current.json` plus one
+#    immutable 360x360 little-endian RGB565 file per media identity under
+#    `/config/www/magic_dial_artwork/cache/`.
 # 3. A command_line sensor reads `current.json`, and template entities expose the
 #    exact fields ESPHome needs: artwork URL and progress percentage.
 #
@@ -19,8 +20,8 @@
 # Rollback:
 # - Remove this package from `packages:` (or comment it out) and reload /
 #   restart Home Assistant.
-# - Delete `/config/www/magic_dial_artwork/current.json` and `current.png` if
-#   you want to fully clean up generated artifacts.
+# - Delete `/config/www/magic_dial_artwork/current.json` and the `cache/`
+#   directory if you want to fully clean up generated artifacts.
 
 shell_command:
   magic_dial_media_refresh: >-

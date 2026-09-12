@@ -4,6 +4,7 @@
 - `magic-dial.yaml`
 - `magic_dial_media_aod.ha-helper.yaml`
 - `magic_dial_media_artwork.py`
+- `media_artwork_loader.h`
 
 ## 已备份文件
 - `backups/20260912_magic_dial_media_aod/magic-dial.yaml.bak`
@@ -21,10 +22,20 @@
    - `overrides.json`
    - 可选的 `overrides/` 图片目录
 
+## 当前图片链路
+- HA 将封面裁切为 360×360，并编码为 little-endian RGB565 原始像素文件。
+- ESP32 常驻两块 259200 字节 PSRAM buffer，FreeRTOS worker 只下载到非活动 buffer。
+- worker 使用 4 KiB 分段 HTTP 读取，每累计 4 KiB 主动 yield；响应必须为 HTTP 200 且
+  `Content-Length` 必须等于 259200。
+- LVGL API 只在 ESPHome 主线程调用；下载完成且 generation 仍是最新请求时，才切换
+  image source。
+- Wi-Fi 使用 `power_save_mode: none`，避免大文件下载期间 modem-sleep 造成 socket 断流。
+
 ## ESPHome 侧部署
 1. 先用当前仓库重新检查 `magic-dial.yaml`。
 2. 编译通过后再 OTA / USB 刷写。
-3. 首次部署时，先确认 HA 已能生成 `current.json` 与 `current.png`，再进 AOD 验证。
+3. 首次部署时，先确认 HA 已能生成 `current.json` 与
+   `cache/<媒体唯一键>.rgb565`（固定 259200 字节），再进 AOD 验证。
 
 ## 回滚
 ### 仅回滚 ESPHome
@@ -34,7 +45,8 @@
 ### 回滚 HA
 - 从 `packages:` 中移除 `magic_dial_media_aod.ha-helper.yaml`。
 - 删除或停用 `magic_dial_media_artwork.py` 对应的调用。
-- 删除 `/config/www/magic_dial_artwork/current.json` 与 `current.png`。
+- 删除 `/config/www/magic_dial_artwork/current.json` 与 `cache/` 下的
+  `.rgb565` 缓存。
 
 ## 当前策略
 - `HomePod`：优先，支持封面与进度。
