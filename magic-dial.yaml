@@ -499,8 +499,12 @@ voice_assistant:  # [VA]
   # 31dBFS -> 24dBFS, so the pre-multiplied signal keeps int16 headroom instead
   # of being pushed into the rails by AGC on top of it. If turns start coming
   # back as `stt-no-text-recognized` again, this is the first pair to back off.
+  # [VA] 2026-09-13 far-field tuning: preserve the full microphone stream
+  # without noise suppression, and use only the HA pipeline's AGC for level
+  # recovery. 18 dBFS raises distant speech by 6 dB versus 24 dBFS, while the
+  # proven 4.5 multiplier avoids returning to the clipping-prone 6.0.
   noise_suppression_level: 0
-  auto_gain: 24dBFS
+  auto_gain: 18dBFS
   volume_multiplier: 4.5
   # A pipeline can also be started from HA (assist_satellite.start_conversation
   # for a proactive question). In that case nothing ran va_prepare, so the
