@@ -26,7 +26,7 @@ from PIL import Image, ImageDraw
 
 ART_SIZE = 360
 RGB565_BYTES = ART_SIZE * ART_SIZE * 2
-ART_CACHE_VERSION = "cover-v4"
+ART_CACHE_VERSION = "cover-v5"
 DEFAULT_COVER_FILENAME = "default_album_cover.jpg"
 
 
