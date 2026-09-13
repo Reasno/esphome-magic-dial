@@ -1616,10 +1616,6 @@ globals:
   - id: g_va_phase  # [VA] 0: idle, 1: listening, 2: thinking, 3: speaking, 4: error, 5: proactive ask
     type: int
     initial_value: '0'
-  - id: g_va_pulse_step  # [VA] frame counter for the thinking '|' pulse
-    type: uint32_t
-    restore_value: no
-    initial_value: '0'
   - id: g_va_motion_step  # [VA] frame counter for the listening / speaking motion
     type: uint32_t
     restore_value: no
@@ -2160,7 +2156,7 @@ script:
           // itself (#CAE4FF, the most common non-white pixel of the artwork), so
           // the status line and the motion rings read as part of the avatar. The phases
           // are already told apart by their wording ("listening..." / the
-          // thinking pulse / "speaking...") and by the avatar being on screen,
+          // static "thinking..." / "speaking...") and by the avatar being on screen,
           // so per-phase hues only fought with the mascot's own palette.
           const auto color_accent = lv_color_hex(0xCAE4FF);
           const auto color_error  = lv_color_hex(0xFF6B6B);
@@ -2170,7 +2166,7 @@ script:
           bool show = true;
           switch (phase) {
             case 1: text = "listening..."; break;
-            case 2: text = "thinking."; break; // first frame is synchronous
+            case 2: text = "thinking..."; break;
             case 3: text = "speaking..."; break;
             case 4: c = color_error;     text = id(g_va_error_text).empty() ? "error"
                                                 : id(g_va_error_text).c_str(); break;
@@ -2185,12 +2181,6 @@ script:
           lv_obj_clear_flag(id(va_text), LV_OBJ_FLAG_HIDDEN);
           lv_obj_set_style_text_color(id(va_text), c, LV_PART_MAIN);
           lv_label_set_text(id(va_text), text);
-
-          // Guard the pulse from the render pass itself rather than from every
-          // caller: any phase change funnels through va_render, so starting and
-          // stopping here cannot be forgotten on a new code path.
-          if (phase == 2) id(va_think_pulse).execute();
-          else id(va_think_pulse).stop();
 
           // Same contract for the motion layer: the arc is hidden here (not
           // inside va_motion) so that an aborted turn -- where the script is
@@ -2251,31 +2241,6 @@ script:
   # deleted the `script.wait: va_zoom_out` inside va_teardown, one of the
   # windows a revived session could slip through. `va_icon` now simply stays at
   # its native scale and the VA widgets at LV_OPA_COVER.
-
-  # [VA] Thinking indicator: thinking. -> thinking.. -> thinking... at 240 ms.
-  # A `script` with `mode: restart` rather than a global `interval:` because an
-  # interval cannot be started and stopped on demand -- it would keep ticking
-  # (and keep writing to a label on a hidden page) for the whole uptime, which
-  # is exactly the kind of always-on timer the animimg cleanup removed.
-  # Only ASCII '|' is used, which every embedded font here already has.
-  - id: va_think_pulse
-    mode: restart
-    then:
-      - while:
-          condition: { lambda: 'return id(g_va_phase) == 2;' }
-          then:
-            - lambda: |-
-                static const char *frames[] = {"thinking.", "thinking..", "thinking..."};
-                // Re-check inside the loop body too: the phase can flip during
-                // the 240 ms delay and we must not stamp a stale frame over
-                // the text the next phase has already written.
-                if (id(g_va_phase) == 2)
-                  lv_label_set_text(id(va_text), frames[id(g_va_pulse_step) % 3]);
-                id(g_va_pulse_step)++;
-                lv_obj_invalidate(id(va_text));
-            - delay: 240ms
-      - lambda: |-
-          if (id(g_va_phase) != 2) lv_label_set_text(id(va_text), "");
 
   - id: knob_visual_settle
     mode: restart
