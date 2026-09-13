@@ -1088,6 +1088,10 @@ touchscreen:
     on_release:
       - lambda: |-
           id(g_touch_down) = false; // [VA]
+          if (id(g_ptt_started) && !id(g_va_active)) {
+            ESP_LOGW("touch", "Clearing stale g_ptt_started on release");
+            id(g_ptt_started) = false;
+          }
           if (id(g_ptt_started)) {  // [VA]
             // A PTT hold that started on the lock screen leaves `g_wake_consume`
             // armed; clear it here because this release never reaches the
@@ -2132,11 +2136,16 @@ script:
             # is still down right before the pipeline is started.
             - delay: 120ms
             - if:
-                condition: { lambda: 'return id(g_touch_down);' }
+                condition:
+                  lambda: |-
+                    return id(g_touch_down) &&
+                      abs(id(g_touch_dx)) <= 50 && abs(id(g_touch_dy)) <= 50;
                 then:
                   - script.execute: va_prepare
                 else:
-                  - lambda: 'id(g_ptt_started) = false;'
+                  - lambda: |-
+                      ESP_LOGI("touch", "Cancel PTT handoff because the touch became a swipe");
+                      id(g_ptt_started) = false;
 
   - id: va_ptt_release_feedback  # [VA]
     mode: restart
@@ -2898,6 +2907,13 @@ script:
           lv_refr_now(lv_display_get_default());
           ESP_LOGI("wake", "Main page refresh completed");
 
+  - id: refresh_visible_display
+    then:
+      - lambda: |-
+          lv_obj_invalidate(lv_screen_active());
+          lv_refr_now(lv_display_get_default());
+          ESP_LOGI("ui", "Forced LCD refresh on active screen");
+
   - id: cycle_target
     parameters:
       direction: int
@@ -2915,6 +2931,8 @@ script:
           id(g_optimistic_valid) = false;
           id(g_manual_until) = millis() + 60000;
       - script.execute: render_main
+      - script.wait: render_main
+      - script.execute: refresh_visible_display
       - script.execute: ring_device_feedback
       - lambda: |-
           // Lightweight target transition: the center stage fades in; the outer orbit stays fixed.
@@ -2981,6 +2999,8 @@ script:
           id(g_optimistic_valid) = false;
           id(g_manual_until) = millis() + 60000;
       - script.execute: render_main
+      - script.wait: render_main
+      - script.execute: refresh_visible_display
       - script.execute: ring_mode_feedback
       - lambda: |-
           lv_obj_t *items[] = {id(lbl_value), id(lbl_unit)};
@@ -3321,6 +3341,8 @@ script:
       - script.execute: knob_visual_settle
       - script.execute: optimistic_settle
       - script.execute: render_main
+      - script.wait: render_main
+      - script.execute: refresh_visible_display
       - if:
           condition: { lambda: 'return id(g_sleeping);' }
           then:
