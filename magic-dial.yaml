@@ -2031,56 +2031,63 @@ script:
           else:
             - script.execute: va_teardown
 
+  # Re-arm wake-word detection outside the teardown automation. Calling
+  # voice_assistant.stop can end the current VA automation context, so no
+  # state/UI work is allowed to depend on actions placed after it.
+  - id: va_rearm_wake_word
+    mode: restart
+    then:
+      - delay: 250ms
+      - if:
+          condition: { lambda: 'return !id(g_va_active);' }
+          then:
+            - micro_wake_word.start:
+
   - id: va_teardown  # [VA]
     mode: restart
     then:
-      # [VA] Clear the component's continue_conversation_ latch. Only
-      # `request_stop()` resets it (voice_assistant.cpp), so without this a
-      # session that ends through any local path (error, watchdog, grace
-      # timeout) would still have the component re-open the microphone behind
-      # our back. Harmless when already idle: request_stop() on State::IDLE
-      # just clears the flags.
-      - voice_assistant.stop:
+      # Clear local ownership first. `voice_assistant.stop` is deliberately the
+      # final action: on ESPHome 2026.7.4 it can terminate/switch the current VA
+      # automation context, which previously skipped every action after stop and
+      # left phase=3/page_va on screen forever.
       - lambda: |-
+          ESP_LOGI("vatrace", "teardown begin t=%u phase=%d active=%d run=%d",
+                   (unsigned) millis(), (int) id(g_va_phase),
+                   (int) id(g_va_active), (int) id(magic_dial_va).is_running());
           id(g_va_proactive) = false;
           id(g_proactive_deadline_ms) = 0;
-          if (!id(g_va_active) && !id(g_ptt_started)) return;
           id(g_va_phase) = 0;
           id(g_va_active) = false;
           id(g_ptt_started) = false;
           id(g_last_activity) = millis();
           id(g_manual_until) = millis() + 3000;
-          if (id(g_va_dac_was_unmuted)) id(dac_unmute).turn_on(); else id(dac_unmute).turn_off();
-      # [VA] BLE scanning is no longer paused during VA, so there is nothing to
-      # restore here. Keeping scan continuous avoids a stale Bluetooth proxy when
-      # an unusual teardown path skips cleanup.
-      # Idle render pass: blanks va_icon / va_text and stops va_think_pulse, so
-      # nothing is left painted on the page we are navigating away from.
+          if (id(g_va_dac_was_unmuted)) id(dac_unmute).turn_on();
+          else id(dac_unmute).turn_off();
+      # Blank VA widgets and stop all phase animations before leaving page_va.
       - script.execute: va_render
       - script.execute: ring_update_state
-      # [VA] Never navigate away from a LIVE session. Everything above is
-      # idempotent state restoration, but the page swap is destructive: if a new
-      # turn arrived while this teardown sat behind a delay (va_fail's 1200 ms,
-      # va_end_watch's poll), the dial is listening again and must keep
-      # page_va. This is the "screen went back to the clock while the assistant
-      # kept listening" bug.
+      - logger.log: "[vatrace] teardown -> leaving page_va"
       - if:
-          condition: { lambda: 'return !id(g_va_active);' }
+          condition: { lambda: 'return id(g_va_return_to_aod);' }
           then:
-            - logger.log: "[vatrace] teardown -> leaving page_va"
-            # [WW] Re-arm the wake word only once the session is really over.
-            # Deliberately inside this `!g_va_active` branch: the delayed
-            # teardown paths (va_fail, watchdog) can run while a new turn is
-            # already live, and starting mWW then would fight the assistant for
-            # the microphone.
-            - micro_wake_word.start:
-            - if:
-                condition: { lambda: 'return id(g_va_return_to_aod);' }
-                then:
-                  - script.execute: enter_sleep
-                else:
-                  - lvgl.page.show: page_main
-                  - script.execute: render_main
+            - script.execute: enter_sleep
+            - script.wait: enter_sleep
+          else:
+            - lvgl.page.show:
+                id: page_main
+                animation: none
+            - script.execute: render_main
+            - script.wait: render_main
+      # Force the newly selected page all the way through LVGL before stopping
+      # the VA component. This also makes physical LCD state match screenshots.
+      - lambda: |-
+          lv_obj_invalidate(lv_screen_active());
+          lv_refr_now(lv_display_get_default());
+          ESP_LOGI("vatrace", "teardown display refreshed t=%u",
+                   (unsigned) millis());
+      - script.execute: va_rearm_wake_word
+      # Last by design; do not append required cleanup after this action.
+      - voice_assistant.stop:
 
   - id: va_fail  # [VA]
     then:
