@@ -562,6 +562,12 @@ voice_assistant:  # [VA]
     - script.execute: va_claim_display
     - script.wait: va_claim_display
     - script.execute: va_render
+    - script.wait: va_render
+    - lambda: |-
+        lv_obj_invalidate(id(va_text));
+        lv_refr_now(lv_display_get_default());
+        ESP_LOGI("vatrace", "thinking first frame refreshed t=%u",
+                 (unsigned) millis());
     - script.execute: ring_update_state
   on_tts_start:
     - lambda: |-
@@ -2164,7 +2170,7 @@ script:
           bool show = true;
           switch (phase) {
             case 1: text = "listening..."; break;
-            case 2: text = ""; break; // va_think_pulse writes it
+            case 2: text = "thinking."; break; // first frame is synchronous
             case 3: text = "speaking..."; break;
             case 4: c = color_error;     text = id(g_va_error_text).empty() ? "error"
                                                 : id(g_va_error_text).c_str(); break;
@@ -2178,7 +2184,7 @@ script:
           else lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
           lv_obj_clear_flag(id(va_text), LV_OBJ_FLAG_HIDDEN);
           lv_obj_set_style_text_color(id(va_text), c, LV_PART_MAIN);
-          if (phase != 2) lv_label_set_text(id(va_text), text);
+          lv_label_set_text(id(va_text), text);
 
           // Guard the pulse from the render pass itself rather than from every
           // caller: any phase change funnels through va_render, so starting and
