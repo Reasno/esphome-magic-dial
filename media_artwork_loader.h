@@ -6,6 +6,7 @@
 #include "esp_heap_caps.h"
 #include "driver/gpio.h"
 #include "esp_http_client.h"
+#include "esp_ota_ops.h"
 #include "esphome/core/defines.h"
 #include "esphome/core/log.h"
 #ifdef USE_ESP32_BLE

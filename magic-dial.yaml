@@ -68,12 +68,27 @@ esphome:
     - priority: 1000
       then:
         - lambda: |-
+            // The LCD stays battery-powered across an ESP restart. Hold CS high
+            // and clock/data low before releasing reset so the ST77916 cannot
+            // sample floating QSPI pins as commands during the pre-init gap.
+            const gpio_num_t qspi_pins[] = {
+              GPIO_NUM_11, GPIO_NUM_13, GPIO_NUM_14, GPIO_NUM_15, GPIO_NUM_16
+            };
+            gpio_reset_pin(GPIO_NUM_12);
+            gpio_set_direction(GPIO_NUM_12, GPIO_MODE_OUTPUT);
+            gpio_set_level(GPIO_NUM_12, 1);
+            for (auto pin : qspi_pins) {
+              gpio_reset_pin(pin);
+              gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+              gpio_set_level(pin, 0);
+            }
             gpio_reset_pin(GPIO_NUM_17);
             gpio_set_direction(GPIO_NUM_17, GPIO_MODE_OUTPUT);
             gpio_set_level(GPIO_NUM_17, 0);
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(1200));
             gpio_set_level(GPIO_NUM_17, 1);
-            vTaskDelay(pdMS_TO_TICKS(120));
+            vTaskDelay(pdMS_TO_TICKS(150));
+            ESP_LOGI("lcd_reset", "Pre-init LCD hard reset completed with QSPI held idle");
     - priority: -100
       then:
         - lambda: |-
@@ -109,6 +124,9 @@ esphome:
         # without this the model is flashed but deaf. va_teardown re-arms it after
         # every assistant turn; this is the initial arm.
         - micro_wake_word.start:
+        - lambda: |-
+            const esp_err_t ota_result = esp_ota_mark_app_valid_cancel_rollback();
+            ESP_LOGI("ota", "Marked running partition valid: %s", esp_err_to_name(ota_result));
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -223,6 +241,12 @@ mqtt:
     - topic: magic_dial/debug/force_aod
       then:
         - script.execute: enter_sleep
+    - topic: magic_dial/debug/wake
+      then:
+        - script.execute: wake_display
+    - topic: magic_dial/debug/force_va
+      then:
+        - script.execute: va_enter_session
     - topic: magic_dial/debug/screenshot/request
       then:
         - lambda: |-
@@ -281,6 +305,7 @@ binary_sensor:
           const uint32_t now = millis();
           // The first knob pulse in AOD is consumed: wake only, never mutate state.
           if (id(g_sleeping)) {
+            ESP_LOGI("wake", "Knob left requested AOD exit");
             id(g_last_activity) = now;
             id(wake_display).execute();
             return;
@@ -333,6 +358,7 @@ binary_sensor:
           const uint32_t now = millis();
           // The first knob pulse in AOD is consumed: wake only, never mutate state.
           if (id(g_sleeping)) {
+            ESP_LOGI("wake", "Knob right requested AOD exit");
             id(g_last_activity) = now;
             id(wake_display).execute();
             return;
@@ -499,6 +525,7 @@ voice_assistant:  # [VA]
         id(g_va_tts_started) = false;
         id(g_va_stt_seen) = false;
         id(va_render).execute();
+    - script.execute: va_claim_display
     - script.execute: ring_update_state
   # [VA] VAD edges do not change the phase -- the screen already says
   # "listening..." and flipping it on every speech edge would flicker. They are
@@ -524,6 +551,7 @@ voice_assistant:  # [VA]
         id(g_va_phase) = 2; // thinking
         id(va_render).execute();
         id(dac_unmute).turn_off(); // Mute thinking
+    - script.execute: va_claim_display
     - script.execute: ring_update_state
   on_tts_start:
     - lambda: |-
@@ -542,6 +570,7 @@ voice_assistant:  # [VA]
         id(g_va_phase) = 3; // speaking
         id(va_render).execute();
         id(dac_unmute).turn_on();
+    - script.execute: va_claim_display
     - script.execute: ring_update_state
   # [VA] Playback finished. HA runs with `always_continue_conversation = false`,
   # so a normal turn is OVER the moment the answer stopped playing -- there is no
@@ -977,6 +1006,7 @@ touchscreen:
           id(g_touch_t0) = millis();
           id(g_touch_down) = true;   // [VA]
           id(g_wake_consume) = id(g_sleeping);
+          if (id(g_sleeping)) ESP_LOGI("wake", "Touch requested AOD exit");
           id(g_last_activity) = millis();
 
           // TV progress mode owns a centered 1x4 remote row in screen coordinates.
@@ -1850,10 +1880,33 @@ script:
       - lambda: 'id(g_ring_feedback) = 0;'
       - script.execute: ring_update_state
 
+  # [VA] Voice assistant owns the display above AOD, media and all control
+  # pages. Reassert ownership at every pipeline phase so a concurrent media or
+  # wake update cannot leave the assistant running behind another page.
+  - id: va_claim_display
+    mode: restart
+    then:
+      - lambda: |-
+          id(g_sleeping) = false;
+          id(g_last_activity) = millis();
+          id(g_backlight_pct) = 100;
+          lv_obj_add_flag(id(aod_media_image), LV_OBJ_FLAG_HIDDEN);
+      - light.turn_on:
+          id: backlight_light
+          brightness: 100%
+      - lvgl.page.show:
+          id: page_va
+          animation: none
+      - lambda: |-
+          lv_obj_invalidate(lv_screen_active());
+          lv_refr_now(lv_display_get_default());
+          ESP_LOGI("vatrace", "VA claimed display phase=%d", (int) id(g_va_phase));
+
   # [VA] Shared session entry: claims the screen/ring for the assistant without
   # starting the pipeline. Used both by the local PTT path (va_prepare) and by
   # pipelines started from HA (proactive ask).
   - id: va_enter_session
+    mode: restart
     then:
       - lambda: |-
           id(g_va_phase) = 1; // [VA]
@@ -1878,10 +1931,8 @@ script:
           id(g_backlight_pct) = 100;
           id(dac_unmute).turn_off();
           id(va_render).execute();
-      - light.turn_on:
-          id: backlight_light
-          brightness: 100%
-      - lvgl.page.show: page_va
+      - script.execute: va_claim_display
+      - script.wait: va_claim_display
       - script.execute: ring_update_state
       # [VA] Keep BLE scanning active during voice sessions. A previous version
       # stopped scanning here to reduce main-loop pressure, but missed restore
@@ -2798,7 +2849,14 @@ script:
           }
 
   - id: enter_sleep
+    mode: restart
     then:
+      - if:
+          condition:
+            lambda: "return id(g_va_active);"
+          then:
+            - script.execute: va_claim_display
+            - script.stop: enter_sleep
       - lambda: |-
           id(g_sleeping) = true;
       - if:
@@ -2818,20 +2876,33 @@ script:
       - script.execute: apply_screen_brightness
 
   - id: wake_display
+    mode: restart
     then:
+      - if:
+          condition:
+            lambda: "return id(g_va_active);"
+          then:
+            - script.execute: va_claim_display
+            - script.stop: wake_display
       - lambda: |-
+          ESP_LOGI("wake", "Leaving AOD and restoring main page");
           id(g_sleeping) = false;
           id(g_last_activity) = millis();
           id(g_manual_until) = 0;
           id(g_backlight_pct) = 100;
+          lv_obj_add_flag(id(aod_media_image), LV_OBJ_FLAG_HIDDEN);
       - light.turn_on:
           id: backlight_light
           brightness: 100%
       - script.execute: resolve_priority
       - lvgl.page.show:
           id: page_main
-          animation: fade_in
-          time: 250ms
+          animation: none
+      - script.execute: render_main
+      - lambda: |-
+          lv_obj_invalidate(lv_screen_active());
+          lv_refr_now(lv_display_get_default());
+          ESP_LOGI("wake", "Main page refresh completed");
 
   - id: cycle_target
     parameters:
