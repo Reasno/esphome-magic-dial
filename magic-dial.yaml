@@ -1269,17 +1269,6 @@ sensor:
     internal: true
 
   - platform: homeassistant
-    id: aod_media_progress_pct
-    entity_id: sensor.magic_dial_media_progress_pct
-    internal: true
-    on_value:
-      - if:
-          condition:
-            lambda: "return id(g_sleeping);"
-          then:
-            - script.execute: render_aod
-
-  - platform: homeassistant
     id: ceiling_light_color_temp
     entity_id: ${ceiling_light_entity}
     attribute: color_temp_kelvin
@@ -2808,15 +2797,6 @@ script:
             else lv_obj_add_flag(id(lbl_aod_holiday), LV_OBJ_FLAG_HIDDEN);
           }
 
-          const float progress = id(aod_media_progress_pct).state;
-          const bool show_progress = media_ready && !isnan(progress) && progress >= 0.0f;
-          if (show_progress) {
-            lv_arc_set_value(id(arc_aod_media_progress), (int) roundf(fminf(100.0f, fmaxf(0.0f, progress))));
-            lv_obj_clear_flag(id(arc_aod_media_progress), LV_OBJ_FLAG_HIDDEN);
-          } else {
-            lv_obj_add_flag(id(arc_aod_media_progress), LV_OBJ_FLAG_HIDDEN);
-          }
-
   - id: enter_sleep
     then:
       - lambda: |-
@@ -3647,7 +3627,6 @@ interval:
                   - script.execute: render_aod
                   - lambda: |-
                       lv_obj_move_foreground(id(aod_media_image));
-                      lv_obj_move_foreground(id(arc_aod_media_progress));
                       lv_obj_invalidate(lv_screen_active());
                       lv_refr_now(lv_display_get_default());
       - lambda: |-
@@ -4233,25 +4212,6 @@ lvgl:
             src: img_doubao_avatar
             hidden: true
             clickable: false
-        - arc:
-            id: arc_aod_media_progress
-            align: CENTER
-            width: 350
-            height: 350
-            arc_width: 4
-            min_value: 0
-            max_value: 100
-            value: 0
-            start_angle: 0
-            end_angle: 360
-            rotation: 120
-            adjustable: false
-            hidden: true
-            arc_color: 0x18303C
-            arc_opa: 40%
-            indicator:
-              arc_color: 0xCAE4FF
-              arc_width: 4
         # Pure black AOD background: the lockscreen photo was removed, so no
         # halo copies are needed behind the digits.
         - label:
