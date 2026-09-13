@@ -247,6 +247,14 @@ mqtt:
     - topic: magic_dial/debug/force_va
       then:
         - script.execute: va_enter_session
+    - topic: magic_dial/debug/force_thinking
+      then:
+        - lambda: |-
+            id(g_va_active) = true;
+            id(g_va_phase) = 2;
+        - script.execute: va_claim_display
+        - script.wait: va_claim_display
+        - script.execute: va_render
     - topic: magic_dial/debug/screenshot/request
       then:
         - lambda: |-
@@ -549,9 +557,11 @@ voice_assistant:  # [VA]
         ESP_LOGI("va", "STT text: %s", x.c_str());
         id(g_va_stt_seen) = true;
         id(g_va_phase) = 2; // thinking
-        id(va_render).execute();
         id(dac_unmute).turn_off(); // Mute thinking
+    # Page ownership must settle before the pulse writes its first frame.
     - script.execute: va_claim_display
+    - script.wait: va_claim_display
+    - script.execute: va_render
     - script.execute: ring_update_state
   on_tts_start:
     - lambda: |-
@@ -2159,6 +2169,7 @@ script:
           // recoloured. Only the status line carries the phase colour.
           if (show) lv_obj_clear_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
           else lv_obj_add_flag(id(va_icon), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_clear_flag(id(va_text), LV_OBJ_FLAG_HIDDEN);
           lv_obj_set_style_text_color(id(va_text), c, LV_PART_MAIN);
           if (phase != 2) lv_label_set_text(id(va_text), text);
 
@@ -2228,7 +2239,7 @@ script:
   # windows a revived session could slip through. `va_icon` now simply stays at
   # its native scale and the VA widgets at LV_OPA_COVER.
 
-  # [VA] Thinking indicator: | -> || -> ||| -> || -> | at 200 ms.
+  # [VA] Thinking indicator: thinking. -> thinking.. -> thinking... at 240 ms.
   # A `script` with `mode: restart` rather than a global `interval:` because an
   # interval cannot be started and stopped on demand -- it would keep ticking
   # (and keep writing to a label on a hidden page) for the whole uptime, which
@@ -2241,14 +2252,15 @@ script:
           condition: { lambda: 'return id(g_va_phase) == 2;' }
           then:
             - lambda: |-
-                static const char *frames[] = {"|", "||", "|||", "||"};
+                static const char *frames[] = {"thinking.", "thinking..", "thinking..."};
                 // Re-check inside the loop body too: the phase can flip during
-                // the 200 ms delay and we must not stamp a stale frame over
+                // the 240 ms delay and we must not stamp a stale frame over
                 // the text the next phase has already written.
                 if (id(g_va_phase) == 2)
-                  lv_label_set_text(id(va_text), frames[id(g_va_pulse_step) & 3]);
+                  lv_label_set_text(id(va_text), frames[id(g_va_pulse_step) % 3]);
                 id(g_va_pulse_step)++;
-            - delay: 200ms
+                lv_obj_invalidate(id(va_text));
+            - delay: 240ms
       - lambda: |-
           if (id(g_va_phase) != 2) lv_label_set_text(id(va_text), "");
 
