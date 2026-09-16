@@ -1812,7 +1812,17 @@ script:
     then:
       - lambda: |-
           if (id(g_sleeping)) {
-            id(ring_light)->turn_off().perform();
+            const bool media_playing =
+              id(tv_state).state == "playing" ||
+              id(homepod_state).state == "playing";
+            if (!media_playing) {
+              id(ring_light)->turn_off().perform();
+              return;
+            }
+            auto call = id(ring_light)->turn_on();
+            call.set_brightness(1.0f);
+            call.set_effect("Ring State");
+            call.perform();
             return;
           }
           if (id(g_ring_feedback) != 0) return;
@@ -2351,6 +2361,12 @@ script:
   - id: sync_from_ha
     mode: restart
     then:
+      - if:
+          condition:
+            lambda: 'return id(g_sleeping);'
+          then:
+            - script.execute: ring_update_state
+            - script.stop: sync_from_ha
       - if: # [VA]
           condition: { lambda: 'return id(g_va_active);' }
           then:
@@ -3174,6 +3190,8 @@ script:
                 id(g_strip_power_optimistic_on) = !currently_on;
                 id(g_strip_power_optimistic_valid) = true;
             - script.execute: render_main
+            - script.wait: render_main
+            - script.execute: refresh_visible_display
             - homeassistant.action: { action: light.toggle, data: { entity_id: '${strip_light_entity}' } }
             - script.execute: strip_power_optimistic_settle
       - if:
