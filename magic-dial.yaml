@@ -2143,7 +2143,6 @@ script:
                 id: page_main
                 animation: none
             - script.execute: render_main
-            - script.wait: render_main
       # Force the newly selected page all the way through LVGL before stopping
       # the VA component. This also makes physical LCD state match screenshots.
       - lambda: |-
@@ -3008,7 +3007,6 @@ script:
           id(g_optimistic_valid) = false;
           id(g_manual_until) = millis() + 60000;
       - script.execute: render_main
-      - script.wait: render_main
       - script.execute: refresh_visible_display
       - script.execute: ring_device_feedback
       - lambda: |-
@@ -3076,7 +3074,6 @@ script:
           id(g_optimistic_valid) = false;
           id(g_manual_until) = millis() + 60000;
       - script.execute: render_main
-      - script.wait: render_main
       - script.execute: refresh_visible_display
       - script.execute: ring_mode_feedback
       - lambda: |-
@@ -3126,6 +3123,12 @@ script:
           condition: { lambda: 'return id(g_va_active);' }
           then:
             - script.stop: handle_tap
+      # A tap changes the state of the very device the page is showing, so the HA
+      # push that follows must NOT be allowed to re-run resolve_priority and swap
+      # g_target out from under the user - that reads as "tap did nothing" (or
+      # worse, "the dial jumped pages"). Pin the current selection the same way
+      # the knob and swipe paths do, just with a shorter lease.
+      - lambda: 'id(g_manual_until) = millis() + 10000;'
       - if:
           condition: { lambda: 'return id(g_target) == 0;' }
           then:
@@ -3190,7 +3193,6 @@ script:
                 id(g_strip_power_optimistic_on) = !currently_on;
                 id(g_strip_power_optimistic_valid) = true;
             - script.execute: render_main
-            - script.wait: render_main
             - script.execute: refresh_visible_display
             - homeassistant.action: { action: light.toggle, data: { entity_id: '${strip_light_entity}' } }
             - script.execute: strip_power_optimistic_settle
@@ -3432,7 +3434,6 @@ script:
       - script.execute: knob_visual_settle
       - script.execute: optimistic_settle
       - script.execute: render_main
-      - script.wait: render_main
       - script.execute: refresh_visible_display
       - if:
           condition: { lambda: 'return id(g_sleeping);' }
