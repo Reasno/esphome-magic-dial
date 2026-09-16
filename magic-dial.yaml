@@ -400,7 +400,10 @@ binary_sensor:
           };
           // 本机 mode 3 (电量) is a read-only readout: the knob does nothing there.
           if (id(g_target) == 7 && id(g_control_mode) == 3) return;
-          if (!active(id(g_target))) return;
+          // 灯带关闭时仍允许在亮度页向右旋转，以便从 0 开始重新打开。
+          const bool strip_brightness_wake =
+            id(g_target) == 3 && id(g_control_mode) == 0;
+          if (!active(id(g_target)) && !strip_brightness_wake) return;
           id(handle_knob).execute(1);
 
 # PCM5100A enable: HIGH means unmuted.
@@ -1227,6 +1230,11 @@ text_sensor:
     entity_id: ${strip_light_entity}
     internal: true
     on_value:
+      - lambda: |-
+          if (id(g_strip_power_optimistic_valid) &&
+              ((x == "on") == id(g_strip_power_optimistic_on))) {
+            id(g_strip_power_optimistic_valid) = false;
+          }
       - script.execute: sync_from_ha
 
   - platform: homeassistant
@@ -1540,6 +1548,14 @@ globals:
     restore_value: no
     initial_value: '0x45D6C5'
   - id: g_target_online
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_strip_power_optimistic_valid
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_strip_power_optimistic_on
     type: bool
     restore_value: no
     initial_value: 'false'
@@ -2325,6 +2341,13 @@ script:
           then:
             - script.execute: render_main
 
+  - id: strip_power_optimistic_settle
+    mode: restart
+    then:
+      - delay: 2s
+      - lambda: 'id(g_strip_power_optimistic_valid) = false;'
+      - script.execute: render_main
+
   - id: sync_from_ha
     mode: restart
     then:
@@ -2468,7 +2491,11 @@ script:
               if (target == 0) { const auto s = id(tv_state).state; return s == "playing" || s == "on" || s == "paused"; }
               if (target == 1) { const auto s = id(homepod_state).state; return s == "playing" || s == "on" || s == "paused"; }
               if (target == 2) return id(ceiling_light_state).state == "on";
-              if (target == 3) return id(strip_light_state).state == "on";
+              if (target == 3) {
+                return id(g_strip_power_optimistic_valid)
+                  ? id(g_strip_power_optimistic_on)
+                  : id(strip_light_state).state == "on";
+              }
               if (target == 4) { const auto s = id(climate_state).state; return !s.empty() && s != "off" && s != "unknown" && s != "unavailable"; }
               if (target == 5) { const auto s = id(dining_room_climate_state).state; return !s.empty() && s != "off" && s != "unknown" && s != "unavailable"; }
               if (target == 6) { const auto s = id(floor_heating_state).state; return !s.empty() && s != "off" && s != "unknown" && s != "unavailable"; }
@@ -2560,7 +2587,11 @@ script:
             if (target == 0) { const auto s=id(tv_state).state; return s=="playing"||s=="on"||s=="paused"; }
             if (target == 1) { const auto s=id(homepod_state).state; return s=="playing"||s=="on"||s=="paused"; }
             if (target == 2) return id(ceiling_light_state).state == "on";
-            if (target == 3) return id(strip_light_state).state == "on";
+            if (target == 3) {
+              return id(g_strip_power_optimistic_valid)
+                ? id(g_strip_power_optimistic_on)
+                : id(strip_light_state).state == "on";
+            }
             if (target == 4) { const auto s=id(climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
             if (target == 5) { const auto s=id(dining_room_climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
             if (target == 6) { const auto s=id(floor_heating_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
@@ -3136,7 +3167,15 @@ script:
       - if:
           condition: { lambda: 'return id(g_target) == 3;' }
           then:
+            - lambda: |-
+                const bool currently_on = id(g_strip_power_optimistic_valid)
+                  ? id(g_strip_power_optimistic_on)
+                  : id(strip_light_state).state == "on";
+                id(g_strip_power_optimistic_on) = !currently_on;
+                id(g_strip_power_optimistic_valid) = true;
+            - script.execute: render_main
             - homeassistant.action: { action: light.toggle, data: { entity_id: '${strip_light_entity}' } }
+            - script.execute: strip_power_optimistic_settle
       - if:
           condition: { lambda: 'return id(g_target) == 4;' }
           then:
@@ -3368,6 +3407,10 @@ script:
             id(g_optimistic_mode) = mode;
             id(g_optimistic_value) = value;
           }
+          if (target == 3 && mode == 0) {
+            id(g_strip_power_optimistic_on) = value > 0.0f;
+            id(g_strip_power_optimistic_valid) = true;
+          }
       - script.execute: knob_visual_settle
       - script.execute: optimistic_settle
       - script.execute: render_main
@@ -3452,12 +3495,24 @@ script:
       - if:
           condition: { lambda: 'return id(g_target) == 3 && id(g_control_mode) == 0;' }
           then:
-            - homeassistant.action:
-                action: light.turn_on
-                data:
-                  entity_id: ${strip_light_entity}
-                  brightness_pct: !lambda |-
-                    char text[8]; snprintf(text, sizeof(text), "%.0f", id(g_optimistic_value)); return std::string(text);
+            - if:
+                condition:
+                  lambda: 'return id(g_optimistic_value) <= 0.0f;'
+                then:
+                  - homeassistant.action:
+                      action: light.turn_off
+                      data:
+                        entity_id: ${strip_light_entity}
+                else:
+                  - homeassistant.action:
+                      action: light.turn_on
+                      data:
+                        entity_id: ${strip_light_entity}
+                        brightness_pct: !lambda |-
+                          char text[8];
+                          snprintf(text, sizeof(text), "%.0f", id(g_optimistic_value));
+                          return std::string(text);
+            - script.execute: strip_power_optimistic_settle
       - if:
           condition: { lambda: 'return id(g_target) == 3 && id(g_control_mode) == 1;' }
           then:
