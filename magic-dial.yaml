@@ -338,8 +338,11 @@ binary_sensor:
           auto active = [&](int target) -> bool {
             if (target == 0) { const auto s=id(tv_state).state; return s=="playing"||s=="on"||s=="paused"; }
             if (target == 1) { const auto s=id(homepod_state).state; return s=="playing"||s=="on"||s=="paused"; }
-            if (target == 2) return id(ceiling_light_state).state=="on";
-            if (target == 3) return id(strip_light_state).state=="on";
+            if (target == 2 || target == 3) {
+              if (id(g_light_power_optimistic_valid) && id(g_light_power_optimistic_target) == target)
+                return id(g_light_power_optimistic_on);
+              return (target == 2 ? id(ceiling_light_state).state : id(strip_light_state).state) == "on";
+            }
             if (target == 4) { const auto s=id(climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
             if (target == 5) { const auto s=id(dining_room_climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
             if (target == 6) { const auto s=id(floor_heating_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
@@ -391,8 +394,11 @@ binary_sensor:
           auto active = [&](int target) -> bool {
             if (target == 0) { const auto s=id(tv_state).state; return s=="playing"||s=="on"||s=="paused"; }
             if (target == 1) { const auto s=id(homepod_state).state; return s=="playing"||s=="on"||s=="paused"; }
-            if (target == 2) return id(ceiling_light_state).state=="on";
-            if (target == 3) return id(strip_light_state).state=="on";
+            if (target == 2 || target == 3) {
+              if (id(g_light_power_optimistic_valid) && id(g_light_power_optimistic_target) == target)
+                return id(g_light_power_optimistic_on);
+              return (target == 2 ? id(ceiling_light_state).state : id(strip_light_state).state) == "on";
+            }
             if (target == 4) { const auto s=id(climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
             if (target == 5) { const auto s=id(dining_room_climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
             if (target == 6) { const auto s=id(floor_heating_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
@@ -1223,6 +1229,12 @@ text_sensor:
     entity_id: ${ceiling_light_entity}
     internal: true
     on_value:
+      - lambda: |-
+          if (id(g_light_power_optimistic_valid) &&
+              id(g_light_power_optimistic_target) == 2 &&
+              ((x == "on") == id(g_light_power_optimistic_on))) {
+            id(g_light_power_optimistic_valid) = false;
+          }
       - script.execute: sync_from_ha
 
   - platform: homeassistant
@@ -1231,9 +1243,10 @@ text_sensor:
     internal: true
     on_value:
       - lambda: |-
-          if (id(g_strip_power_optimistic_valid) &&
-              ((x == "on") == id(g_strip_power_optimistic_on))) {
-            id(g_strip_power_optimistic_valid) = false;
+          if (id(g_light_power_optimistic_valid) &&
+              id(g_light_power_optimistic_target) == 3 &&
+              ((x == "on") == id(g_light_power_optimistic_on))) {
+            id(g_light_power_optimistic_valid) = false;
           }
       - script.execute: sync_from_ha
 
@@ -1372,6 +1385,10 @@ sensor:
     attribute: brightness
     internal: true
     on_value:
+      - lambda: |-
+          // HA only publishes `brightness` while the light is on, so every value
+          // that arrives here is worth remembering for the next tap-to-on.
+          if (!isnan(x) && x > 0.0f) id(g_ceiling_last_brightness) = x / 255.0f;
       - script.execute: sync_from_ha
 
   - platform: homeassistant
@@ -1380,6 +1397,8 @@ sensor:
     attribute: brightness
     internal: true
     on_value:
+      - lambda: |-
+          if (!isnan(x) && x > 0.0f) id(g_strip_last_brightness) = x / 255.0f;
       - script.execute: sync_from_ha
 
   - platform: template
@@ -1551,14 +1570,36 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
-  - id: g_strip_power_optimistic_valid
+  # One shared power-feedback slot for both light pages. A tap can only ever be
+  # about the page you are looking at, so `target` + `on` is enough and the two
+  # lights can never fight over the same flag. Cleared early by the matching HA
+  # state push, with light_power_optimistic_settle as the backstop.
+  - id: g_light_power_optimistic_valid
     type: bool
     restore_value: no
     initial_value: 'false'
-  - id: g_strip_power_optimistic_on
+  - id: g_light_power_optimistic_target
+    type: int
+    restore_value: no
+    initial_value: '2'
+  - id: g_light_power_optimistic_on
     type: bool
     restore_value: no
     initial_value: 'false'
+  # Last non-zero brightness seen from HA, as a 0-1 fraction. HA drops the
+  # `brightness` attribute entirely while a light is off, which is why the dial
+  # used to fall back to 0 and show a value that was never true. This is both
+  # what gets displayed and what gets sent when a tap switches the light on, so
+  # the number on screen is the number on the wire. Restored across reboots so
+  # the first tap after a power cut is not a guess.
+  - id: g_ceiling_last_brightness
+    type: float
+    restore_value: yes
+    initial_value: '1.0'
+  - id: g_strip_last_brightness
+    type: float
+    restore_value: yes
+    initial_value: '1.0'
   - id: g_touch_x0
     type: int
     restore_value: no
@@ -2350,12 +2391,13 @@ script:
           then:
             - script.execute: render_main
 
-  - id: strip_power_optimistic_settle
+  - id: light_power_optimistic_settle
     mode: restart
     then:
-      - delay: 2s
-      - lambda: 'id(g_strip_power_optimistic_valid) = false;'
+      - delay: 3s
+      - lambda: 'id(g_light_power_optimistic_valid) = false;'
       - script.execute: render_main
+      - script.execute: refresh_visible_display
 
   - id: sync_from_ha
     mode: restart
@@ -2505,11 +2547,10 @@ script:
             auto active = [&](int target) -> bool {
               if (target == 0) { const auto s = id(tv_state).state; return s == "playing" || s == "on" || s == "paused"; }
               if (target == 1) { const auto s = id(homepod_state).state; return s == "playing" || s == "on" || s == "paused"; }
-              if (target == 2) return id(ceiling_light_state).state == "on";
-              if (target == 3) {
-                return id(g_strip_power_optimistic_valid)
-                  ? id(g_strip_power_optimistic_on)
-                  : id(strip_light_state).state == "on";
+              if (target == 2 || target == 3) {
+                if (id(g_light_power_optimistic_valid) && id(g_light_power_optimistic_target) == target)
+                  return id(g_light_power_optimistic_on);
+                return (target == 2 ? id(ceiling_light_state).state : id(strip_light_state).state) == "on";
               }
               if (target == 4) { const auto s = id(climate_state).state; return !s.empty() && s != "off" && s != "unknown" && s != "unavailable"; }
               if (target == 5) { const auto s = id(dining_room_climate_state).state; return !s.empty() && s != "off" && s != "unknown" && s != "unavailable"; }
@@ -2572,8 +2613,11 @@ script:
             float value = 0;
             if (id(g_target) == 0) value = optimistic ? id(g_optimistic_value) : (isnan(id(tv_volume).state) ? 0 : id(tv_volume).state * 100.0f);
             else if (id(g_target) == 1) value = optimistic ? id(g_optimistic_value) : (isnan(id(homepod_volume).state) ? 0 : id(homepod_volume).state * 100.0f);
-            else if (id(g_target) == 2) value = optimistic ? id(g_optimistic_value) : (isnan(id(ceiling_light_brightness).state) ? 0 : id(ceiling_light_brightness).state / 2.55f);
-            else if (id(g_target) == 3) value = optimistic ? id(g_optimistic_value) : (isnan(id(strip_light_brightness).state) ? 0 : id(strip_light_brightness).state / 2.55f);
+            // Lights: `brightness` is absent whenever HA considers the light off,
+            // so fall back to the last non-zero value instead of a bogus 0 - that
+            // is also exactly what a tap-to-on is about to send.
+            else if (id(g_target) == 2) value = optimistic ? id(g_optimistic_value) : (isnan(id(ceiling_light_brightness).state) ? id(g_ceiling_last_brightness) * 100.0f : id(ceiling_light_brightness).state / 2.55f);
+            else if (id(g_target) == 3) value = optimistic ? id(g_optimistic_value) : (isnan(id(strip_light_brightness).state) ? id(g_strip_last_brightness) * 100.0f : id(strip_light_brightness).state / 2.55f);
             else if (id(g_target) == 4 || id(g_target) == 5 || id(g_target) == 6) {
               value = optimistic ? id(g_optimistic_value) : (id(g_target) == 4 ? id(climate_target_temperature).state :
                 (id(g_target) == 5 ? id(dining_room_climate_target_temp).state : id(floor_heating_target_temp).state));
@@ -2601,11 +2645,10 @@ script:
           auto active = [&](int target) -> bool {
             if (target == 0) { const auto s=id(tv_state).state; return s=="playing"||s=="on"||s=="paused"; }
             if (target == 1) { const auto s=id(homepod_state).state; return s=="playing"||s=="on"||s=="paused"; }
-            if (target == 2) return id(ceiling_light_state).state == "on";
-            if (target == 3) {
-              return id(g_strip_power_optimistic_valid)
-                ? id(g_strip_power_optimistic_on)
-                : id(strip_light_state).state == "on";
+            if (target == 2 || target == 3) {
+              if (id(g_light_power_optimistic_valid) && id(g_light_power_optimistic_target) == target)
+                return id(g_light_power_optimistic_on);
+              return (target == 2 ? id(ceiling_light_state).state : id(strip_light_state).state) == "on";
             }
             if (target == 4) { const auto s=id(climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
             if (target == 5) { const auto s=id(dining_room_climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
@@ -3177,25 +3220,73 @@ script:
           condition: { lambda: 'return id(g_target) == 1;' }
           then:
             - homeassistant.action: { action: media_player.media_play_pause, data: { entity_id: '${homepod_entity}' } }
+      # Both light pages share one shape: flip the local power state, repaint the
+      # LCD right away, and only then talk to HA. Switching on is an explicit
+      # `turn_on` carrying the brightness the screen is already showing, so the
+      # dial never has to guess what HA will restore - what you see is what was
+      # sent. (`toggle` used to leave the page rendering 0 % until HA answered.)
       - if:
           condition: { lambda: 'return id(g_target) == 2;' }
           then:
-            # The template light owns the relay/lamp power-up dance, so tap is a
-            # plain toggle again.
-            - homeassistant.action: { action: light.toggle, data: { entity_id: '${ceiling_light_entity}' } }
+            - lambda: |-
+                const bool currently_on =
+                  (id(g_light_power_optimistic_valid) && id(g_light_power_optimistic_target) == 2)
+                    ? id(g_light_power_optimistic_on)
+                    : id(ceiling_light_state).state == "on";
+                id(g_light_power_optimistic_target) = 2;
+                id(g_light_power_optimistic_on) = !currently_on;
+                id(g_light_power_optimistic_valid) = true;
+            - script.execute: render_main
+            - script.execute: refresh_visible_display
+            - if:
+                condition: { lambda: 'return id(g_light_power_optimistic_on);' }
+                then:
+                  - homeassistant.action:
+                      action: light.turn_on
+                      data:
+                        entity_id: ${ceiling_light_entity}
+                        brightness_pct: !lambda |-
+                          const int pct = (int) roundf(fmaxf(1.0f, fminf(100.0f, id(g_ceiling_last_brightness) * 100.0f)));
+                          char buf[8];
+                          snprintf(buf, sizeof(buf), "%d", pct);
+                          return std::string(buf);
+                else:
+                  - homeassistant.action:
+                      action: light.turn_off
+                      data:
+                        entity_id: ${ceiling_light_entity}
+            - script.execute: light_power_optimistic_settle
       - if:
           condition: { lambda: 'return id(g_target) == 3;' }
           then:
             - lambda: |-
-                const bool currently_on = id(g_strip_power_optimistic_valid)
-                  ? id(g_strip_power_optimistic_on)
-                  : id(strip_light_state).state == "on";
-                id(g_strip_power_optimistic_on) = !currently_on;
-                id(g_strip_power_optimistic_valid) = true;
+                const bool currently_on =
+                  (id(g_light_power_optimistic_valid) && id(g_light_power_optimistic_target) == 3)
+                    ? id(g_light_power_optimistic_on)
+                    : id(strip_light_state).state == "on";
+                id(g_light_power_optimistic_target) = 3;
+                id(g_light_power_optimistic_on) = !currently_on;
+                id(g_light_power_optimistic_valid) = true;
             - script.execute: render_main
             - script.execute: refresh_visible_display
-            - homeassistant.action: { action: light.toggle, data: { entity_id: '${strip_light_entity}' } }
-            - script.execute: strip_power_optimistic_settle
+            - if:
+                condition: { lambda: 'return id(g_light_power_optimistic_on);' }
+                then:
+                  - homeassistant.action:
+                      action: light.turn_on
+                      data:
+                        entity_id: ${strip_light_entity}
+                        brightness_pct: !lambda |-
+                          const int pct = (int) roundf(fmaxf(1.0f, fminf(100.0f, id(g_strip_last_brightness) * 100.0f)));
+                          char buf[8];
+                          snprintf(buf, sizeof(buf), "%d", pct);
+                          return std::string(buf);
+                else:
+                  - homeassistant.action:
+                      action: light.turn_off
+                      data:
+                        entity_id: ${strip_light_entity}
+            - script.execute: light_power_optimistic_settle
       - if:
           condition: { lambda: 'return id(g_target) == 4;' }
           then:
@@ -3427,9 +3518,13 @@ script:
             id(g_optimistic_mode) = mode;
             id(g_optimistic_value) = value;
           }
+          // Dialling brightness is also a power change on the strip: 0 % turns it
+          // off, anything above 0 turns it back on. (The ceiling light resolves
+          // brightness 0 to "off" inside its HA template, so it needs no branch.)
           if (target == 3 && mode == 0) {
-            id(g_strip_power_optimistic_on) = value > 0.0f;
-            id(g_strip_power_optimistic_valid) = true;
+            id(g_light_power_optimistic_target) = 3;
+            id(g_light_power_optimistic_on) = value > 0.0f;
+            id(g_light_power_optimistic_valid) = true;
           }
       - script.execute: knob_visual_settle
       - script.execute: optimistic_settle
@@ -3531,7 +3626,7 @@ script:
                           char text[8];
                           snprintf(text, sizeof(text), "%.0f", id(g_optimistic_value));
                           return std::string(text);
-            - script.execute: strip_power_optimistic_settle
+            - script.execute: light_power_optimistic_settle
       - if:
           condition: { lambda: 'return id(g_target) == 3 && id(g_control_mode) == 1;' }
           then:
