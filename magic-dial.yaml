@@ -754,8 +754,38 @@ light:
               }
               return;
             }
+            const bool media_playing =
+              id(tv_state).state == "playing" || id(homepod_state).state == "playing";
             if (id(g_sleeping)) {
-              it.all() = Color(0, 0, 0);
+              if (!media_playing) {
+                it.all() = Color(0, 0, 0);
+                return;
+              }
+              struct PaletteStop { uint8_t r; uint8_t g; uint8_t b; };
+              static const PaletteStop palette[] = {
+                {0x16, 0x2B, 0x75},  // deep blue
+                {0x6E, 0x3F, 0xD8},  // violet
+                {0x2F, 0xB7, 0xD8},  // cyan
+                {0xFF, 0xB3, 0x47},  // warm amber
+                {0x16, 0x2B, 0x75},  // close the loop
+              };
+              const int stop_count = sizeof(palette) / sizeof(palette[0]);
+              const float elapsed = (float) millis();
+              const float rotation = fmodf(elapsed / 9000.0f * n, (float) n);
+              const float brightness = 0.32f;
+              for (int i = 0; i < n; i++) {
+                const float pos = fmodf(((float) i + rotation) / (float) n * (stop_count - 1), (float) (stop_count - 1));
+                const int idx0 = (int) floorf(pos);
+                const int idx1 = (idx0 + 1) % (stop_count - 1);
+                const float t = pos - idx0;
+                const float r = palette[idx0].r + (palette[idx1].r - palette[idx0].r) * t;
+                const float g = palette[idx0].g + (palette[idx1].g - palette[idx0].g) * t;
+                const float b = palette[idx0].b + (palette[idx1].b - palette[idx0].b) * t;
+                it[i] = Color(
+                  (uint8_t) roundf(r * brightness),
+                  (uint8_t) roundf(g * brightness),
+                  (uint8_t) roundf(b * brightness));
+              }
               return;
             }
             float level = id(g_ring_brightness);
