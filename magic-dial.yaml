@@ -343,9 +343,13 @@ binary_sensor:
                 return id(g_light_power_optimistic_on);
               return (target == 2 ? id(ceiling_light_state).state : id(strip_light_state).state) == "on";
             }
-            if (target == 4) { const auto s=id(climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
-            if (target == 5) { const auto s=id(dining_room_climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
-            if (target == 6) { const auto s=id(floor_heating_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+            if (target >= 4 && target <= 6) {
+              if (id(g_climate_power_optimistic_valid) && id(g_climate_power_optimistic_target) == target)
+                return id(g_climate_power_optimistic_on);
+              const auto s = target == 4 ? id(climate_state).state :
+                (target == 5 ? id(dining_room_climate_state).state : id(floor_heating_state).state);
+              return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable";
+            }
             return true;
           };
           // 本机 mode 3 (电量) is a read-only readout: the knob does nothing there.
@@ -399,9 +403,13 @@ binary_sensor:
                 return id(g_light_power_optimistic_on);
               return (target == 2 ? id(ceiling_light_state).state : id(strip_light_state).state) == "on";
             }
-            if (target == 4) { const auto s=id(climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
-            if (target == 5) { const auto s=id(dining_room_climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
-            if (target == 6) { const auto s=id(floor_heating_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+            if (target >= 4 && target <= 6) {
+              if (id(g_climate_power_optimistic_valid) && id(g_climate_power_optimistic_target) == target)
+                return id(g_climate_power_optimistic_on);
+              const auto s = target == 4 ? id(climate_state).state :
+                (target == 5 ? id(dining_room_climate_state).state : id(floor_heating_state).state);
+              return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable";
+            }
             return true;
           };
           // 本机 mode 3 (电量) is a read-only readout: the knob does nothing there.
@@ -1272,6 +1280,13 @@ text_sensor:
     entity_id: ${living_room_climate_entity}
     internal: true
     on_value:
+      - lambda: |-
+          if (id(g_climate_power_optimistic_valid) &&
+              id(g_climate_power_optimistic_target) == 4 &&
+              ((x != "off" && x != "unknown" && x != "unavailable" && !x.empty()) ==
+               id(g_climate_power_optimistic_on))) {
+            id(g_climate_power_optimistic_valid) = false;
+          }
       - script.execute: sync_from_ha
 
   - platform: homeassistant
@@ -1279,6 +1294,13 @@ text_sensor:
     entity_id: ${dining_room_climate_entity}
     internal: true
     on_value:
+      - lambda: |-
+          if (id(g_climate_power_optimistic_valid) &&
+              id(g_climate_power_optimistic_target) == 5 &&
+              ((x != "off" && x != "unknown" && x != "unavailable" && !x.empty()) ==
+               id(g_climate_power_optimistic_on))) {
+            id(g_climate_power_optimistic_valid) = false;
+          }
       - script.execute: sync_from_ha
 
   - platform: homeassistant
@@ -1286,6 +1308,13 @@ text_sensor:
     entity_id: ${floor_heating_entity}
     internal: true
     on_value:
+      - lambda: |-
+          if (id(g_climate_power_optimistic_valid) &&
+              id(g_climate_power_optimistic_target) == 6 &&
+              ((x != "off" && x != "unknown" && x != "unavailable" && !x.empty()) ==
+               id(g_climate_power_optimistic_on))) {
+            id(g_climate_power_optimistic_valid) = false;
+          }
       - script.execute: sync_from_ha
 
   - platform: homeassistant
@@ -1600,6 +1629,22 @@ globals:
     type: float
     restore_value: yes
     initial_value: '1.0'
+  # Same idea as the light slot, but a climate toggle has no honest number to
+  # show while it is in flight: `climate.toggle` decides the HVAC mode on the HA
+  # side, so the dial only knows "it is about to be on/off". The renderer prints
+  # 开启中 / 关闭中 for this window instead of inventing a temperature or a mode.
+  - id: g_climate_power_optimistic_valid
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_climate_power_optimistic_target
+    type: int
+    restore_value: no
+    initial_value: '4'
+  - id: g_climate_power_optimistic_on
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   - id: g_touch_x0
     type: int
     restore_value: no
@@ -2399,6 +2444,18 @@ script:
       - script.execute: render_main
       - script.execute: refresh_visible_display
 
+  # Same backstop for climate. The window is longer than the light one because a
+  # heat pump / floor heating entity often needs a couple of seconds before HA
+  # publishes the new hvac state, and 开启中 is a better lie than a value that
+  # flips back and forth.
+  - id: climate_power_optimistic_settle
+    mode: restart
+    then:
+      - delay: 6s
+      - lambda: 'id(g_climate_power_optimistic_valid) = false;'
+      - script.execute: render_main
+      - script.execute: refresh_visible_display
+
   - id: sync_from_ha
     mode: restart
     then:
@@ -2552,12 +2609,22 @@ script:
                   return id(g_light_power_optimistic_on);
                 return (target == 2 ? id(ceiling_light_state).state : id(strip_light_state).state) == "on";
               }
-              if (target == 4) { const auto s = id(climate_state).state; return !s.empty() && s != "off" && s != "unknown" && s != "unavailable"; }
-              if (target == 5) { const auto s = id(dining_room_climate_state).state; return !s.empty() && s != "off" && s != "unknown" && s != "unavailable"; }
-              if (target == 6) { const auto s = id(floor_heating_state).state; return !s.empty() && s != "off" && s != "unknown" && s != "unavailable"; }
+              if (target >= 4 && target <= 6) {
+                if (id(g_climate_power_optimistic_valid) && id(g_climate_power_optimistic_target) == target)
+                  return id(g_climate_power_optimistic_on);
+                const auto s = target == 4 ? id(climate_state).state :
+                  (target == 5 ? id(dining_room_climate_state).state : id(floor_heating_state).state);
+                return !s.empty() && s != "off" && s != "unknown" && s != "unavailable";
+              }
               return true;
             };
             if (!active(id(g_target))) return std::string("—");
+            // A climate toggle in flight: HA still owns the resulting HVAC mode and
+            // setpoint, so print the transition instead of a number that is either
+            // stale or invented.
+            if (id(g_climate_power_optimistic_valid) &&
+                id(g_climate_power_optimistic_target) == id(g_target))
+              return std::string(id(g_climate_power_optimistic_on) ? "开启中" : "关闭中");
             const bool optimistic = id(g_optimistic_valid) &&
               id(g_optimistic_target) == id(g_target) && id(g_optimistic_mode) == id(g_control_mode) &&
               millis() - id(g_knob_last_rotate_ms) <= 2000;
@@ -2650,9 +2717,13 @@ script:
                 return id(g_light_power_optimistic_on);
               return (target == 2 ? id(ceiling_light_state).state : id(strip_light_state).state) == "on";
             }
-            if (target == 4) { const auto s=id(climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
-            if (target == 5) { const auto s=id(dining_room_climate_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
-            if (target == 6) { const auto s=id(floor_heating_state).state; return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable"; }
+            if (target >= 4 && target <= 6) {
+              if (id(g_climate_power_optimistic_valid) && id(g_climate_power_optimistic_target) == target)
+                return id(g_climate_power_optimistic_on);
+              const auto s = target == 4 ? id(climate_state).state :
+                (target == 5 ? id(dining_room_climate_state).state : id(floor_heating_state).state);
+              return !s.empty()&&s!="off"&&s!="unknown"&&s!="unavailable";
+            }
             return true;
           };
           const bool online = active(id(g_target));
@@ -2720,6 +2791,12 @@ script:
           }
           lv_obj_set_style_text_color(id(lbl_device_name), lv_color_hex(online ? 0xBFD0D8 : 0x81919A), LV_PART_MAIN);
           if (!online) lv_label_set_text(id(lbl_mode), truly_offline ? "设备离线" : "已关闭");
+          // 关闭中 keeps the wheel honest while the climate command is in flight:
+          // `online` is already the optimistic value, so without this the label
+          // would read the old mode name (制冷 etc.) for a device that is going off.
+          if (id(g_climate_power_optimistic_valid) &&
+              id(g_climate_power_optimistic_target) == id(g_target))
+            lv_label_set_text(id(lbl_mode), id(g_climate_power_optimistic_on) ? "开启中" : "关闭中");
           // The flex row keeps the value and unit aligned, so only the font
           // changes per target; no manual y offsets are needed any more.
           lv_obj_set_style_text_font(id(lbl_value), id(font_mono_76), LV_PART_MAIN);
@@ -2735,6 +2812,11 @@ script:
               lv_obj_set_style_text_font(id(lbl_value), id(font_sc_44), LV_PART_MAIN);
             }
           }
+          // 开启中 / 关闭中 is Chinese text, so it needs the CJK face even on the
+          // numeric page, where lbl_value otherwise uses the digits-only mono font.
+          if (id(g_climate_power_optimistic_valid) &&
+              id(g_climate_power_optimistic_target) == id(g_target))
+            lv_obj_set_style_text_font(id(lbl_value), id(font_sc_44), LV_PART_MAIN);
 
           uint32_t accent = 0x45D6C5;
           if (id(g_target) <= 1) accent = id(g_target) == 0 ? 0x49A8FF : 0x6A9BFF;
@@ -3287,18 +3369,58 @@ script:
                       data:
                         entity_id: ${strip_light_entity}
             - script.execute: light_power_optimistic_settle
+      # The three climate pages follow the light shape, with one difference: the
+      # dial cannot predict the resulting HVAC mode or setpoint (`climate.toggle`
+      # picks those on the HA side), so the optimistic window only claims
+      # "on/off" and the renderer prints 开启中 / 关闭中 until HA confirms.
       - if:
           condition: { lambda: 'return id(g_target) == 4;' }
           then:
+            - lambda: |-
+                const auto s = id(climate_state).state;
+                const bool currently_on =
+                  (id(g_climate_power_optimistic_valid) && id(g_climate_power_optimistic_target) == 4)
+                    ? id(g_climate_power_optimistic_on)
+                    : (!s.empty() && s != "off" && s != "unknown" && s != "unavailable");
+                id(g_climate_power_optimistic_target) = 4;
+                id(g_climate_power_optimistic_on) = !currently_on;
+                id(g_climate_power_optimistic_valid) = true;
+            - script.execute: render_main
+            - script.execute: refresh_visible_display
             - homeassistant.action: { action: climate.toggle, data: { entity_id: '${living_room_climate_entity}' } }
+            - script.execute: climate_power_optimistic_settle
       - if:
           condition: { lambda: 'return id(g_target) == 5;' }
           then:
+            - lambda: |-
+                const auto s = id(dining_room_climate_state).state;
+                const bool currently_on =
+                  (id(g_climate_power_optimistic_valid) && id(g_climate_power_optimistic_target) == 5)
+                    ? id(g_climate_power_optimistic_on)
+                    : (!s.empty() && s != "off" && s != "unknown" && s != "unavailable");
+                id(g_climate_power_optimistic_target) = 5;
+                id(g_climate_power_optimistic_on) = !currently_on;
+                id(g_climate_power_optimistic_valid) = true;
+            - script.execute: render_main
+            - script.execute: refresh_visible_display
             - homeassistant.action: { action: climate.toggle, data: { entity_id: '${dining_room_climate_entity}' } }
+            - script.execute: climate_power_optimistic_settle
       - if:
           condition: { lambda: 'return id(g_target) == 6;' }
           then:
+            - lambda: |-
+                const auto s = id(floor_heating_state).state;
+                const bool currently_on =
+                  (id(g_climate_power_optimistic_valid) && id(g_climate_power_optimistic_target) == 6)
+                    ? id(g_climate_power_optimistic_on)
+                    : (!s.empty() && s != "off" && s != "unknown" && s != "unavailable");
+                id(g_climate_power_optimistic_target) = 6;
+                id(g_climate_power_optimistic_on) = !currently_on;
+                id(g_climate_power_optimistic_valid) = true;
+            - script.execute: render_main
+            - script.execute: refresh_visible_display
             - homeassistant.action: { action: climate.toggle, data: { entity_id: '${floor_heating_entity}' } }
+            - script.execute: climate_power_optimistic_settle
       - if:
           condition: { lambda: 'return id(g_target) == 7;' }
           then:
