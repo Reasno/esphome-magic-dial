@@ -800,7 +800,13 @@ light:
               // Pre-compensating keeps the intent ("about a third of full") honest.
               const float brightness = powf(0.32f, 1.0f / 2.8f);  // ~0.66 pre-gamma
               for (int i = 0; i < n; i++) {
-                const float pos = fmodf(((float) i + rotation) / (float) n * (stop_count - 1), (float) (stop_count - 1));
+                // Subtracting the rotation makes the gradient travel toward higher
+                // LED indices, which is the clockwise direction on this ring - the
+                // same convention the knob comet in "Ring Feedback" uses for a
+                // right turn. Adding it (the previous form) drifted anticlockwise.
+                float phase = fmodf((float) i - rotation, (float) n);
+                if (phase < 0.0f) phase += (float) n;
+                const float pos = phase / (float) n * (stop_count - 1);
                 const int idx0 = (int) floorf(pos);
                 const int idx1 = (idx0 + 1) % (stop_count - 1);
                 const float t = pos - idx0;
