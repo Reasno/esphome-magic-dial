@@ -485,6 +485,9 @@ micro_wake_word:
     - logger.log:
         level: INFO
         format: "[WW] wake word detected -> starting assistant"
+    # Wake-word sessions are ambient interactions: always return to AOD when
+    # finished. Preserve this intent even if another callback cleared sleeping.
+    - lambda: 'id(g_va_return_to_aod) = true;'
     - script.execute: va_prepare
 
 voice_assistant:  # [VA]
@@ -532,6 +535,22 @@ voice_assistant:  # [VA]
         condition: { lambda: 'return !id(g_va_active);' }
         then:
           - script.execute: va_enter_session
+  on_timer_started:
+    - logger.log:
+        level: INFO
+        format: "[VA] timer started"
+  on_timer_updated:
+    - logger.log:
+        level: INFO
+        format: "[VA] timer updated"
+  on_timer_cancelled:
+    - logger.log:
+        level: INFO
+        format: "[VA] timer cancelled"
+  on_timer_finished:
+    - logger.log:
+        level: INFO
+        format: "[VA] timer finished"
   on_listening:
     - lambda: |-
         id(g_va_last_evt_ms) = millis();
@@ -2098,7 +2117,8 @@ script:
           id(g_va_last_evt_ms) = millis();
           id(g_manual_until) = millis() + 60000;
           id(g_va_dac_was_unmuted) = id(dac_unmute).state;
-          id(g_va_return_to_aod) = id(g_sleeping) || id(g_wake_consume);
+          id(g_va_return_to_aod) =
+            id(g_va_return_to_aod) || id(g_sleeping) || id(g_wake_consume);
           // An assistant turn IS activity: whether it started from a lock-screen
           // long press or from a wake word while the dial was asleep, the screen
           // must leave AOD state and come up to full brightness. Without this the
@@ -2234,18 +2254,20 @@ script:
           else id(dac_unmute).turn_off();
       # Blank VA widgets and stop all phase animations before leaving page_va.
       - script.execute: va_render
-      - script.execute: ring_update_state
       - logger.log: "[vatrace] teardown -> leaving page_va"
       - if:
           condition: { lambda: 'return id(g_va_return_to_aod);' }
           then:
+            - lambda: 'id(g_va_return_to_aod) = false;'
             - script.execute: enter_sleep
             - script.wait: enter_sleep
           else:
+            - lambda: 'id(g_va_return_to_aod) = false;'
             - lvgl.page.show:
                 id: page_main
                 animation: none
             - script.execute: render_main
+            - script.execute: ring_update_state
       # Force the newly selected page all the way through LVGL before stopping
       # the VA component. This also makes physical LCD state match screenshots.
       - lambda: |-
