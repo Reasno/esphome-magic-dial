@@ -779,17 +779,26 @@ light:
                 return;
               }
               struct PaletteStop { uint8_t r; uint8_t g; uint8_t b; };
+              // The two darkest stops were lifted out of navy: every channel
+              // written here still goes through the strip's 2.8 gamma table, and
+              // a 0x16 red / 0x2B green channel comes out as literally 0.
               static const PaletteStop palette[] = {
-                {0x16, 0x2B, 0x75},  // deep blue
-                {0x6E, 0x3F, 0xD8},  // violet
-                {0x2F, 0xB7, 0xD8},  // cyan
+                {0x2E, 0x5A, 0xE6},  // blue
+                {0x8A, 0x5A, 0xFF},  // violet
+                {0x3F, 0xD2, 0xF0},  // cyan
                 {0xFF, 0xB3, 0x47},  // warm amber
-                {0x16, 0x2B, 0x75},  // close the loop
+                {0x2E, 0x5A, 0xE6},  // close the loop
               };
               const int stop_count = sizeof(palette) / sizeof(palette[0]);
               const float elapsed = (float) millis();
               const float rotation = fmodf(elapsed / 9000.0f * n, (float) n);
-              const float brightness = 0.32f;
+              // The ring light runs ESPHome's default gamma_correct: 2.8, which is
+              // applied *after* this lambda writes its pixels. A plain 0.32 factor
+              // therefore leaves the LEDs at 0.32^2.8 ~= 4 % of the palette colour,
+              // i.e. a ring that reads as off - which is exactly why the lock-screen
+              // media glow was invisible while the tap flash (full 255) was fine.
+              // Pre-compensating keeps the intent ("about a third of full") honest.
+              const float brightness = powf(0.32f, 1.0f / 2.8f);  // ~0.66 pre-gamma
               for (int i = 0; i < n; i++) {
                 const float pos = fmodf(((float) i + rotation) / (float) n * (stop_count - 1), (float) (stop_count - 1));
                 const int idx0 = (int) floorf(pos);
