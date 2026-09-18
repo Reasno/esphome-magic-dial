@@ -117,8 +117,12 @@ esphome:
         - script.execute: resolve_priority
         - lvgl.page.show:
             id: page_main
-            animation: fade_in
-            time: 250ms
+            animation: none
+        - script.execute: render_main
+        - lambda: |-
+            lv_obj_invalidate(lv_screen_active());
+            lv_refr_now(lv_display_get_default());
+            ESP_LOGI("ui", "Boot main page full refresh completed");
         # [WW] microWakeWord never self-starts: MicroWakeWord::setup() only builds
         # the frontend/queues and leaves the component in State::STOPPED, so
         # without this the model is flashed but deaf. va_teardown re-arms it after
@@ -690,6 +694,7 @@ voice_assistant:  # [VA]
   on_error:
     - lambda: |-
         ESP_LOGE("va", "error code=%s message=%s", code.c_str(), message.c_str());
+        if (!id(g_va_active)) return;
         if (code == "stt-no-text-recognized") {
           id(va_cleanup).execute();
         } else {
@@ -2233,7 +2238,7 @@ script:
             - micro_wake_word.start:
 
   - id: va_teardown  # [VA]
-    mode: restart
+    mode: single
     then:
       # Clear local ownership first. `voice_assistant.stop` is deliberately the
       # final action: on ESPHome 2026.7.4 it can terminate/switch the current VA
@@ -2258,16 +2263,15 @@ script:
       - if:
           condition: { lambda: 'return id(g_va_return_to_aod);' }
           then:
-            - lambda: 'id(g_va_return_to_aod) = false;'
             - script.execute: enter_sleep
             - script.wait: enter_sleep
           else:
-            - lambda: 'id(g_va_return_to_aod) = false;'
             - lvgl.page.show:
                 id: page_main
                 animation: none
             - script.execute: render_main
             - script.execute: ring_update_state
+      - lambda: 'id(g_va_return_to_aod) = false;'
       # Force the newly selected page all the way through LVGL before stopping
       # the VA component. This also makes physical LCD state match screenshots.
       - lambda: |-
@@ -3097,8 +3101,15 @@ script:
       - script.execute: render_aod
       - lvgl.page.show:
           id: page_aod
-          animation: fade_in
-          time: 300ms
+          animation: none
+      - lambda: |-
+          lv_obj_invalidate(lv_screen_active());
+          lv_refr_now(lv_display_get_default());
+          ESP_LOGI("vatrace",
+                   "enter_sleep committed active_aod=%d sleeping=%d va_active=%d t=%u",
+                   (int) (lv_screen_active() == id(page_aod)->obj),
+                   (int) id(g_sleeping), (int) id(g_va_active),
+                   (unsigned) millis());
       - script.execute: apply_screen_brightness
 
   - id: wake_display
