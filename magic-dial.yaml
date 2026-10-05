@@ -110,9 +110,8 @@ esphome:
         - lambda: |-
             id(g_last_activity) = millis();
             id(g_backlight_pct) = 100;
-        # Keep the speaker's software gain in sync with the number the 本机扬声器
-        # target shows from the very first frame, so the first VA turn after a
-        # reboot is already at the displayed volume.
+        # Keep the media player's gain in sync with the 本机扬声器 value from
+        # the first frame, so the first VA turn uses the displayed volume.
         - script.execute: apply_local_volume
         - script.execute: resolve_priority
         - lvgl.page.show:
@@ -455,6 +454,56 @@ speaker:
     dac_type: external
     channel: stereo
 
+media_player:
+  - platform: speaker
+    id: magic_dial_media_player
+    name: "${friendly_name} Speaker"
+    announcement_pipeline:
+      speaker: magic_dial_speaker
+    volume_initial: 100%
+    on_announcement:
+      # A standalone assist_satellite.announce does not start an Assist
+      # pipeline, so it has no voice_assistant.on_start event. Establish the
+      # same local session that conversational responses already have.
+      - if:
+          condition:
+            lambda: 'return !id(g_va_active);'
+          then:
+            - script.execute: va_enter_session
+            - script.wait: va_enter_session
+      - lambda: |-
+          id(g_va_announcement_active) = true;
+          id(g_va_last_evt_ms) = millis();
+          id(g_va_phase) = 3; // speaking
+          id(va_render).execute();
+          id(dac_unmute).turn_on();
+          ESP_LOGI("vatrace", "media announcement start t=%u run=%d",
+                   (unsigned) millis(), (int) id(magic_dial_va).is_running());
+      - script.execute: va_claim_display
+      - script.execute: ring_update_state
+    on_idle:
+      - if:
+          # Ignore boot-time and unrelated idle transitions. Only an
+          # ANNOUNCING -> IDLE edge closes a Voice Assistant response.
+          condition:
+            lambda: 'return id(g_va_announcement_active);'
+          then:
+            - lambda: |-
+                id(g_va_announcement_active) = false;
+                id(g_va_announcement_end_pending) = true;
+                id(g_va_last_evt_ms) = millis();
+                // Refresh the phase stamp so the stuck-listening watchdog
+                // cannot inherit the previous turn's start time.
+                id(g_va_started_ms) = millis();
+                id(dac_unmute).turn_off();
+                ESP_LOGI("vatrace", "media announcement end t=%u phase=%d run=%d",
+                         (unsigned) millis(), (int) id(g_va_phase),
+                         (int) id(magic_dial_va).is_running());
+            # START_CONVERSATION/ASK_QUESTION reopens the microphone immediately
+            # after playback. Give on_listening a short window to cancel cleanup;
+            # plain ANNOUNCE and one-shot answers have no such event.
+            - script.execute: va_finish_announcement
+
 microphone:
   - platform: i2s_audio
     id: magic_dial_microphone
@@ -497,7 +546,7 @@ micro_wake_word:
 voice_assistant:  # [VA]
   id: magic_dial_va
   microphone: magic_dial_microphone
-  speaker: magic_dial_speaker
+  media_player: magic_dial_media_player
   use_wake_word: false
   # [VA] Capture gain. The PDM mic on this board is very quiet, and with the
   # ESPHome defaults (no gain, multiplier 1.0) the stream is too weak for the
@@ -558,6 +607,7 @@ voice_assistant:  # [VA]
   on_listening:
     - lambda: |-
         id(g_va_last_evt_ms) = millis();
+        id(g_va_announcement_end_pending) = false;
         id(g_va_active) = true;
         id(g_va_phase) = 1; // listening
         id(g_va_error_text) = "";
@@ -624,55 +674,8 @@ voice_assistant:  # [VA]
     - logger.log:
         level: INFO
         format: "[VA] tts finished"
-  on_tts_stream_start:
-    - lambda: |-
-        id(g_va_last_evt_ms) = millis();
-        id(g_va_phase) = 3; // speaking
-        id(va_render).execute();
-        id(dac_unmute).turn_on();
-    - script.execute: va_claim_display
-    - script.execute: ring_update_state
-  # [VA] Playback finished. HA runs with `always_continue_conversation = false`,
-  # so a normal turn is OVER the moment the answer stopped playing -- there is no
-  # round 2 to wait for. Showing the `listening` look here was the "optimistic
-  # second listening" bug: the dial looked like it was recording for the whole
-  # 8 s the idle watchdog needed to notice that nobody was coming.
-  #
-  # The only case that still keeps the mic look is a proactive ask
-  # (assist_satellite.start_conversation): there HA really does listen after the
-  # question, until g_proactive_deadline_ms.
-  #
-  # The 8 s idle+silent poll, the 12 s stuck-listening watchdog and the 120 s
-  # ceiling in the 1 s interval below all stay as fallbacks.
-  on_tts_stream_end:
-    - lambda: |-
-        id(g_va_last_evt_ms) = millis();
-        // Refresh the phase stamp so the 12 s stuck-listening watchdog cannot
-        // inherit this turn's old start time in the proactive branch below.
-        id(g_va_started_ms) = millis();
-        ESP_LOGI("vatrace", "tts_stream_end t=%u phase=%d run=%d",
-                 (unsigned) millis(), (int) id(g_va_phase),
-                 (int) id(magic_dial_va).is_running());
-        id(dac_unmute).turn_off(); // same mute the mic path uses while listening
-    - if:
-        # Proactive ask still inside its listening window -> keep the mic look.
-        condition:
-          lambda: |-
-            return id(g_va_proactive) &&
-              (int32_t)(id(g_proactive_deadline_ms) - millis()) > 0;
-        then:
-          - lambda: |-
-              id(g_va_phase) = 1; // genuinely listening for the answer
-              id(va_render).execute();
-          - script.execute: ring_update_state
-        else:
-          # One-shot turn finished: close the session right away instead of
-          # faking `listening` until the 8 s idle watchdog fires. va_cleanup ->
-          # va_teardown re-arms micro_wake_word and returns to page_main / AOD.
-          - logger.log: "[vatrace] tts_stream_end -> cleanup (no continue)"
-          - script.execute: va_cleanup
   # [VA] RUN_END is a network message from HA and its arrival is NOT ordered
-  # against the local `on_tts_stream_end`: in a continued conversation round N's
+  # against the local media-player state: in a continued conversation round N's
   # run-end regularly lands AFTER round N+1's on_listening, which already reset
   # `g_va_tts_started` to false. The old `!g_va_tts_started` test therefore fired
   # on a perfectly healthy new turn and tore it down -- this is the "clock face
@@ -1839,6 +1842,17 @@ globals:
   - id: g_va_tts_started  # [VA]
     type: bool
     initial_value: 'false'
+  # True only while the media player's announcement pipeline is playing a VA
+  # response. It gates on_idle so unrelated media-player idle events cannot
+  # close an active assistant session.
+  - id: g_va_announcement_active  # [VA]
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_va_announcement_end_pending  # [VA]
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   - id: g_va_started_ms  # [VA]
     type: uint32_t
     initial_value: '0'
@@ -2225,6 +2239,21 @@ script:
           else:
             - script.execute: va_teardown
 
+  # Finalizes an announcement only if HA did not reopen the microphone. The
+  # on_listening event clears the pending flag for START_CONVERSATION and
+  # ASK_QUESTION before this short grace period expires.
+  - id: va_finish_announcement  # [VA]
+    mode: restart
+    then:
+      - delay: 750ms
+      - if:
+          condition:
+            lambda: 'return id(g_va_announcement_end_pending);'
+          then:
+            - lambda: 'id(g_va_announcement_end_pending) = false;'
+            - logger.log: "[vatrace] announcement grace expired -> cleanup"
+            - script.execute: va_cleanup
+
   # Re-arm wake-word detection outside the teardown automation. Calling
   # voice_assistant.stop can end the current VA automation context, so no
   # state/UI work is allowed to depend on actions placed after it.
@@ -2250,6 +2279,8 @@ script:
                    (int) id(g_va_active), (int) id(magic_dial_va).is_running());
           id(g_va_proactive) = false;
           id(g_proactive_deadline_ms) = 0;
+          id(g_va_announcement_active) = false;
+          id(g_va_announcement_end_pending) = false;
           id(g_va_phase) = 0;
           id(g_va_active) = false;
           id(g_ptt_started) = false;
@@ -3898,27 +3929,13 @@ script:
           force: false
       - script.execute: knob_bar_trailing
 
-  # Pushes `g_local_volume` (0-100 %) into the i2s_audio speaker.
-  #
-  # Why this exists: there is no `media_player:` component on this device. The
-  # "本机扬声器" knob target was purely cosmetic -- it moved `g_local_volume` and
-  # re-rendered the screen, and nothing ever reached the audio path, so VA TTS
-  # always played at the hardware full-scale level.
-  #
-  # `speaker.volume_set` on an `i2s_audio` speaker with no `audio_dac:`
-  # configured falls back to software volume: it converts the 0.0-1.0 value into
-  # a Q31 gain factor (linear over -49 dB .. 0 dB) that
-  # `I2SAudioSpeakerBase::apply_software_volume_` applies to every buffer written
-  # to the DAC. `voice_assistant` hands TTS chunks to the exact same speaker
-  # object, so this covers VA playback, `speaker.play`, and any future media.
-  #
-  # 100 % is special-cased upstream to INT32_MAX, i.e. the gain stage is skipped
-  # entirely -- so the default is bit-identical to the pre-fix behaviour.
+  # Keeps the on-device volume control and the HA media_player entity on the
+  # same gain value. The speaker media player owns the announcement output path.
   - id: apply_local_volume
     mode: restart
     then:
-      - speaker.volume_set:
-          id: magic_dial_speaker
+      - media_player.volume_set:
+          id: magic_dial_media_player
           volume: !lambda 'return fminf(1.0f, fmaxf(0.0f, id(g_local_volume) / 100.0f));'
 
   # Renders the current knob value as a 52x16 full-screen bar and publishes it
